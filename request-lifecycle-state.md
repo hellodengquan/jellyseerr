@@ -384,6 +384,10 @@ Media AVAILABLE → 请求 COMPLETED（反向驱动）
 | `server/api/servarr/sonarr.ts` | Sonarr API 封装：幂等添加剧集 |
 | `server/api/servarr/base.ts` | *arr API 基类：超时配置、缓存管理 |
 | `server/lib/scanners/baseScanner.ts` | 扫描器基类：AsyncLock 使用示例 |
+| `server/entity/OverrideRule.ts` | 覆盖规则实体：条件匹配 + 参数覆盖 |
+| `server/entity/User.ts` | 用户实体：配额字段、`getQuota()` 计算 |
+| `server/lib/permissions.ts` | 权限枚举与 `hasPermission()` 位运算检查 |
+| `server/lib/watchlistsync.ts` | Watchlist 同步：自动请求创建流程 |
 
 ---
 
@@ -791,4 +795,390 @@ if (entity.status !== MediaRequestStatus.FAILED) {
 | 媒体被 *arr 拒绝（版权/违规） | `FAILED` | 无法恢复，只能拒绝或删除请求 |
 | 网络超时（API 实际成功了） | `FAILED` 但媒体实际已添加 | 重试会走幂等更新路径，自动恢复 |
 | 媒体服务器未扫描到文件 | Media 长期 `PROCESSING` | 手动触发媒体库扫描 |
+
+---
+
+## 十、请求配额管理
+
+配额机制在请求创建阶段进行拦截，限制用户在指定时间窗口内提交的请求数量，防止滥用。
+
+### 10.1 配额模型
+
+**配额维度**：电影和 TV 独立计算。
+
+| 维度 | 电影 | TV |
+|---|---|---|
+| 计量单位 | 请求条数 | 请求涉及的季数（`SeasonRequest` 数量） |
+| 限制字段 | `movieQuotaLimit` | `tvQuotaLimit` |
+| 时间窗口 | `movieQuotaDays` | `tvQuotaDays` |
+| 已用量 | `movieQuotaUsed` | `tvQuotaUsed` |
+
+**配额来源优先级**：用户级配额 > 全局默认配额。
+
+```typescript
+// server/entity/User.ts:282-284
+const movieQuotaLimit = !canBypass
+  ? (this.movieQuotaLimit ?? defaultQuotas.movie.quotaLimit)
+  : 0;
+const movieQuotaDays = this.movieQuotaDays ?? defaultQuotas.movie.quotaDays;
+```
+
+- 用户字段 `movieQuotaLimit` / `tvQuotaLimit` 为 `null` 时回退到全局设置 `defaultQuotas`
+- 拥有 `MANAGE_USERS` 权限的用户 `canBypass = true`，配额限制设为 0（即无限制）
+
+### 10.2 配额检查时机
+
+配额检查发生在 `MediaRequest.request()` 的早期阶段（`server/entity/MediaRequest.ts:114-120`），在去重检查和 *arr 推送之前：
+
+```typescript
+const quotas = await requestUser.getQuota();
+
+if (requestBody.mediaType === MediaType.MOVIE && quotas.movie.restricted) {
+  throw new QuotaRestrictedError('Movie Quota exceeded.');
+} else if (requestBody.mediaType === MediaType.TV && quotas.tv.restricted) {
+  throw new QuotaRestrictedError('Series Quota exceeded.');
+}
+```
+
+TV 请求还额外检查剩余配额是否足够覆盖本次请求的季数（`server/entity/MediaRequest.ts:451-455`）：
+
+```typescript
+if (quotas.tv.limit && finalSeasons.length > (quotas.tv.remaining ?? 0)) {
+  throw new QuotaRestrictedError('Series Quota exceeded.');
+}
+```
+
+### 10.3 配额计算逻辑
+
+**方法**：`User.getQuota()` → `server/entity/User.ts:273-372`
+
+#### 电影配额计算
+
+```typescript
+// 统计时间窗口内非 DECLINED 的电影请求数
+const movieQuotaUsed = await requestRepository.count({
+  where: {
+    requestedBy: { id: this.id },
+    ...(movieQuotaDays ? { createdAt: AfterDate(movieDate) } : {}),
+    type: MediaType.MOVIE,
+    status: Not(MediaRequestStatus.DECLINED),
+  },
+});
+```
+
+**计数规则**：
+- 仅统计非 DECLINED 状态的请求（PENDING / APPROVED / FAILED / COMPLETED 都算）
+- `movieQuotaDays` 为空时统计全部历史，非空时仅统计最近 N 天
+
+#### TV 配额计算
+
+```typescript
+// 统计时间窗口内非 DECLINED 的 TV 请求涉及的季数
+const tvQuotaUsed = (
+  await tvQuotaUsedQuery
+    .addSelect((subQuery) => {
+      return subQuery
+        .select('COUNT(season.id)', 'seasonCount')
+        .from(SeasonRequest, 'season')
+        .leftJoin('season.request', 'parentRequest')
+        .where('parentRequest.id = request.id');
+    }, 'seasonCount')
+    .getMany()
+).reduce((sum, req) => sum + req.seasonCount, 0);
+```
+
+**计数规则**：
+- 以季为计量单位（不是以请求为单位）
+- 使用子查询统计每个请求关联的 `SeasonRequest` 数量
+- 同样排除 DECLINED 状态
+
+### 10.4 配额响应结构
+
+```typescript
+// GET /api/v1/user/:id/quota → QuotaResponse
+{
+  movie: {
+    days: 7,           // 配额时间窗口（天）
+    limit: 5,          // 配额上限（0 = 无限制）
+    used: 3,           // 已使用量
+    remaining: 2,      // 剩余量
+    restricted: false  // 是否已超额
+  },
+  tv: {
+    days: 7,
+    limit: 10,
+    used: 8,
+    remaining: 2,
+    restricted: false
+  }
+}
+```
+
+`restricted` 为 `true` 时触发 `QuotaRestrictedError`（HTTP 403）。
+
+### 10.5 配额与请求状态的关系
+
+```
+用户提交请求
+    │
+    ├─ getQuota() 计算当前配额
+    │
+    ├─ restricted = true → QuotaRestrictedError (403) ← 阻断
+    │
+    ├─ TV: remaining < finalSeasons.length → QuotaRestrictedError (403) ← 阻断
+    │
+    └─ 通过配额检查 → 继续后续流程（去重、自动审批、推送 *arr）
+```
+
+**注意**：DECLINED 请求不计入配额，这意味着被拒绝的请求不占用配额空间；COMPLETED 请求仍计入配额（直到超出时间窗口）。
+
+---
+
+## 十一、自动批准规则的匹配链路
+
+Jellyseerr 的"自动批准"由两部分组成：**权限驱动的自动审批** 和 **覆盖规则（OverrideRule）驱动的参数覆盖**。
+
+### 11.1 权限驱动的自动审批
+
+**核心逻辑**：用户提交请求时，若拥有特定权限，请求直接进入 `APPROVED` 状态，跳过管理员审批。
+
+**权限体系**（`server/lib/permissions.ts`）：
+
+| 权限 | 值 | 含义 |
+|---|---|---|
+| `AUTO_APPROVE` | 128 | 自动批准所有类型 |
+| `AUTO_APPROVE_MOVIE` | 256 | 自动批准电影 |
+| `AUTO_APPROVE_TV` | 512 | 自动批准 TV |
+| `AUTO_APPROVE_4K` | 32768 | 自动批准所有 4K 类型 |
+| `AUTO_APPROVE_4K_MOVIE` | 65536 | 自动批准 4K 电影 |
+| `AUTO_APPROVE_4K_TV` | 131072 | 自动批准 4K TV |
+| `MANAGE_REQUESTS` | 16 | 管理请求（隐含自动批准） |
+
+**匹配链路**（`server/entity/MediaRequest.ts:354-367`）：
+
+```
+请求提交
+    │
+    ├─ is4k = false + mediaType = MOVIE
+    │   └─ hasPermission([AUTO_APPROVE, AUTO_APPROVE_MOVIE, MANAGE_REQUESTS], 'or')
+    │       → true: status = APPROVED, modifiedBy = user
+    │       → false: status = PENDING
+    │
+    ├─ is4k = true + mediaType = MOVIE
+    │   └─ hasPermission([AUTO_APPROVE_4K, AUTO_APPROVE_4K_MOVIE, MANAGE_REQUESTS], 'or')
+    │
+    ├─ is4k = false + mediaType = TV
+    │   └─ hasPermission([AUTO_APPROVE, AUTO_APPROVE_TV, MANAGE_REQUESTS], 'or')
+    │
+    └─ is4k = true + mediaType = TV
+        └─ hasPermission([AUTO_APPROVE_4K, AUTO_APPROVE_4K_TV, MANAGE_REQUESTS], 'or')
+```
+
+**权限匹配特性**：
+- 使用 `type: 'or'` — 满足任一权限即可
+- `ADMIN` 权限隐含所有权限（`hasPermission` 中 `value & Permission.ADMIN` 直接返回 true）
+- 自动审批时 `modifiedBy = user`（非自动审批时 `modifiedBy = undefined`）
+
+### 11.2 覆盖规则（OverrideRule）匹配链路
+
+OverrideRule 不影响审批决策，但会覆盖请求推送到 *arr 时的参数（rootFolder、profileId、tags）。
+
+**实体定义**（`server/entity/OverrideRule.ts`）：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `radarrServiceId` | int | 关联的 Radarr 服务 ID |
+| `sonarrServiceId` | int | 关联的 Sonarr 服务 ID |
+| `users` | string (逗号分隔) | 适用的用户 ID 列表 |
+| `genre` | string (逗号分隔) | 匹配的类型 ID 列表 |
+| `language` | string (\|分隔) | 匹配的原始语言代码 |
+| `keywords` | string (逗号分隔) | 匹配的 TMDB 关键词 ID 列表 |
+| `profileId` | int | 覆盖的质量配置 ID |
+| `rootFolder` | string | 覆盖的根文件夹路径 |
+| `tags` | string (逗号分隔) | 追加的标签 ID 列表 |
+
+**匹配流程**（`server/entity/MediaRequest.ts:218-343`）：
+
+```
+请求提交（非管理员 / 非 REQUEST_ADVANCED 用户）
+    │
+    ├─ 确定默认 *arr 服务
+    │   └─ is4k ? 找 4k 默认服务器 : 找非 4k 默认服务器
+    │
+    ├─ 查找匹配该服务的所有 OverrideRule
+    │
+    ├─ 逐条过滤规则（所有条件 AND 逻辑）
+    │   ├─ users: 规则中的用户列表包含当前用户 ID
+    │   ├─ genre: 规则中的类型 ID 与媒体类型有交集
+    │   ├─ language: 规则中的语言代码与媒体原始语言匹配
+    │   └─ keywords: 规则中的关键词 ID 与媒体关键词有交集
+    │
+    ├─ 特殊处理：动漫关键词
+    │   └─ TV + 动漫关键词 + 规则不含动漫关键词 → 跳过该规则
+    │
+    ├─ 按"特异度"排序匹配的规则
+    │   └─ specificity = [genre, language, keywords] 中非 null 的数量
+    │   └─ 特异度最高的规则胜出
+    │
+    └─ 应用胜出规则的覆盖
+        ├─ rootFolder → 覆盖
+        ├─ profileId → 覆盖
+        └─ tags → 合并（去重）
+```
+
+**关键代码**：
+
+```typescript
+// server/entity/MediaRequest.ts:311-321
+const prioritizedRule = appliedOverrideRules.sort((a, b) => {
+  const keys: (keyof OverrideRule)[] = ['genre', 'language', 'keywords'];
+  const aSpecificity = keys.filter((key) => a[key] !== null).length;
+  const bSpecificity = keys.filter((key) => b[key] !== null).length;
+  return bSpecificity - aSpecificity;  // 高特异度优先
+})[0];
+```
+
+**OverrideRule 不适用的场景**：
+- 用户拥有 `MANAGE_REQUESTS` 权限 → `useOverrides = false`
+- 此时用户可以自行指定 rootFolder / profileId / tags
+
+### 11.3 自动请求（Auto Request）
+
+Watchlist 同步和自动请求是另一种自动审批路径。
+
+**权限**：`AUTO_REQUEST` / `AUTO_REQUEST_MOVIE` / `AUTO_REQUEST_TV`
+
+**流程**（`server/lib/watchlistsync.ts`）：
+
+```
+Plex Watchlist 同步定时任务
+    │
+    ├─ 遍历所有有 Plex Token 的用户
+    │
+    ├─ 获取用户 Plex Watchlist
+    │
+    ├─ 过滤：跳过已拉黑、已可用、已有自动请求的媒体
+    │
+    └─ 对不可用媒体调用 MediaRequest.request({ isAutoRequest: true })
+        │
+        ├─ 走正常配额检查、去重检查
+        ├─ 拥有 AUTO_APPROVE 权限 → 直接 APPROVED
+        └─ 无 AUTO_APPROVE 权限 → PENDING（等待管理员审批）
+```
+
+**自动请求与普通请求的区别**：
+- `isAutoRequest = true` 标记
+- 自动请求的去重检查更严格：同一用户 + 同一媒体只能有一条非 DELETED 的自动请求
+- Watchlist 同步中，`DuplicateMediaRequestError` / `QuotaRestrictedError` / `NoSeasonsAvailableError` 等异常被降级为 debug 日志，不打断同步流程
+
+---
+
+## 十二、请求统计与运维仪表盘
+
+### 12.1 请求统计 API
+
+**入口**：`GET /api/v1/request/count` → `server/routes/request.ts:338-426`
+
+该接口返回按维度分类的请求数量，供前端仪表盘使用：
+
+```typescript
+return res.status(200).json({
+  total: totalCount,         // 全部请求总数
+  movie: movieCount,         // 电影请求数
+  tv: tvCount,               // TV 请求数
+  pending: pendingCount,     // PENDING 状态数
+  approved: approvedCount,   // APPROVED 状态数
+  declined: declinedCount,   // DECLINED 状态数
+  processing: processingCount, // 处理中（APPROVED 且 Media 非 AVAILABLE）
+  available: availableCount,   // 已可用（APPROVED 且 Media AVAILABLE）
+  completed: completedCount,   // COMPLETED 状态数
+});
+```
+
+**统计维度说明**：
+
+| 维度 | 统计逻辑 | 含义 |
+|---|---|---|
+| `pending` | `request.status = PENDING` | 待审批 |
+| `approved` | `request.status = APPROVED` | 已批准（含处理中和已可用） |
+| `declined` | `request.status = DECLINED` | 已拒绝 |
+| `processing` | `request.status = APPROVED AND media.status != AVAILABLE` | 已批准但媒体未到位 |
+| `available` | `request.status = APPROVED AND media.status = AVAILABLE` | 已批准且媒体已到位（但请求尚未 COMPLETED） |
+| `completed` | `request.status = COMPLETED` | 已完成 |
+
+**processing 和 available 的区分**：这两个维度不是独立的请求状态，而是 `APPROVED` 状态的细分：
+
+```typescript
+// server/routes/request.ts:378-388
+const processingCount = await query
+  .where('request.status = :requestStatus', {
+    requestStatus: MediaRequestStatus.APPROVED,
+  })
+  .andWhere(
+    '((request.is4k = false AND media.status != :availableStatus) OR (request.is4k = true AND media.status4k != :availableStatus))',
+    { availableStatus: MediaStatus.AVAILABLE }
+  )
+  .getCount();
+```
+
+### 12.2 请求列表查询 API
+
+**入口**：`GET /api/v1/request` → `server/routes/request.ts:32-276`
+
+支持多维筛选：
+
+| 参数 | 值 | 作用 |
+|---|---|---|
+| `filter` | `pending` / `approved` / `processing` / `unavailable` / `available` / `completed` / `failed` / `deleted` | 按请求状态筛选 |
+| `mediaType` | `movie` / `tv` / `all` | 按媒体类型筛选 |
+| `requestedBy` | 用户 ID | 按请求人筛选 |
+| `take` / `skip` | 分页参数 | 分页查询 |
+
+**筛选条件与状态映射**：
+
+| filter 值 | 请求状态 | 媒体状态 |
+|---|---|---|
+| `pending` | PENDING | — |
+| `approved` / `processing` | APPROVED | — |
+| `unavailable` | PENDING + APPROVED | UNKNOWN + PENDING + PROCESSING + PARTIALLY_AVAILABLE |
+| `available` | COMPLETED | AVAILABLE |
+| `completed` | COMPLETED | — |
+| `failed` | FAILED | — |
+| `deleted` | COMPLETED | DELETED |
+
+### 12.3 用户配额查询 API
+
+**入口**：`GET /api/v1/user/:id/quota` → `server/routes/user/index.ts:802-827`
+
+需要 `MANAGE_USERS` 权限或本人查询。返回当前用户的配额使用情况，供前端显示配额进度条。
+
+### 12.4 运维关注指标
+
+基于以上 API，运维仪表盘通常关注以下指标：
+
+| 指标 | 数据来源 | 告警阈值建议 |
+|---|---|---|
+| PENDING 请求堆积数 | `GET /request/count` → `pending` | > 50 |
+| FAILED 请求数 | `GET /request/count` → `failed` (需额外查询) | > 0 |
+| processing 停滞时间 | 请求 `createdAt` 与当前时间差 | > 24h |
+| 用户配额命中率 | `GET /user/:id/quota` → `restricted` | 持续 true |
+| *arr 推送失败率 | FAILED / (APPROVED + FAILED) | > 5% |
+| 媒体同步延迟 | `lastSeasonChange` 与 `mediaAddedAt` 差值 | > 1h |
+| 自动请求异常 | Watchlist Sync 日志中的 error 级别消息 | 任何 error |
+
+### 12.5 请求优先级
+
+Jellyseerr **不提供显式的请求优先级机制**。请求处理顺序遵循以下隐式规则：
+
+1. **审批顺序**：PENDING 请求按 `createdAt` 排序，管理员手动选择批准顺序
+2. **推送顺序**：`MediaRequestSubscriber` 在 `afterInsert` / `afterUpdate` 中同步推送，取决于数据库事件触发顺序
+3. **OverrideRule 优先级**：当多条规则匹配时，按特异度排序选择（见第十一章），这是代码中唯一的"优先级"概念
+
+**源码注释**（`server/entity/MediaRequest.ts:311-312`）：
+```
+// hacky way to prioritize rules
+// TODO: make this better
+```
+表明当前的优先级排序是临时方案，未来可能改进。
+
 
