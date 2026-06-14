@@ -624,7 +624,406 @@ hasNotificationType(Notification.MEDIA_FAILED, userTypes);  // false
 
 ---
 
-## 十、关键代码引用速查
+## 十、发送失败的重试与降级策略
+
+### 10.1 整体错误处理模式
+
+通知框架采用 **Fire-and-Forget（发后即忘）** + **静默失败** 的设计哲学。所有 Agent 的发送失败都不会中断整体流程，也不会向上层抛出异常。
+
+**统一错误处理模式**（以 Discord Agent 为例）：
+
+```typescript
+public async send(type, payload): Promise<boolean> {
+  try {
+    // 发送逻辑...
+    await axios.post(webhookUrl, payload);
+    return true;
+  } catch (e) {
+    logger.error('Error sending Discord notification', {
+      label: 'Notifications',
+      type: Notification[type],
+      subject: payload.subject,
+      errorMessage: e.message,
+      response: e?.response?.data,
+    });
+    return false;
+  }
+}
+```
+
+**设计要点：**
+- 每个 Agent 内部独立 try-catch，错误不冒泡
+- 详细记录错误日志（类型、标题、错误信息、响应数据）
+- 返回 `boolean` 表示成功与否，但调用方不依赖此返回值
+- 单个 Agent 失败不影响其他 Agent 的发送
+
+### 10.2 重试机制现状
+
+**当前实现：无内置重试机制**
+
+所有 10 个 Agent 均未实现自动重试逻辑。发送失败仅记录日志，不会进行二次尝试。
+
+**原因分析：**
+- 通知属于非核心路径，优先保证主流程不被阻塞
+- 各渠道 API 的限流策略、重试成本差异较大
+- 设计上倾向于"尽力而为"，而非"确保送达"
+
+### 10.3 降级策略
+
+虽然没有统一的重试机制，但部分 Agent 实现了特定场景下的降级处理：
+
+#### WebPush：失效订阅自动清理
+
+```typescript
+// RFC 8030: 410/404 是永久性失败，其他是临时性的
+const isPermanentFailure = statusCode === 410 || statusCode === 404;
+
+logger.error(
+  isPermanentFailure
+    ? 'Error sending web push notification; removing invalid subscription'
+    : 'Error sending web push notification (transient error, keeping subscription)',
+  { /* ... */ }
+);
+
+if (isPermanentFailure) {
+  await userPushSubRepository.remove(pushSub); // 永久失败：删除订阅
+}
+```
+
+**降级策略：**
+- **永久失败（410 Gone / 404 Not Found）**：主动删除数据库中的无效订阅，避免后续继续发送浪费资源
+- **临时失败（其他状态码）**：保留订阅，下次通知时继续尝试
+
+#### 图片加载降级（Pushover Agent）
+
+```typescript
+private async getImagePayload(imageUrl): Promise<Partial<PushoverImagePayload>> {
+  try {
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    return {
+      attachment_base64: base64,
+      attachment_type: contentType,
+    };
+  } catch (e) {
+    logger.error('Error getting image payload', { /* ... */ });
+    return {}; // 失败则返回空对象，不影响文字通知发送
+  }
+}
+```
+
+**降级策略：**
+- 图片加载失败时，降级为纯文字通知
+- 不因为附件问题导致整条通知发送失败
+
+### 10.4 Manager 层面的容错
+
+`NotificationManager.sendNotification()` 本身没有 try-catch，但由于：
+1. 使用 `forEach` 而非 `for...of` + `await`
+2. 每个 Agent 的 `send()` 都是异步且内部已捕获错误
+
+因此单个 Agent 的异常不会影响其他 Agent，也不会导致 Manager 崩溃。
+
+**潜在风险：**
+- 发送结果完全异步，业务层无法知晓是否成功
+- 没有失败统计和告警机制
+- 长时间的静默失败可能导致问题被掩盖
+
+---
+
+## 十一、用户偏好配置：存储与读取热点分析
+
+### 11.1 存储结构
+
+用户通知偏好存储在 `UserSettings` 实体中，与 `User` 是一对一关系。
+
+```typescript
+@Entity()
+export class User {
+  @OneToOne(() => UserSettings, (settings) => settings.user, {
+    cascade: true,
+    eager: true,      // 关键：自动关联加载
+    onDelete: 'CASCADE',
+  })
+  public settings?: UserSettings;
+}
+```
+
+**核心字段：`notificationTypes`**
+
+```typescript
+@Column({
+  type: 'text',
+  nullable: true,
+  transformer: {
+    from: (value: string | null): Partial<NotificationAgentTypes> => {
+      // JSON 反序列化 + 默认值填充
+      const defaultTypes = {
+        email: ALL_NOTIFICATIONS,
+        webpush: ALL_NOTIFICATIONS,
+        // ... 其他默认 0
+      };
+      // ...
+    },
+    to: (value): string | null => {
+      // JSON 序列化 + 未知 key 过滤
+      const allowedKeys = Object.values(NotificationAgentKey);
+      (Object.keys(value)).forEach((key) => {
+        if (!allowedKeys.includes(key)) {
+          delete value[key];
+        }
+      });
+      return JSON.stringify(value);
+    },
+  },
+})
+public notificationTypes: Partial<NotificationAgentTypes>;
+```
+
+**存储特点：**
+- 数据库存储为 JSON 字符串（`text` 类型）
+- 读取时自动反序列化为对象，并填充默认值
+- 写入时自动序列化，并过滤未知 key（向前兼容）
+- 每种渠道对应一个数字（bitmask），存储 10 个渠道偏好只需一条 JSON
+
+### 11.2 读取路径分析
+
+#### 路径一：请求认证时加载
+
+在 `server/middleware/auth.ts:9-41` 的 `checkUser` 中间件中：
+
+```typescript
+if (req.session?.userId) {
+  const userRepository = getRepository(User);
+  user = await userRepository.findOne({
+    where: { id: req.session.userId },
+  });
+}
+// 由于 User.settings 配置了 eager: true，会自动 JOIN 查询
+```
+
+**特点：**
+- 每个 HTTP 请求触发一次数据库查询
+- 利用 `eager: true` 自动关联加载，无需显式 `relations`
+- 请求处理期间用户对象挂在 `req.user` 上，可复用
+
+#### 路径二：通知发送时查询
+
+在管理员通知场景下，需要遍历所有用户：
+
+```typescript
+if (payload.notifyAdmin) {
+  const userRepository = getRepository(User);
+  const users = await userRepository.find(); // 全表扫描！
+
+  await Promise.all(
+    users
+      .filter((user) => 
+        user.settings?.hasNotificationType(agentKey, type) &&
+        shouldSendAdminNotification(type, user, payload)
+      )
+      .map(async (user) => { /* 发送通知 */ })
+  );
+}
+```
+
+**热点问题：**
+- 每次管理员通知都会执行一次全表查询 `userRepository.find()`
+- 如果有 10 个启用的 Agent，每个都会独立查一次用户表
+- 用户量大时（>1000），性能问题显著
+
+### 11.3 系统级配置 vs 用户级配置
+
+| 配置层级 | 存储位置 | 加载时机 | 缓存策略 |
+|---------|---------|---------|---------|
+| 系统级 | `settings.json` 文件 | 服务启动时加载一次 | 内存单例，全程复用 |
+| 用户级 | 数据库 `user_settings` 表 | 请求时 / 发通知时查询 | 无缓存，每次查库 |
+
+**系统级配置的单例模式：**
+
+```typescript
+let settings: Settings | undefined;
+
+export const getSettings = (): Settings => {
+  if (!settings) {
+    settings = new Settings();
+  }
+  return settings;
+};
+```
+
+系统设置启动时调用 `load()` 读取文件，之后全程内存访问，性能极高。
+
+### 11.4 性能热点与优化空间
+
+**当前热点：**
+
+1. **管理员通知的 N+1 查询问题**
+   - 每个 Agent 独立查询用户表
+   - 10 个 Agent × 1 次全表查询 = 10 次重复查询
+
+2. **JSON 反序列化开销**
+   - 每次读取 `notificationTypes` 都要执行 `JSON.parse`
+   - 还要进行默认值填充和类型转换
+
+3. **无用户级缓存**
+   - 同一次通知流程中，多个 Agent 可能重复查询同一用户
+   - 短时间内多条通知触发时，用户数据反复加载
+
+**可优化方向：**
+- 在 `NotificationManager` 层统一查询一次用户列表，传给各 Agent
+- 增加用户设置的内存缓存（带过期时间）
+- 考虑将常用的通知类型字段冗余到 User 表，避免 JSON 解析
+
+---
+
+## 十二、多 Provider 并发发送：顺序与去重机制
+
+### 12.1 并发发送模型
+
+#### Manager 层：并发触发，顺序注册
+
+```typescript
+public sendNotification(type, payload): void {
+  this.activeAgents.forEach((agent) => {
+    if (agent.shouldSend()) {
+      agent.send(type, payload); // 没有 await！
+    }
+  });
+}
+```
+
+**并发特点：**
+- 使用 `forEach` 遍历，按 Agent 注册顺序依次调用
+- `agent.send()` 返回 Promise 但不被 await，属于 **fire-and-forget**
+- 所有 Agent 几乎同时开始发送（并发执行）
+- 完成顺序取决于各渠道 API 的响应速度，不确定
+
+#### Agent 内部：用户级并发
+
+对于需要发给多个用户的 Agent（如 Email、WebPush），内部使用 `Promise.all` 并发发送：
+
+```typescript
+if (payload.notifyAdmin) {
+  const users = await userRepository.find();
+  await Promise.all(
+    users.filter(...).map(async (user) => {
+      // 每个用户独立发送
+      await sendToUser(user);
+    })
+  );
+}
+```
+
+### 12.2 发送顺序
+
+**触发顺序（确定）：** 按 `registerAgents()` 中的注册顺序
+
+当前注册顺序（`server/index.ts:132-143`）：
+1. DiscordAgent
+2. EmailAgent
+3. GotifyAgent
+4. NtfyAgent
+5. PushbulletAgent
+6. PushoverAgent
+7. SlackAgent
+8. TelegramAgent
+9. WebhookAgent
+10. WebPushAgent
+
+**完成顺序（不确定）：** 取决于各渠道 API 响应时间、网络延迟等因素。
+
+### 12.3 去重机制
+
+#### 层面一：同一渠道内的系统/用户去重
+
+Pushover、Telegram 等同时支持系统级和用户级发送的 Agent，实现了**同一渠道内的去重判断**：
+
+**Pushover Agent 示例**（`server/lib/notifications/agents/pushover.ts:244-256`）：
+
+```typescript
+if (payload.notifyUser) {
+  if (
+    payload.notifyUser.settings?.hasNotificationType(NotificationAgentKey.PUSHOVER, type) &&
+    payload.notifyUser.settings.pushoverApplicationToken &&
+    payload.notifyUser.settings.pushoverUserKey &&
+    // 去重判断：用户 token 与系统 token 不同时才单独发送
+    (payload.notifyUser.settings.pushoverApplicationToken !== settings.options.accessToken ||
+     payload.notifyUser.settings.pushoverUserKey !== settings.options.userToken)
+  ) {
+    // 发送用户级通知
+  }
+}
+```
+
+**Telegram Agent 示例**（`server/lib/notifications/agents/telegram.ts:220-228`）：
+
+```typescript
+if (payload.notifyUser) {
+  if (
+    payload.notifyUser.settings?.hasNotificationType(NotificationAgent.TELEGRAM, type) &&
+    payload.notifyUser.settings?.telegramChatId &&
+    // 去重判断：用户 chatId 与系统 chatId 不同时才单独发送
+    payload.notifyUser.settings.telegramChatId !== settings.options.chatId
+  ) {
+    // 发送用户级通知
+  }
+}
+```
+
+**逻辑：**
+- 如果用户配置的接收地址（chatId / userKey）和系统级配置是同一个，就不重复发送
+- 避免用户同时通过"系统频道"和"个人直达"收到两份相同通知
+
+#### 层面二：管理员通知的操作者去重
+
+`shouldSendAdminNotification()` 函数确保**操作触发者本人不会收到通知**：
+
+```typescript
+export const shouldSendAdminNotification = (type, user, payload): boolean => {
+  return (
+    user.id !== payload.notifyUser?.id &&
+    user.hasPermission(getAdminPermission(type)) &&
+    // 媒体自动批准：排除请求提交者
+    (type !== Notification.MEDIA_AUTO_APPROVED ||
+      user.id !== (payload.request?.modifiedBy ?? payload.request?.requestedBy)?.id) &&
+    // 问题创建：排除创建者
+    (type !== Notification.ISSUE_CREATED || user.id !== payload.issue?.createdBy.id) &&
+    // 问题评论：排除评论者
+    (type !== Notification.ISSUE_COMMENT || user.id !== payload.comment?.user.id) &&
+    // 问题解决/重开：排除操作者
+    ((type !== Notification.ISSUE_RESOLVED && type !== Notification.ISSUE_REOPENED) ||
+      user.id !== payload.issue?.modifiedBy?.id)
+  );
+};
+```
+
+#### 层面三：跨渠道去重
+
+**现状：无跨渠道去重机制**
+
+如果用户同时启用了 Email、WebPush、Discord 等多个渠道，且这些渠道都配置了接收该类型通知，用户会在多个终端收到内容相同的通知。
+
+**设计考量：**
+- 各渠道定位不同（即时性、可达性、场景）
+- 用户自主选择启用哪些渠道，即表示愿意接收多渠道通知
+- 框架层面不做"智能选路"，保持简单透明
+
+### 12.4 并发与去重总结
+
+| 维度 | 机制 | 说明 |
+|------|------|------|
+| 触发方式 | 并发 fire-and-forget | 所有 Agent 同时触发，不等待结果 |
+| 触发顺序 | 按注册顺序 | 顺序确定，但完成顺序不确定 |
+| 同渠道去重 | 有（部分 Agent） | 比较系统配置和用户配置，相同则不重复发 |
+| 操作者去重 | 有 | 触发事件的用户本人不会收到管理员通知 |
+| 跨渠道去重 | 无 | 用户启用多个渠道会收到多份 |
+| 多设备去重 | 无 | WebPush 多个订阅设备会各自收到 |
+
+---
+
+## 十三、关键代码引用速查
+
+### 13.1 核心框架
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -635,13 +1034,45 @@ hasNotificationType(Notification.MEDIA_FAILED, userTypes);  // false
 | Agent 基类与接口 | `server/lib/notifications/agents/agent.ts` | 26-38 |
 | NotificationPayload | `server/lib/notifications/agents/agent.ts` | 9-24 |
 | Agent 注册 | `server/index.ts` | 132-143 |
+
+### 13.2 配置与存储
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
 | 系统配置结构 | `server/lib/settings/index.ts` | 220-351 |
 | NotificationAgentKey 枚举 | `server/lib/settings/index.ts` | 323-334 |
+| 系统设置单例 getSettings | `server/lib/settings/index.ts` | 888-896 |
 | 用户设置实体 | `server/entity/UserSettings.ts` | 31-154 |
 | 用户 hasNotificationType | `server/entity/UserSettings.ts` | 148-153 |
-| 媒体请求通知触发 | `server/subscriber/MediaRequestSubscriber.ts` | 78-94 |
+| notificationTypes transformer | `server/entity/UserSettings.ts` | 88-145 |
+| User.settings 关联配置 | `server/entity/User.ts` | 137-142 |
+| 用户认证中间件 | `server/middleware/auth.ts` | 9-41 |
+
+### 13.3 各 Agent 实现
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
 | Discord Agent | `server/lib/notifications/agents/discord.ts` | 78-352 |
 | Email Agent | `server/lib/notifications/agents/email.ts` | 62-410 |
 | WebPush Agent | `server/lib/notifications/agents/webpush.ts` | 57-401 |
 | Webhook Agent | `server/lib/notifications/agents/webhook.ts` | 66-250 |
 | Gotify Agent | `server/lib/notifications/agents/gotify.ts` | 19-161 |
+| Pushover Agent | `server/lib/notifications/agents/pushover.ts` | 36-353 |
+| Telegram Agent | `server/lib/notifications/agents/telegram.ts` | 37-325 |
+
+### 13.4 业务触发点
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 媒体请求通知触发 | `server/subscriber/MediaRequestSubscriber.ts` | 78-94 |
+
+### 13.5 重试、降级与去重相关
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| WebPush 永久失败清理 | `server/lib/notifications/agents/webpush.ts` | 249-273 |
+| Pushover 图片加载降级 | `server/lib/notifications/agents/pushover.ts` | 64-88 |
+| Pushover 同渠道去重 | `server/lib/notifications/agents/pushover.ts` | 244-256 |
+| Telegram 同渠道去重 | `server/lib/notifications/agents/telegram.ts` | 220-228 |
+| 管理员通知操作者去重 | `server/lib/notifications/index.ts` | 67-90 |
+| Manager 并发 fire-and-forget | `server/lib/notifications/index.ts` | 109-113 |
