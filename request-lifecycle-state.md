@@ -372,12 +372,18 @@ Media AVAILABLE → 请求 COMPLETED（反向驱动）
 | 文件 | 职责 |
 |---|---|
 | `server/constants/media.ts` | 状态枚举定义 |
-| `server/entity/MediaRequest.ts` | 请求实体 + 静态创建方法 `request()` + `@AfterInsert`/`@AfterUpdate` 通知钩子 |
+| `server/entity/MediaRequest.ts` | 请求实体 + 静态创建方法 `request()` + `@AfterInsert`/`@AfterUpdate` 通知钩子 + 重复请求检测 |
 | `server/entity/SeasonRequest.ts` | 季请求实体 |
+| `server/entity/Media.ts` | 媒体实体 + 状态管理 |
 | `server/routes/request.ts` | REST API：创建/审批/拒绝/重试/删除请求 |
-| `server/subscriber/MediaRequestSubscriber.ts` | 请求实体事件订阅器：推送到 *arr + 更新父 Media 状态 |
+| `server/subscriber/MediaRequestSubscriber.ts` | 请求实体事件订阅器：推送到 *arr + 更新父 Media 状态 + 删除回收 |
 | `server/subscriber/MediaSubscriber.ts` | 媒体实体事件订阅器：反向驱动请求状态 → COMPLETED |
 | `server/lib/availabilitySync.ts` | 定时同步：校验媒体是否仍存在于媒体服务器 |
+| `server/utils/asyncLock.ts` | 进程内互斥锁：防止单实例内重复创建 |
+| `server/api/servarr/radarr.ts` | Radarr API 封装：幂等添加电影 |
+| `server/api/servarr/sonarr.ts` | Sonarr API 封装：幂等添加剧集 |
+| `server/api/servarr/base.ts` | *arr API 基类：超时配置、缓存管理 |
+| `server/lib/scanners/baseScanner.ts` | 扫描器基类：AsyncLock 使用示例 |
 
 ---
 
@@ -393,3 +399,396 @@ Media AVAILABLE → 请求 COMPLETED（反向驱动）
 | APPROVED | FAILED | 推送到 *arr 失败 | `sendToRadarr()`/`sendToSonarr()` catch 块 |
 | FAILED | APPROVED | 管理员重试 | `POST /:id/retry` |
 | 任意 | (删除) | 管理员/用户删除请求 | `DELETE /:id` |
+
+---
+
+## 七、请求被驳回后的回收流程
+
+当请求被管理员拒绝（`PENDING → DECLINED`）或被删除时，系统需要执行一系列清理操作，回滚 Media 和 Season 的状态，避免资源泄漏。
+
+### 7.1 拒绝请求的回收逻辑
+
+**入口**：`MediaRequestSubscriber.updateParentStatus()` → `server/subscriber/MediaRequestSubscriber.ts:820-943`
+
+#### 电影请求拒绝
+
+```typescript
+// MediaRequestSubscriber.ts:849-856
+if (
+  media.mediaType === MediaType.MOVIE &&
+  entity.status === MediaRequestStatus.DECLINED &&
+  media[statusKey] !== MediaStatus.DELETED
+) {
+  media[statusKey] = MediaStatus.UNKNOWN;
+  await mediaRepository.save(media);
+}
+```
+
+**规则**：
+- Media 状态从 `PENDING` / `PROCESSING` 回滚为 `UNKNOWN`
+- 但如果 Media 已经是 `DELETED`（已从媒体服务器移除），则不做修改
+
+#### TV 请求拒绝
+
+TV 的回收逻辑更复杂，需要同时考虑：
+1. 是否还有其他 PENDING 请求
+2. 各季的状态回滚
+3. 其他活跃请求对季状态的影响
+
+```typescript
+// MediaRequestSubscriber.ts:864-888
+if (media.mediaType === MediaType.TV &&
+    entity.status === MediaRequestStatus.DECLINED &&
+    media[statusKey] === MediaStatus.PENDING) {
+  const pendingCount = await requestRepository.count({ ... });
+  if (pendingCount === 0) {
+    freshMedia[statusKey] = MediaStatus.UNKNOWN;
+  }
+}
+```
+
+**季级别的回收**：
+```typescript
+// MediaRequestSubscriber.ts:890-932
+for (const seasonRequest of entity.seasons) {
+  seasonRequest.status = MediaRequestStatus.DECLINED;
+  
+  // 若该季没有其他活跃请求，则回滚 Season 状态
+  if (season && season[statusKey] === MediaStatus.PENDING) {
+    const otherActiveRequests = await requestRepository.createQueryBuilder(...)
+      .where('request.id != :requestId', { requestId: entity.id })
+      .andWhere('request.status NOT IN (:...statuses)', {
+        statuses: [MediaRequestStatus.DECLINED, MediaRequestStatus.COMPLETED]
+      })
+      .andWhere('season.seasonNumber = :seasonNumber', { ... })
+      .getCount();
+    
+    if (otherActiveRequests === 0) {
+      season[statusKey] = MediaStatus.UNKNOWN;
+    }
+  }
+}
+```
+
+**回收规则总结**：
+
+| 对象 | 条件 | 回收后状态 |
+|---|---|---|
+| 电影 Media | 非 DELETED | `UNKNOWN` |
+| TV Media | 无其他 PENDING 请求 | `UNKNOWN` |
+| SeasonRequest | 父请求 DECLINED | `DECLINED` |
+| Season | 无其他活跃请求且当前为 PENDING | `UNKNOWN` |
+
+### 7.2 删除请求的回收逻辑
+
+**入口**：`MediaRequestSubscriber.handleRemoveParentUpdate()` → `server/subscriber/MediaRequestSubscriber.ts:946-1004`
+
+```typescript
+// 检查是否还有活跃请求（非 COMPLETED / DECLINED）
+const hasActive = fullMedia.requests.some(
+  (request) => !request.is4k &&
+    request.status !== MediaRequestStatus.COMPLETED &&
+    request.status !== MediaRequestStatus.DECLINED
+);
+
+if (needsStatusUpdate) {
+  const hadCompleted = fullMedia.requests.some(
+    (r) => !r.is4k && r.status === MediaRequestStatus.COMPLETED
+  );
+  cleanMedia.status = hadCompleted
+    ? MediaStatus.DELETED    // 有过已完成请求 → 标记为已删除
+    : MediaStatus.UNKNOWN;   // 无已完成请求 → 重置为未知
+}
+```
+
+**删除回收规则**：
+- 无活跃请求时才触发 Media 状态重置
+- 若该 Media 曾有过 `COMPLETED` 请求 → 标记为 `DELETED`（表示曾经存在过但现已移除）
+- 若该 Media 从未有过 `COMPLETED` 请求 → 标记为 `UNKNOWN`（干净重置）
+
+---
+
+## 八、多实例部署时的去重和互斥机制
+
+Jellyseerr 通过**三层防护**确保多实例部署或高并发场景下不会产生重复请求：
+
+### 8.1 第一层：应用层互斥锁（AsyncLock）
+
+**实现**：`server/utils/asyncLock.ts`
+
+```typescript
+// 使用方式：将"检查-创建"的临界区包裹在 asyncLock.dispatch 中
+await this.asyncLock.dispatch(tmdbId, async () => {
+  const existing = await this.getExisting(tmdbId, mediaType);
+  if (existing) {
+    // 更新现有记录
+  } else {
+    // 创建新记录
+  }
+});
+```
+
+**工作原理**：
+- 基于 `tmdbId` 为 key 的内存级互斥锁
+- 同一 `tmdbId` 的操作串行化执行
+- 使用 EventEmitter 实现等待队列，避免 busy-wait
+- 单个进程内保证不会创建重复 Media 记录
+
+**使用场景**：
+- `BaseScanner.processMovie()` / `processShow()` → 扫描器处理媒体时
+- 所有"查找或创建"模式的数据库操作
+
+**局限性**：仅在单进程内有效，多实例部署时需依赖数据库层约束。
+
+### 8.2 第二层：业务逻辑去重检查
+
+**实现**：`MediaRequest.request()` → `server/entity/MediaRequest.ts:171-216`
+
+```typescript
+// 检查是否已有相同媒体的请求
+const existing = await requestRepository
+  .createQueryBuilder('request')
+  .leftJoinAndSelect('request.media', 'media')
+  .where('request.is4k = :is4k', { is4k: requestBody.is4k })
+  .andWhere('media.tmdbId = :tmdbId', { tmdbId: tmdbMedia.id })
+  .andWhere('media.mediaType = :mediaType', { mediaType: requestBody.mediaType })
+  .getMany();
+
+// 电影去重规则
+if (requestBody.mediaType === MediaType.MOVIE &&
+    existing[0].status !== MediaRequestStatus.DECLINED &&
+    existing[0].status !== MediaRequestStatus.COMPLETED) {
+  throw new DuplicateMediaRequestError('Request for this media already exists.');
+}
+
+// 自动请求去重
+const statusKey = requestBody.is4k ? 'status4k' : 'status';
+if (existing.find(
+  (r) => r.requestedBy.id === requestUser.id &&
+    r.isAutoRequest &&
+    r.media?.[statusKey] !== MediaStatus.DELETED
+)) {
+  throw new DuplicateMediaRequestError('Auto-request for this media and user already exists.');
+}
+```
+
+**去重规则**：
+
+| 场景 | 去重条件 | 异常 |
+|---|---|---|
+| 电影请求 | 存在非 DECLINED / 非 COMPLETED 的同类型请求 | `DuplicateMediaRequestError` (409) |
+| 自动请求 | 同一用户 + 同一媒体 + 非 DELETED 状态 | `DuplicateMediaRequestError` (409) |
+| TV 请求季去重 | 过滤掉已有请求或已可用的季（`NoSeasonsAvailableError`） | `NoSeasonsAvailableError` (202) |
+
+### 8.3 第三层：数据库唯一约束
+
+通过数据库级别的唯一索引作为最后一道防线：
+
+| 实体 | 唯一约束 | 作用 | 定义位置 |
+|---|---|---|---|
+| `Media` | `(tmdbId, mediaType)` 联合索引 | 防止同一媒体创建多条 Media 记录 | `server/entity/Media.ts:30` |
+| `Blocklist` | `(tmdbId, mediaType)` 唯一约束 | 防止同一媒体重复拉黑 | `server/entity/Blocklist.ts:21` |
+| `Watchlist` | `(tmdbId, mediaType, requestedBy)` 唯一约束 | 同一用户不能重复添加同一媒体到监视列表 | `server/entity/Watchlist.ts:29` |
+| `Season` | `(mediaId, seasonNumber)` 隐式约束 | 通过 `@OneToMany` cascade 保证 | `server/entity/Media.ts:118` |
+
+**迁移历史**：`server/migration/sqlite/1772047972752-AddMediaTypeToUniqueConstraints.ts` 中专门为 `Blocklist` 和 `Watchlist` 添加了 `mediaType` 到唯一约束中，确保同一 TMDB ID 作为电影和剧集时互不影响。
+
+### 8.4 多实例部署注意事项
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Instance A │     │  Instance B │     │  Instance C │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       └───────────────────┼───────────────────┘
+                           ▼
+                    ┌─────────────┐
+                    │  SQLite/PG  │   ◄─── 数据库唯一约束是唯一跨实例的互斥机制
+                    └─────────────┘
+```
+
+**风险与限制**：
+- `AsyncLock` 是内存级别的，多实例部署时无效
+- 业务层去重检查（`SELECT` + `INSERT`）存在 TOCTOU 竞态条件
+- **唯一依赖数据库唯一约束保证最终一致性**
+- 建议：生产环境多实例部署时使用 PostgreSQL，并配合 `SERIALIZABLE` 事务隔离级别或悲观锁（`SELECT ... FOR UPDATE`）
+
+---
+
+## 九、Sonarr / Radarr 集成失败的重试和降级策略
+
+### 9.1 集成调用的幂等设计
+
+`sendToRadarr()` 和 `sendToSonarr()` 在推送前会先检查媒体是否已存在于 *arr 中，避免重复添加：
+
+**Radarr 幂等逻辑** → `server/api/servarr/radarr.ts:118-248`
+```typescript
+public addMovie = async (options: RadarrMovieOptions): Promise<RadarrMovie> => {
+  const movie = await this.getMovieByTmdbId(options.tmdbId);
+  
+  // 1. 已有文件 → 直接返回，跳过添加
+  if (movie.hasFile) return movie;
+  
+  // 2. 已存在但未监控 → 更新为监控状态
+  if (movie.id && !movie.monitored) {
+    const response = await this.axios.put('/movie', { ... });
+    if (options.searchNow) this.searchMovie(response.data.id);
+    return response.data;
+  }
+  
+  // 3. 已存在且已监控 → 直接返回，按需触发搜索
+  if (movie.id) {
+    if (options.searchNow && !movie.hasFile) {
+      this.searchMovie(movie.id);
+    }
+    return movie;
+  }
+  
+  // 4. 真正不存在 → 创建新记录
+  const response = await this.axios.post('/movie', { ... });
+  return response.data;
+};
+```
+
+**Sonarr 幂等逻辑** → `server/api/servarr/sonarr.ts:191-310`
+
+```typescript
+public async addSeries(options: AddSeriesOptions): Promise<SonarrSeries> {
+  const series = await this.getSeriesByTvdbId(options.tvdbid);
+  
+  // 1. 已存在 → 更新监控状态和季列表
+  if (series.id) {
+    series.monitored = options.monitored ?? series.monitored;
+    series.seasons = this.buildSeasonList(options.seasons, series.seasons);
+    const response = await this.axios.put('/series', series);
+    
+    // 重新监控缺失的集
+    const episodes = await this.getEpisodes(response.data.id);
+    const episodeIdsToMonitor = episodes
+      .filter(ep => options.seasons.includes(ep.seasonNumber) && !ep.monitored)
+      .map(ep => ep.id);
+    if (episodeIdsToMonitor.length > 0) {
+      await this.monitorEpisodes(episodeIdsToMonitor);
+    }
+    return response.data;
+  }
+  
+  // 2. 不存在 → 创建
+  const createdSeriesResponse = await this.axios.post('/series', { ... });
+  return createdSeriesResponse.data;
+}
+```
+
+### 9.2 失败处理流程
+
+**入口**：`MediaRequestSubscriber.sendToRadarr()` catch 块 → `MediaRequestSubscriber.ts:398-473`
+
+```typescript
+radarr.addMovie(radarrMovieOptions)
+  .then(async (radarrMovie) => {
+    // 成功：更新 Media 的 externalServiceId 等
+  })
+  .catch(async () => {
+    try {
+      const requestRepository = getRepository(MediaRequest);
+      // 防重复标记：避免重复 FAILED 状态写入
+      if (entity.status !== MediaRequestStatus.FAILED) {
+        entity.status = MediaRequestStatus.FAILED;
+        await requestRepository.save(entity);
+      }
+    } catch (saveError) { ... }
+    
+    MediaRequest.sendNotification(entity, media, Notification.MEDIA_FAILED);
+  })
+  . .finally(() => {
+    // 无论成功失败，清理缓存
+    .finally(() => {
+      radarr.clearCache({
+        tmdbId: movie.id,
+        externalId: entity.is4k ? media.externalServiceId4k : media.externalServiceId,
+      });
+    })
+```
+
+**失败分级处理**：
+
+| 失败场景 | 处理方式 | 请求状态 |
+|---|---|---|
+| 网络连接错误 / 配置错误 | catch 块捕获，标记为 FAILED | `FAILED` |
+| API 返回非 2xx | catch 块捕获，标记为 FAILED | `FAILED` |
+| 推送中途异常（已提交但更新 Media 失败） | 依赖 *arr 端幂等性，下次重试会走更新逻辑 | `FAILED`（取决于失败点） |
+| 状态已为 FAILED（并发） | 跳过重复保存 | 保持 `FAILED` |
+
+### 9.3 重试机制
+
+**手动重试**（唯一支持的重试方式）：
+```typescript
+// server/routes/request.ts:633-661
+requestRoutes.post('/:requestId/retry', ..., async (req, res) => {
+  const request = await requestRepository.findOneOrFail({ ... });
+  // 将 FAILED 重新设为 APPROVED，触发 afterUpdate 钩子
+  request.status = MediaRequestStatus.APPROVED;
+  request.modifiedBy = req.user;
+  await requestRepository.save(request);
+});
+```
+
+**重试触发的流程**：
+1. `FAILED → APPROVED` 状态变更
+2. `MediaRequestSubscriber.afterUpdate` 被触发
+3. 重新调用 `sendToRadarr()` / `sendToSonarr()`
+4. 由于 *arr API 是幂等的，会执行"查找 → 更新"而非重复创建
+
+**无自动重试**：
+- 系统不提供自动重试机制（无指数退避、无定时重试）
+- 所有重试必须由管理员手动触发
+- 设计考量：避免无效请求打爆 *arr 服务，让管理员介入判断失败原因
+
+### 9.4 降级策略
+
+| 降级配置 | 位置 | 默认值 | 作用 |
+|---|---|---|---|
+| `preventSearch` | `DVRSettings` | `false` | 为 `true` 时，添加媒体时不立即触发搜索（`searchNow: false`），由 *arr 后台索引器定时搜索 |
+| `minimumAvailability` | `RadarrSettings` | - | Radarr 接受请求时的最小可用标准（`announced` / `inCinemas` / `released` / `preDB`） |
+| `apiRequestTimeout` | `NetworkSettings` | `10000` ms | 所有 *arr API 请求的超时时间，避免长时间挂起 |
+| `tagRequests` | `DVRSettings` | - | 为请求添加用户标签，便于在 *arr 中追溯来源 |
+
+**降级工作流**：
+```
+管理员启用 preventSearch
+    │
+    ▼
+请求批准 → sendToRadarr(searchNow: false)
+    │
+    ▼
+Radarr 添加媒体但不立即搜索
+    │
+    ▼
+Radarr 索引器按计划自动搜索
+    │
+    ▼
+搜索命中 → 下载 → 媒体服务器扫描 → Media AVAILABLE → 请求 COMPLETED
+```
+
+**防止状态标记竞态**：
+```typescript
+// MediaRequestSubscriber.ts:402-405
+if (entity.status !== MediaRequestStatus.FAILED) {
+  entity.status = MediaRequestStatus.FAILED;
+  await requestRepository.save(entity);
+}
+```
+- 避免并发失败场景下重复写入 FAILED 状态
+- 配合 `finally` 块中的缓存清理，确保下次重试不会命中脏缓存
+
+### 9.5 故障模式与恢复
+
+| 故障模式 | 对请求状态的影响 | 恢复方式 |
+|---|---|---|
+| *arr 服务宕机 | 请求 → `FAILED` | 服务恢复后管理员手动重试 |
+| 配置错误（API Key 错误） | 请求 → `FAILED` | 修正配置后重试 |
+| 磁盘空间不足 | *arr 拒绝 → `FAILED` | 清理空间后重试 |
+| 媒体被 *arr 拒绝（版权/违规） | `FAILED` | 无法恢复，只能拒绝或删除请求 |
+| 网络超时（API 实际成功了） | `FAILED` 但媒体实际已添加 | 重试会走幂等更新路径，自动恢复 |
+| 媒体服务器未扫描到文件 | Media 长期 `PROCESSING` | 手动触发媒体库扫描 |
+
