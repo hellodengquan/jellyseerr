@@ -1021,9 +1021,564 @@ export const shouldSendAdminNotification = (type, user, payload): boolean => {
 
 ---
 
-## 十三、关键代码引用速查
+## 十三、通知模板的国际化与多语言支持
 
-### 13.1 核心框架
+### 13.1 国际化框架选型
+
+基于 `@formatjs/intl` 库实现，遵循 ICU Message Format 标准。核心初始化在 `server/i18n/index.ts`：
+
+```typescript
+const cache = createIntlCache();
+const intls = new Map<string, IntlInstance>();
+
+export function initI18n(): void {
+  for (const locale of availableLocales) {
+    const filePath = path.join(__dirname, `locale/${locale}.json`);
+    if (!fs.existsSync(filePath)) continue;
+
+    const messages = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    intls.set(
+      locale,
+      createIntl(
+        { locale, messages, defaultLocale: 'en' },
+        cache
+      )
+    );
+  }
+}
+
+export function getIntl(locale?: AvailableLocale): IntlInstance {
+  return intls.get(locale ?? 'en') || intls.get('en')!;
+}
+```
+
+**设计要点：**
+- 服务启动时一次性加载所有语言包到内存
+- 39 种语言支持（en、zh-Hans、zh-Hant、ja、ko、fr、de 等）
+- 使用 `createIntlCache` 复用缓存，提升性能
+- 默认回退到英语（en），保证不崩溃
+
+### 13.2 消息定义与使用模式
+
+#### 全局通用消息
+
+定义在 `server/i18n/globalMessages.ts`，所有 Agent 共享：
+
+```typescript
+const globalMessages = defineMessages('notifications.common', {
+  requestedBy: 'Requested By',
+  requestStatus: 'Request Status',
+  pendingApproval: 'Pending Approval',
+  available: 'Available',
+  declined: 'Declined',
+  failed: 'Failed',
+  commentFrom: 'Comment from {userName}',  // 支持变量插值
+  reportedBy: 'Reported By',
+  issueStatus: 'Issue Status',
+  viewIssue: 'View Issue in {applicationTitle}',
+  // ... 共 24 条通用消息
+});
+```
+
+#### Agent 私有消息
+
+部分 Agent 内部使用 `defineMessages` 定义私有消息（以 WebPush 为例）：
+
+```typescript
+const messages = defineMessages('notifications.webpush', {
+  pendingRequest: 'A {mediaType} request requires your approval',
+  requestApproved: 'Your {mediaType} request has been approved',
+  requestAvailable: 'Your {mediaType} request is now available',
+  // ...
+});
+
+// 使用方式
+const intl = getIntl(locale);
+const body = intl.formatMessage(messages.pendingRequest, { mediaType });
+```
+
+### 13.3 语言选择策略
+
+#### 系统级通知（Channel-based）
+
+使用系统配置的语言，每个 Agent 独立配置：
+
+```typescript
+// Slack Agent 示例
+const intl = getIntl(settings.options.locale);
+```
+
+系统级 Agent 的 `locale` 配置在 `settings.json` 中：
+
+```json
+{
+  "notifications": {
+    "agents": {
+      "discord": { "options": { "locale": "en" } },
+      "slack":   { "options": { "locale": "zh-Hans" } },
+      "email":   { "options": { "locale": "en" } }
+    }
+  }
+}
+```
+
+#### 用户级通知（User-based）
+
+使用接收用户的偏好语言，从 `user.settings.locale` 获取：
+
+```typescript
+// WebPush Agent 示例
+const locale = payload.notifyUser?.settings?.locale as AvailableLocale;
+const intl = getIntl(locale);
+```
+
+```typescript
+// Email Agent 示例
+this.buildMessage(type, payload, email, name, locale) {
+  const intl = getIntl(locale);
+  // ...
+}
+```
+
+### 13.4 模板系统分层
+
+#### 第一层：富文本模板（Discord/Slack 等）
+
+通过程序化构建消息结构，不依赖模板文件：
+
+```typescript
+// Discord Agent buildEmbed 方法
+public buildEmbed(type, payload, locale?): DiscordRichEmbed {
+  const intl = getIntl(locale);
+  
+  switch (type) {
+    case Notification.MEDIA_PENDING:
+      color = EmbedColors.ORANGE;
+      status = intl.formatMessage(globalMessages.pendingApproval);
+      break;
+    // ...
+  }
+
+  if (payload.request) {
+    fields.push({
+      name: intl.formatMessage(globalMessages.requestedBy),
+      value: payload.request.requestedBy.displayName,
+      inline: true,
+    });
+  }
+
+  return { title, description, color, fields, thumbnail };
+}
+```
+
+#### 第二层：邮件模板（Pug 模板引擎）
+
+邮件使用 Pug 模板文件，位于 `server/templates/email/`，支持 HTML 和纯文本：
+
+```
+server/templates/email/
+├── media-request/       # 媒体请求通知
+│   ├── html.pug         # HTML 版本
+│   └── subject.pug      # 邮件标题
+├── media-issue/         # 问题通知
+│   ├── html.pug
+│   └── subject.pug
+├── generatedpassword/   # 生成密码
+├── resetpassword/       # 重置密码
+└── test-email/          # 测试邮件
+```
+
+**模板使用方式（Email Agent）：**
+
+```typescript
+return {
+  template: 'media-request',  // 模板目录名
+  message: { to: recipientEmail },
+  locals: {
+    body,                    // 国际化后的正文
+    mediaName: payload.subject,
+    imageUrl: payload.image,
+    actionUrl: applicationUrl,
+    username: recipientName,
+    applicationTitle,
+    // ... 其他模板变量
+  },
+};
+```
+
+#### 第三层：简洁消息模板（Gotify/Ntfy/WebPush 等）
+
+纯文本或简单 Markdown 格式，程序化拼接：
+
+```typescript
+// Ntfy Agent
+const title = payload.event 
+  ? `${payload.event} - ${payload.subject}` 
+  : payload.subject;
+
+let message = payload.message ?? '';
+if (payload.request) {
+  message += `\n**${intl.formatMessage(globalMessages.requestedBy)}:** ${userName}`;
+  message += `\n**${intl.formatMessage(globalMessages.requestStatus)}:** ${status}`;
+}
+```
+
+### 13.5 国际化覆盖范围
+
+| 渠道 | 国际化支持 | 语言来源 | 模板方式 |
+|------|-----------|---------|---------|
+| Discord | ✅ 完整 | 系统配置 / 用户设置 | 程序化构建 Embed |
+| Email | ✅ 完整 | 用户设置 | Pug 模板 + 国际化变量 |
+| WebPush | ✅ 完整 | 用户设置 | 程序化拼接 |
+| Slack | ✅ 完整 | 系统配置 | 程序化构建 Block |
+| Telegram | ✅ 完整 | 系统配置 / 用户设置 | 程序化拼接 |
+| Pushover | ✅ 完整 | 系统配置 / 用户设置 | 程序化拼接 |
+| Pushbullet | ✅ 完整 | 系统配置 / 用户设置 | 程序化拼接 |
+| Gotify | ✅ 完整 | 系统配置 | 程序化拼接 |
+| Ntfy | ✅ 完整 | 系统配置 | 程序化拼接 |
+| Webhook | ❌ 无 | - | 用户自定义模板，原始数据透传 |
+
+**Webhook 的特殊处理：**
+Webhook 不做国际化，直接传递原始数据（英文）给用户配置的回调地址，由接收方自行处理本地化。
+
+### 13.6 语言配置存储
+
+用户语言偏好存储在 `UserSettings.locale`：
+
+```typescript
+// server/entity/UserSettings.ts
+@Column({ default: 'en' })
+public locale: string;
+```
+
+数据库迁移记录：`server/migration/sqlite/1619239659754-AddUserSettingsLocale.ts`
+
+---
+
+## 十四、批量通知的合并与节流机制
+
+### 14.1 当前机制：无内置合并与节流
+
+通知框架目前**没有**实现任何批量合并（batching）或节流（throttling）机制。
+
+**核心特征：**
+- 每次业务事件触发都独立调用 `notificationManager.sendNotification()`
+- 没有队列、没有缓冲、没有合并窗口
+- 所有通知实时发出，不做延迟聚合
+
+### 14.2 通知触发源分析
+
+通知通过 TypeORM 生命周期钩子和 Subscriber 触发：
+
+#### 触发源一：实体生命周期钩子
+
+`MediaRequest` 实体中使用 `@AfterInsert` 和 `@AfterUpdate`：
+
+```typescript
+@Entity()
+export class MediaRequest {
+  @AfterInsert()
+  public async notifyNewRequest(): Promise<void> {
+    if (this.status === MediaRequestStatus.PENDING) {
+      MediaRequest.sendNotification(this, media, Notification.MEDIA_PENDING);
+      
+      if (this.isAutoRequest) {
+        MediaRequest.sendNotification(this, media, Notification.MEDIA_AUTO_REQUESTED);
+      }
+    }
+  }
+
+  @AfterUpdate()
+  public async notifyApprovedOrDeclined(): Promise<void> {
+    if (this.status === MediaRequestStatus.APPROVED) {
+      MediaRequest.sendNotification(this, media, Notification.MEDIA_APPROVED);
+    }
+  }
+}
+```
+
+**潜在问题：自动请求场景的重复通知**
+
+当 `isAutoRequest: true` 时，`notifyNewRequest()` 会连续触发两次通知：
+1. `MEDIA_PENDING` - 待审核通知
+2. `MEDIA_AUTO_REQUESTED` - 自动请求通知
+
+两条通知内容相似，同时推送给用户，造成干扰。
+
+#### 触发源二：Subscriber 模式
+
+`IssueSubscriber` 和 `MediaRequestSubscriber` 使用 TypeORM 的事件订阅：
+
+```typescript
+@EventSubscriber()
+export class IssueSubscriber implements EntitySubscriberInterface<Issue> {
+  public afterInsert(event: InsertEvent<Issue>): void {
+    this.sendIssueNotification(event.entity, Notification.ISSUE_CREATED);
+  }
+
+  public beforeUpdate(event: UpdateEvent<Issue>): void {
+    if (event.entity.status === IssueStatus.RESOLVED && 
+        event.databaseEntity.status !== IssueStatus.RESOLVED) {
+      this.sendIssueNotification(event.entity, Notification.ISSUE_RESOLVED);
+    }
+  }
+}
+```
+
+### 14.3 批量场景下的行为
+
+#### 场景一：批量导入媒体
+
+当同步 Radarr/Sonarr 库时，可能短时间内大量媒体变为可用状态：
+
+- 每个媒体实体独立触发 `AfterUpdate`
+- 每个媒体独立调用 `sendNotification(Notification.MEDIA_AVAILABLE)`
+- 100 个媒体变为可用 → 100 × 10 个 Agent = 1000 次 API 调用
+
+#### 场景二：批量审核请求
+
+管理员批量批准 50 个请求：
+
+- 每个 `MediaRequest` 实体独立触发 `AfterUpdate`
+- 每个请求独立发出 `MEDIA_APPROVED` 通知
+- 50 个请求 × 10 个 Agent = 500 次 API 调用
+- 每个用户可能瞬间收到 50 条通知
+
+#### 场景三：剧集季级可用
+
+一部剧集的 24 集同时下载完成：
+
+- 每集独立触发状态更新
+- 每集独立发出 `MEDIA_AVAILABLE` 通知
+- 用户可能收到 24 条"XX 第 X 集已可用"的重复类型通知
+
+### 14.4 唯一的隐式合并：状态跳转合并
+
+在 `MediaRequest.notifyApprovedOrDeclined()` 中有一处**隐式合并**：
+
+```typescript
+@AfterUpdate()
+public async notifyApprovedOrDeclined(autoApproved = false): Promise<void> {
+  if (this.status === MediaRequestStatus.APPROVED) {
+    // 如果媒体已经可用，跳过 APPROVED 通知，直接发 AVAILABLE 通知
+    if (media[is4k ? 'status4k' : 'status'] === MediaStatus.AVAILABLE) {
+      logger.info('Media is already available. Sending availability notification instead of approval.', {
+        label: 'Media Request',
+        requestId: this.id,
+      });
+      MediaRequest.sendNotification(this, media, Notification.MEDIA_AVAILABLE);
+      return; // 跳过 APPROVED 通知
+    }
+    
+    MediaRequest.sendNotification(this, media, Notification.MEDIA_APPROVED);
+  }
+}
+```
+
+**逻辑：**
+- 当批准请求时，如果媒体已经是可用状态
+- 不发送"已批准"通知，直接发送"已可用"通知
+- 避免用户连续收到两条内容相似的通知
+
+### 14.5 节流机制的缺失
+
+目前完全没有节流保护：
+
+| 维度 | 现状 | 风险 |
+|------|------|------|
+| 单用户通知频率 | 无限制 | 1 分钟内可能收到几十条通知 |
+| 单渠道 API 调用频率 | 无限制 | 可能触发 Discord/Telegram 等平台的限流 |
+| 全局通知 QPS | 无限制 | 批量操作时可能瞬间耗尽资源 |
+| 重复内容检测 | 无 | 相同类型通知可能在短时间内反复发送 |
+
+### 14.6 优化方向建议
+
+1. **引入合并窗口（Batching Window）**
+   - 同类型、同用户的通知在 5-10 秒窗口内合并
+   - 合并为 "XX 等 5 部电影已可用" 的摘要通知
+
+2. **按用户级别节流**
+   - 单个用户每分钟最多接收 N 条通知
+   - 超出部分延迟发送或合并
+
+3. **按渠道级别限流**
+   - 针对每个外部 API 设置 QPS 限制
+   - 使用令牌桶或漏桶算法
+
+4. **批量操作显式标记**
+   - 批量批准/导入时，显式跳过单条通知
+   - 操作完成后发送一条汇总通知
+
+---
+
+## 十五、通知失败时的告警和运维介入流程
+
+### 15.1 日志系统基础
+
+通知框架使用 `winston` 作为日志库，配置在 `server/logger.ts`。
+
+#### 三个日志输出通道
+
+```typescript
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL?.toLowerCase() || 'debug',
+  format: winston.format.combine(
+    winston.format.splat(),
+    winston.format.timestamp(),
+    hformat
+  ),
+  transports: [
+    new winston.transports.Console({ /* 彩色控制台输出 */ }),
+    seerrFileTransport,        // 人类可读文本日志
+    machineLogFileTransport,   // 机器可读 JSON 日志
+  ],
+});
+```
+
+#### 文件日志配置
+
+| 日志类型 | 文件 | 保留策略 | 格式 |
+|---------|------|---------|------|
+| 应用日志 | `seerr-%DATE%.log` | 7 天，20MB 滚动 | 人类可读文本 |
+| 机器日志 | `.machinelogs-%DATE%.json` | 1 天，20MB 滚动 | JSON 格式 |
+
+### 15.2 通知失败的日志记录
+
+每个 Agent 的 `send()` 方法都有统一的错误日志模式：
+
+```typescript
+try {
+  await axios.post(webhookUrl, payload);
+  return true;
+} catch (e) {
+  logger.error('Error sending Discord notification', {
+    label: 'Notifications',           // 固定标签，方便筛选
+    type: Notification[type],         // 通知类型
+    subject: payload.subject,         // 通知标题
+    errorMessage: e.message,          // 错误消息
+    response: e?.response?.data,      // API 响应（如果有）
+  });
+  return false;
+}
+```
+
+**日志关键字段说明：**
+- `label: 'Notifications'` - 可用于过滤所有通知相关日志
+- `type` - 业务场景（MEDIA_PENDING / MEDIA_AVAILABLE 等）
+- `errorMessage` - 错误原因（网络超时、认证失败、权限不足等）
+- `response` - 外部 API 返回的错误详情，用于诊断
+
+### 15.3 机器日志的结构化
+
+`.machinelogs.json` 为结构化 JSON 格式，便于后续分析：
+
+```json
+{
+  "timestamp": "2026-06-14T10:30:00.123Z",
+  "level": "error",
+  "label": "Notifications",
+  "message": "Error sending Discord notification",
+  "type": "MEDIA_AVAILABLE",
+  "subject": "Inception (2010)",
+  "errorMessage": "Request failed with status code 401",
+  "response": { "message": "Invalid Webhook Token" }
+}
+```
+
+### 15.4 告警机制：完全缺失
+
+**当前状态：没有任何内置告警机制。**
+
+| 告警维度 | 现状 | 说明 |
+|---------|------|------|
+| 失败率告警 | ❌ 无 | 即使 100% 的通知都失败，也不会主动告警 |
+| 连续失败告警 | ❌ 无 | 某个渠道连续失败 N 次，不会触发告警 |
+| 配置错误告警 | ❌ 无 | Webhook URL 无效、API Token 过期等配置问题，仅记录日志 |
+| 外部服务不可用告警 | ❌ 无 | SMTP 服务器宕机、Discord API 不可用，仅记录日志 |
+| 发送延迟告警 | ❌ 无 | 无超时监控，发送多久都不会告警 |
+
+### 15.5 运维介入流程：完全被动
+
+**当前运维流程：**
+
+```
+用户反馈 "没收到通知"
+       ↓
+管理员登录服务器查看 seerr.log
+       ↓
+搜索 label:Notifications 相关错误
+       ↓
+根据 errorMessage 和 response 诊断原因
+       ↓
+手动修复配置或联系外部服务
+       ↓
+通过测试通知功能验证修复
+```
+
+**典型故障排查路径：**
+
+1. **Discord Webhook 失效**
+   - 日志：`errorMessage: "Request failed with status code 404"`
+   - 原因：Webhook URL 被删除或过期
+   - 修复：重新配置 Webhook URL
+
+2. **SMTP 认证失败**
+   - 日志：`errorMessage: "Invalid login: 535 Authentication failed"`
+   - 原因：邮箱密码过期或被封禁
+   - 修复：更新 SMTP 密码
+
+3. **WebPush 订阅过期**
+   - 日志：`"removing invalid subscription"`
+   - 原因：用户浏览器推送订阅已过期
+   - 修复：系统自动处理，无需人工干预
+
+### 15.6 失败通知的测试机制
+
+系统提供测试通知功能，用于验证配置正确性：
+
+```typescript
+// 测试通知调用
+notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
+  event: 'Test Notification',
+  subject: 'Test Notification',
+  message: 'This is a test notification from Overseerr.',
+  notifySystem: true,
+  notifyUser: currentUser,
+});
+```
+
+**注意：`TEST_NOTIFICATION` 类型特殊处理**
+- 在 `hasNotificationType()` 中，测试通知会强制启用
+- 不需要在用户/系统设置中显式启用该类型
+- 方便测试配置，无需临时修改通知类型开关
+
+### 15.7 优化方向建议
+
+1. **失败计数器**
+   - 为每个 Agent 维护连续失败计数器
+   - 连续失败 N 次（如 10 次）触发告警
+
+2. **失败率监控**
+   - 统计滑动窗口内的失败率
+   - 失败率 > 20% 触发告警
+
+3. **健康检查端点**
+   - 暴露 `/api/v1/health/notifications` 端点
+   - 返回各渠道最近 1 小时的发送统计
+
+4. **告警集成**
+   - 支持将通知失败事件转发到运维告警系统
+   - 复用现有 Webhook Agent 发送告警
+
+5. **配置校验**
+   - 保存配置时主动验证连通性
+   - 配置错误立即提示用户，而非等到实际发送失败
+
+---
+
+## 十六、关键代码引用速查
+
+### 16.1 核心框架
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1035,7 +1590,7 @@ export const shouldSendAdminNotification = (type, user, payload): boolean => {
 | NotificationPayload | `server/lib/notifications/agents/agent.ts` | 9-24 |
 | Agent 注册 | `server/index.ts` | 132-143 |
 
-### 13.2 配置与存储
+### 16.2 配置与存储
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1048,7 +1603,7 @@ export const shouldSendAdminNotification = (type, user, payload): boolean => {
 | User.settings 关联配置 | `server/entity/User.ts` | 137-142 |
 | 用户认证中间件 | `server/middleware/auth.ts` | 9-41 |
 
-### 13.3 各 Agent 实现
+### 16.3 各 Agent 实现
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1060,13 +1615,18 @@ export const shouldSendAdminNotification = (type, user, payload): boolean => {
 | Pushover Agent | `server/lib/notifications/agents/pushover.ts` | 36-353 |
 | Telegram Agent | `server/lib/notifications/agents/telegram.ts` | 37-325 |
 
-### 13.4 业务触发点
+### 16.4 业务触发点
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
 | 媒体请求通知触发 | `server/subscriber/MediaRequestSubscriber.ts` | 78-94 |
+| 实体生命周期钩子 @AfterInsert | `server/entity/MediaRequest.ts` | 629-655 |
+| 实体生命周期钩子 @AfterUpdate | `server/entity/MediaRequest.ts` | 663-730 |
+| IssueSubscriber 事件订阅 | `server/subscriber/IssueSubscriber.ts` | 16-136 |
+| IssueCommentSubscriber | `server/subscriber/IssueCommentSubscriber.ts` | - |
+| MediaSubscriber | `server/subscriber/MediaSubscriber.ts` | - |
 
-### 13.5 重试、降级与去重相关
+### 16.5 重试、降级与去重相关
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1076,3 +1636,25 @@ export const shouldSendAdminNotification = (type, user, payload): boolean => {
 | Telegram 同渠道去重 | `server/lib/notifications/agents/telegram.ts` | 220-228 |
 | 管理员通知操作者去重 | `server/lib/notifications/index.ts` | 67-90 |
 | Manager 并发 fire-and-forget | `server/lib/notifications/index.ts` | 109-113 |
+| 状态跳转合并隐式去重 | `server/entity/MediaRequest.ts` | 682-696 |
+
+### 16.6 国际化与多语言
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| i18n 初始化 initI18n | `server/i18n/index.ts` | 12-38 |
+| getIntl 工具函数 | `server/i18n/index.ts` | 40-42 |
+| defineMessages 工具函数 | `server/i18n/index.ts` | 48-62 |
+| 全局通用消息 globalMessages | `server/i18n/globalMessages.ts` | 3-24 |
+| Slack Agent 国际化使用 | `server/lib/notifications/agents/slack.ts` | 64-221 |
+| Ntfy Agent 国际化使用 | `server/lib/notifications/agents/ntfy.ts` | 31-113 |
+| 用户 locale 字段 | `server/entity/UserSettings.ts` | 155-157 |
+
+### 16.7 日志与运维
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| winston logger 配置 | `server/logger.ts` | 1-75 |
+| Agent 统一错误日志模式 | `server/lib/notifications/agents/*` | 各 Agent send() 方法 |
+| 测试通知特殊处理 | `server/lib/notifications/index.ts` | 37-39 |
+| 邮件模板目录 | `server/templates/email/` | - |
