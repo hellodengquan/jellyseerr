@@ -2122,9 +2122,581 @@ function shouldSuppressNotification(
 
 ---
 
-## 十九、关键代码引用速查
+## 十九、通知到达率统计与监控指标
 
-### 19.1 核心框架
+### 19.1 当前状态：完全没有监控指标体系
+
+| 监控能力 | 现状 | 说明 |
+|---------|------|------|
+| Prometheus /metrics 端点 | ❌ 无 | 未集成任何指标采集框架 |
+| OpenTelemetry 链路追踪 | ❌ 无 | 未集成 OTel SDK |
+| 发送成功率统计 | ❌ 无 | 没有计数器统计成功/失败次数 |
+| 到达率追踪 | ❌ 无 | 无回执机制，无法确认是否送达 |
+| 延迟统计 | ❌ 无 | 未记录发送耗时的 P50/P95/P99 |
+| 渠道可用性监控 | ❌ 无 | 无心跳检测，失败只在实际发送时发现 |
+| 告警阈值配置 | ❌ 无 | 没有任何告警规则配置 |
+| 监控仪表盘 | ❌ 无 | UI 层无任何监控视图 |
+
+### 19.2 唯一的数据源：结构化日志
+
+唯一可以用于间接统计的是 `.machinelogs.json` 中的结构化日志。
+
+#### 可从日志提取的指标
+
+通过日志聚合工具（ELK/Loki/Grafana），可以从日志中提取以下指标：
+
+| 指标 | 日志字段 | 计算方式 |
+|------|---------|---------|
+| 发送总次数 | `label=Notifications`, `level=debug`, message 含 `"Sending .* notification"` | 计数 |
+| 失败次数 | `label=Notifications`, `level=error`, message 含 `"Error sending .* notification"` | 计数 |
+| 成功率 | 上述两者 | `(总次数 - 失败次数) / 总次数` |
+| 各渠道发送量 | 从 message 中提取渠道名（Discord/Email 等） | 按渠道分组计数 |
+| 各通知类型发送量 | `type` 字段 | 按 type 分组计数 |
+| 失败原因分布 | `errorMessage` 字段 | 按错误消息分组 |
+
+#### 日志分析的局限性
+
+1. **成功日志缺失**：成功发送没有显式日志，只能通过 `Sending X notification` 推断开始，无法确认结束
+2. **无法精确计算成功率**：缺少 success 日志，失败/开始 只能得到**下限成功率**
+3. **无延迟数据**：日志中没有开始-结束时间戳，无法计算 P95 延迟
+4. **保留期短**：机器日志仅保留 1 天，无法做周/月趋势分析
+5. **无用户维度**：日志中缺少接收用户 ID，无法按用户统计到达率
+
+### 19.3 各渠道的送达确认能力差异
+
+不同渠道对"送达确认"的支持程度不同：
+
+| 渠道 | 送达确认 | Webhook 回执 | 说明 |
+|------|---------|-------------|------|
+| Email | ❌ 无 | ❌ | SMTP 只确认接收，不确认用户阅读 |
+| WebPush | ⚠️ 部分 | ❌ | 410/404 表示订阅失效，其他状态码不代表送达 |
+| Discord | ⚠️ 部分 | ✅ 可配置 | Webhook 返回 204 表示成功送达频道 |
+| Slack | ⚠️ 部分 | ❌ | API 返回 200 表示成功，但不保证用户看到 |
+| Telegram | ⚠️ 部分 | ❌ | API 返回 ok=true 表示 Bot 已发送 |
+| Pushover | ✅ 有 | ❌ | API 返回 receipt，可查询用户确认状态 |
+| Pushbullet | ⚠️ 部分 | ❌ | API 返回 200 表示推送成功 |
+| Gotify | ⚠️ 部分 | ❌ | API 返回 200 表示服务端已接收 |
+| Ntfy | ⚠️ 部分 | ❌ | API 返回 200 表示消息已排队 |
+| Webhook | ✅ 有 | N/A | HTTP 状态码直接作为送达确认 |
+
+### 19.4 建议的指标体系
+
+#### 核心指标
+
+```typescript
+// 建议的 Prometheus 指标
+notifications_sent_total{agent, type, status}        // Counter: 发送总数
+notifications_duration_seconds{agent, type, status}  // Histogram: 发送延迟
+notifications_active_subscriptions{agent}            // Gauge: 活跃订阅数
+notifications_delivery_failures{agent, error_type}   // Counter: 失败分类
+```
+
+#### 标签维度
+
+| 标签 | 取值示例 | 说明 |
+|------|---------|------|
+| `agent` | discord, email, webpush, ... | 渠道名 |
+| `type` | MEDIA_AVAILABLE, MEDIA_PENDING, ... | 通知类型 |
+| `status` | success, failure, rate_limited | 发送结果 |
+| `error_type` | auth_failed, network_timeout, invalid_payload, ... | 失败分类 |
+
+#### 告警规则建议
+
+| 告警 | 表达式 | 严重程度 |
+|------|--------|---------|
+| 渠道完全不可用 | `rate(notifications_sent_total{status="failure"}[5m]) / rate(notifications_sent_total[5m]) > 0.9` | P1 |
+| 渠道高失败率 | `rate(notifications_sent_total{status="failure"}[15m]) / rate(notifications_sent_total[15m]) > 0.3` | P2 |
+| 发送延迟过高 | `histogram_quantile(0.95, notifications_duration_seconds[10m]) > 30s` | P2 |
+| 发送量突降 | `rate(notifications_sent_total[5m]) < rate(notifications_sent_total[1h]) offset 1h * 0.3` | P3 |
+
+---
+
+## 二十、用户取消通知订阅的端到端链路
+
+### 20.1 各渠道的取消订阅方式对比
+
+通知框架支持**三种取消订阅模式**，不同渠道适用不同模式：
+
+| 渠道 | 取消方式 | 操作位置 | API 端点 |
+|------|---------|---------|---------|
+| WebPush | 显式删除订阅 | 用户端 / 浏览器设置 | `DELETE /user/:id/pushSubscription/:endpoint` |
+| Email | ❌ 无 unsubscribe 链接 | 仅通过通知类型开关 | - |
+| Discord 用户 | 清空 discordIds | 用户设置页 | `POST /user/:id/settings/notifications` |
+| Telegram | 清空 telegramChatId | 用户设置页 | `POST /user/:id/settings/notifications` |
+| Pushover | 清空 token/key | 用户设置页 | `POST /user/:id/settings/notifications` |
+| Pushbullet | 清空 accessToken | 用户设置页 | `POST /user/:id/settings/notifications` |
+| Discord 系统 | 管理员关闭 Agent | 管理后台 | `POST /settings/notifications/discord` |
+| Slack 系统 | 管理员关闭 Agent | 管理后台 | `POST /settings/notifications/slack` |
+| Gotify 系统 | 管理员关闭 Agent | 管理后台 | `POST /settings/notifications/gotify` |
+| Ntfy 系统 | 管理员关闭 Agent | 管理后台 | `POST /settings/notifications/ntfy` |
+| Webhook 系统 | 管理员关闭 Agent | 管理后台 | `POST /settings/notifications/webhook` |
+
+### 20.2 WebPush 订阅生命周期（最完整链路）
+
+WebPush 是唯一实现了完整的**注册-使用-失效-清理**生命周期的渠道。
+
+#### 阶段一：用户订阅注册
+
+端点：`POST /user/registerPushSubscription`
+
+```typescript
+// server/routes/user/index.ts:239-325
+router.post('/registerPushSubscription', async (req, res, next) => {
+  await dataSource.transaction(async (transactionalEntityManager) => {
+    const transactionalRepo = 
+      transactionalEntityManager.getRepository(UserPushSubscription);
+
+    // 1. 防重复检查：auth 或 endpoint 相同则跳过
+    const existingSubscription = await transactionalRepo.findOne({
+      where: [
+        { auth: req.body.auth, user: { id: req.user?.id } },
+        { endpoint: req.body.endpoint, user: { id: req.user?.id } },
+      ],
+    });
+
+    if (existingSubscription) {
+      // 2. iOS 特殊处理：endpoint 相同但 auth 变化（密钥刷新）
+      if (
+        existingSubscription.endpoint === req.body.endpoint &&
+        existingSubscription.auth !== req.body.auth
+      ) {
+        existingSubscription.auth = req.body.auth;
+        existingSubscription.p256dh = req.body.p256dh;
+        await transactionalRepo.save(existingSubscription);
+        return;
+      }
+      return; // 完全重复则跳过
+    }
+
+    // 3. 清理同设备的陈旧订阅（iOS 静默刷新导致）
+    if (req.body.userAgent) {
+      const staleSubscriptions = await transactionalRepo.find({
+        where: {
+          userAgent: req.body.userAgent,
+          user: { id: req.user?.id },
+          endpoint: Not(req.body.endpoint),
+        },
+      });
+      if (staleSubscriptions.length > 0) {
+        await transactionalRepo.remove(staleSubscriptions);
+      }
+    }
+
+    // 4. 创建新订阅
+    const userPushSubscription = new UserPushSubscription({
+      auth: req.body.auth,
+      endpoint: req.body.endpoint,
+      p256dh: req.body.p256dh,
+      userAgent: req.body.userAgent,
+      user: req.user,
+    });
+    await transactionalRepo.save(userPushSubscription);
+  });
+  return res.status(204).send();
+});
+```
+
+**关键设计点：**
+- **事务保护**：整个流程在事务中执行，防止并发竞态条件
+- **iOS 密钥刷新兼容**：同 endpoint 但 auth 变化时更新而非创建新记录
+- **陈旧订阅清理**：同 userAgent 的旧 endpoint 自动删除，避免 iOS 刷新导致的僵尸订阅
+- **唯一约束**：`@Unique(['endpoint', 'user'])` 数据库层面防止重复
+
+#### 阶段二：通知发送时使用订阅
+
+```typescript
+// server/lib/notifications/agents/webpush.ts:220-282
+const userPushSubRepository = getRepository(UserPushSubscription);
+const userPushSubs = await userPushSubRepository.find({
+  where: { user: { id: payload.notifyUser.id } },
+});
+
+await Promise.all(
+  userPushSubs.map(async (pushSub) => {
+    try {
+      await sendNotification(pushSub.endpoint, /* payload */);
+    } catch (e) {
+      const statusCode = e?.statusCode;
+      const isPermanentFailure = statusCode === 410 || statusCode === 404;
+
+      if (isPermanentFailure) {
+        // 阶段三：永久失败自动清理订阅
+        await userPushSubRepository.remove(pushSub);
+      }
+    }
+  })
+);
+```
+
+#### 阶段三：订阅失效自动清理
+
+- **触发条件**：推送服务返回 `410 Gone` 或 `404 Not Found`
+- **动作**：立即从数据库删除该订阅记录
+- **日志**：记录 `"removing invalid subscription"`
+
+#### 阶段四：用户主动取消订阅
+
+端点：`DELETE /user/:id/pushSubscription/:endpoint`
+
+```typescript
+// server/routes/user/index.ts:370-405
+router.delete('/:id/pushSubscription/:endpoint', async (req, res, next) => {
+  const userPushSubRepository = getRepository(UserPushSubscription);
+
+  const userPushSub = await userPushSubRepository.findOne({
+    where: {
+      user: { id: Number(req.params.id) },
+      endpoint: req.params.endpoint,
+    },
+  });
+
+  // 幂等设计：订阅不存在也返回 204，避免前端报错
+  if (!userPushSub) {
+    return res.status(204).send();
+  }
+
+  await userPushSubRepository.remove(userPushSub);
+  return res.status(204).send();
+});
+```
+
+#### WebPush 订阅查询接口
+
+| 接口 | 功能 |
+|------|------|
+| `GET /user/:id/pushSubscriptions` | 查询用户所有订阅列表 |
+| `GET /user/:id/pushSubscription/:endpoint` | 查询单个订阅详情 |
+
+### 20.3 用户级渠道：通过设置页面取消
+
+对于 Email、Discord 用户通知、Telegram、Pushover、Pushbullet 等用户级渠道，取消订阅是通过**修改用户设置**实现的。
+
+#### 通知类型粒度开关
+
+用户可以针对每种渠道，独立启用/禁用每种通知类型：
+
+```typescript
+// server/routes/user/usersettings.ts:561-637
+userSettingsRoutes.post('/:id/notifications', async (req, res) => {
+  // notificationTypes 是一个对象，每种渠道对应一个 bitmask
+  // { email: 4095, webpush: 0, pushover: 12, ... }
+  user.settings.notificationTypes = Object.assign(
+    {},
+    user.settings.notificationTypes,
+    req.body.notificationTypes  // 增量合并，不是整体覆盖
+  );
+
+  // 同时可以清除渠道凭证，彻底断开
+  user.settings.telegramChatId = req.body.telegramChatId;  // 清空 = 取消
+  user.settings.pushoverUserKey = req.body.pushoverUserKey; // 清空 = 取消
+  user.settings.discordIds = req.body.discordIds;           // 清空数组 = 取消
+});
+```
+
+**两种取消级别：**
+
+| 级别 | 操作 | 效果 | 可逆性 |
+|------|------|------|--------|
+| 软取消 | 通知类型设为 0 | 该渠道所有通知都不发送，保留凭证 | 可逆 |
+| 硬取消 | 清空渠道凭证（token/chatId） | 同时删除配置，需要重新认证 | 需重新配置 |
+
+### 20.4 系统级渠道：管理员关闭
+
+对于系统广播类渠道（Discord/Slack/Telegram 系统频道等），只能由管理员在后台关闭：
+
+```typescript
+// server/routes/settings/notifications.ts:95-119 (Discord 示例)
+router.post('/discord', async (req, res) => {
+  const settings = getSettings();
+  settings.notifications.agents.discord = {
+    enabled: req.body.enabled,  // false = 全量关闭
+    types: req.body.types,
+    options: req.body.options,
+  };
+  settings.save();
+  return res.status(200).json(settings.notifications.agents.discord);
+});
+```
+
+### 20.5 Email 的 unsubscribe 链接缺失
+
+**当前缺陷：** Email 通知中**没有** List-Unsubscribe 头或邮件底部的取消订阅链接。
+
+**合规影响：**
+- 不符合 CAN-SPAM Act（美国）要求的"清晰可见的取消订阅方式"
+- 不符合 GDPR（欧盟）要求的"数据主体随时撤回同意"
+- 用户只能登录系统后在设置页面关闭，不够便捷
+
+**建议修复：**
+
+```typescript
+// Email Agent 中添加
+mail.send({
+  template: 'media-request',
+  message: {
+    to: recipientEmail,
+    // 添加 List-Unsubscribe 头
+    headers: {
+      'List-Unsubscribe': `<${applicationUrl}/unsubscribe?token=${signedToken}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    },
+  },
+  // ...
+});
+```
+
+---
+
+## 二十一、通知模板版本管理与回滚
+
+### 21.1 三层模板的版本管理现状
+
+| 模板类型 | 版本管理 | 回滚能力 | 存储位置 |
+|---------|---------|---------|---------|
+| 系统设置（含 Agent 配置） | ✅ 有迁移机制 | ⚠️ 有单版本备份 | `settings.json` 文件 |
+| Email Pug 模板 | ❌ 无 | ❌ 无 | `server/templates/email/` 文件 |
+| 程序化模板（Discord/Slack 等） | ❌ 无 | ❌ 无 | 代码硬编码 |
+| Webhook 自定义模板 | ❌ 无 | ❌ 无 | `settings.json`（编码存储） |
+| 国际化语言包 | ❌ 无 | ❌ 无 | `server/i18n/locale/*.json` 文件 |
+
+### 21.2 系统设置的迁移框架
+
+系统设置（包含所有通知 Agent 配置）有完整的迁移机制，位于 `server/lib/settings/migrator.ts`。
+
+#### 迁移执行流程
+
+```typescript
+// server/lib/settings/migrator.ts:8-101
+export const runMigrations = async (settings, SETTINGS_PATH) => {
+  let migrated = settings;
+
+  // 1. 备份机制：迁移前创建 .old.json 备份
+  const BACKUP_PATH = SETTINGS_PATH.replace('.json', '.old.json');
+  let oldBackup = null;
+  try {
+    oldBackup = await fs.readFile(BACKUP_PATH, 'utf-8');
+  } catch { /* 忽略 */ }
+  await fs.writeFile(BACKUP_PATH, JSON.stringify(settings, undefined, ' '));
+
+  // 2. 按文件名顺序执行所有迁移
+  const migrations = (await fs.readdir(migrationsDir))
+    .filter(f => f.endsWith('.js') || f.endsWith('.ts'));
+
+  for (const migration of migrations) {
+    const { default: migrationFn } = await import(
+      path.join(migrationsDir, migration)
+    );
+    // 深拷贝后执行迁移，避免副作用
+    const newSettings = await migrationFn(structuredClone(migrated));
+    migrated = newSettings;
+  }
+
+  // 3. 迁移后校验：确保写入文件正确
+  if (settingsBefore !== settingsAfter) {
+    await fs.writeFile(SETTINGS_PATH, JSON.stringify(migrated, undefined, ' '));
+    const fileSaved = JSON.parse(await fs.readFile(SETTINGS_PATH, 'utf-8'));
+    if (JSON.stringify(fileSaved) !== settingsAfter) {
+      throw new Error('Unable to save settings after migration.');
+    }
+  } else if (oldBackup) {
+    // 未发生迁移，恢复原有备份（防止两份文件相同）
+    await fs.writeFile(BACKUP_PATH, oldBackup.toString());
+  }
+};
+```
+
+#### 已有的迁移脚本
+
+`server/lib/settings/migrations/` 目录中的迁移：
+
+| 编号 | 迁移文件 | 内容 |
+|------|---------|------|
+| 0001 | `migrate_hostname.ts` | Hostname 配置迁移 |
+| 0002 | `migrate_apitokens.ts` | API Token 配置迁移 |
+| 0003 | `emby_media_server_type.ts` | Emby 媒体服务器类型迁移 |
+| 0004 | `migrate_region_setting.ts` | 区域设置迁移 |
+| 0005 | `migrate_network_settings.ts` | 网络设置迁移 |
+| 0006 | `remove_lunasea.ts` | 移除 LunaSea Agent 配置 |
+| 0007 | `migrate_arr_tags.ts` | *Arr 标签配置迁移 |
+| 0008 | `migrate_blacklist_to_blocklist.ts` | blacklist → blocklist 命名变更 |
+
+#### 迁移脚本示例（0008）
+
+```typescript
+// server/lib/settings/migrations/0008_migrate_blacklist_to_blocklist.ts
+const migrateBlacklistToBlocklist = (settings: any): AllSettings => {
+  // 幂等检查：已执行过则跳过
+  if (
+    Array.isArray(settings.migrations) &&
+    settings.migrations.includes('0008_migrate_blacklist_to_blocklist')
+  ) {
+    return settings;
+  }
+
+  // 字段重命名：blacklist → blocklist
+  if (settings.main?.hideBlacklisted !== undefined) {
+    settings.main.hideBlocklisted = settings.main.hideBlacklisted;
+    delete settings.main.hideBlacklisted;
+  }
+
+  // 记录已执行的迁移
+  if (!Array.isArray(settings.migrations)) {
+    settings.migrations = [];
+  }
+  settings.migrations.push('0008_migrate_blacklist_to_blocklist');
+
+  return settings;
+};
+```
+
+**迁移设计模式：**
+- **幂等性**：通过 `settings.migrations` 数组记录已执行迁移，重复执行安全
+- **类型兼容**：入参为 `any`，出参为强类型 `AllSettings`，兼容旧格式
+- **前向兼容**：缺失字段跳过，不会因旧版本配置缺失而崩溃
+
+#### 回滚机制（有限）
+
+```
+settings.json       ← 当前生效配置
+settings.old.json   ← 上一次迁移前的备份（仅保留一个版本）
+```
+
+**限制：**
+- 仅保留**最近一次**迁移前的备份
+- 没有版本历史，无法回滚到更早版本
+- 没有自动回滚流程，需要手动替换文件
+- 迁移失败会直接 `process.exit()`，需要人工介入
+
+### 21.3 数据库结构迁移（用户设置）
+
+用户设置存储在 SQLite/PostgreSQL 中，通过 TypeORM 的 migration 机制管理版本。
+
+#### 用户通知相关迁移历史
+
+| 迁移文件 | 内容 |
+|---------|------|
+| `1613615266968-CreateUserSettings.ts` | 创建 UserSettings 表 |
+| `1613955393450-UpdateUserSettingsRegions.ts` | 区域字段更新 |
+| `1614334195680-AddTelegramSettingsToUserSettings.ts` | 新增 Telegram 配置字段 |
+| `1615333940450-AddPGPToUserSettings.ts` | 新增 PGP 公钥字段 |
+| `1617730837489-AddUserSettingsNotificationAgentsField.ts` | 新增通知 Agent 字段 |
+| `1619239659754-AddUserSettingsLocale.ts` | 新增 locale 字段 |
+| `1619339817343-AddUserSettingsNotificationTypes.ts` | 新增 notificationTypes 字段 |
+| `1635079863457-AddPushbulletPushoverUserSettings.ts` | 新增 Pushbullet/Pushover 字段 |
+| `1727907530757-AddUserSettingsStreamingRegion.ts` | 新增流式区域字段 |
+| `1618912653565-CreateUserPushSubscriptions.ts` | 创建 UserPushSubscription 表 |
+| `1743023610704-UpdateWebPush.ts` / `1745492372230-UpdateWebPush.ts` | WebPush 字段更新 |
+| `1765233385034-AddUniqueConstraintToPushSubscription.ts` | 新增唯一约束 |
+
+**特点：**
+- 数据库迁移有完整历史，但同样**没有回滚脚本**
+- TypeORM 的 `migrate:revert` 理论可用，但未经过充分测试
+- 迁移失败同样需要人工处理
+
+### 21.4 通知模板版本管理的完全缺失
+
+#### Email Pug 模板
+
+```
+server/templates/email/
+├── media-request/html.pug      # 硬编码在仓库中
+├── media-request/subject.pug
+├── media-issue/html.pug
+└── ...
+```
+
+- 随版本发布更新，没有独立的版本号
+- 用户无法自定义模板，也无法回退到旧版本
+- 模板修改需要重新部署服务
+
+#### 程序化模板（Discord/Slack 等）
+
+```typescript
+// 消息构建逻辑硬编码在代码中
+// server/lib/notifications/agents/discord.ts:180-352
+public buildEmbed(type, payload, locale?): DiscordRichEmbed {
+  // 所有消息结构在代码中构建
+  // 没有外部模板文件，没有版本控制
+}
+```
+
+- 完全硬编码，修改需要发布新版本
+- 没有用户自定义能力
+- 没有回滚机制（除了回滚代码版本）
+
+#### Webhook 自定义模板
+
+用户配置的 JSON 模板只存在 `settings.json` 中：
+- 没有版本历史，每次保存覆盖上一版
+- 没有预览功能，保存即生效
+- 保存错误无法回滚，只能手动重新配置
+
+### 21.5 建议的模板版本管理方案
+
+#### Webhook 模板版本管理
+
+```typescript
+// 建议的实体
+@Entity()
+export class WebhookTemplateVersion {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  version: string;          // "v1", "v2" ...
+
+  @Column({ type: 'text' })
+  jsonPayload: string;      // Base64 编码的模板
+
+  @Column({ type: 'text' })
+  webhookUrl: string;
+
+  @Column({ default: false })
+  isActive: boolean;        // 当前激活版本
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @Column()
+  createdBy: number;        // 哪个管理员创建的版本
+
+  @Column({ nullable: true })
+  description?: string;     // 版本说明
+}
+```
+
+#### 系统设置多版本备份
+
+```
+config/
+├── settings.json                 ← 当前生效
+├── settings.old.json             ← 上一版本
+├── settings.2026-06-01.json      ← 建议：按日期保留历史版本
+├── settings.2026-05-15.json
+└── settings.versions.json        ← 版本元数据索引
+```
+
+#### 回滚流程建议
+
+```
+管理员选择版本
+      ↓
+系统自动备份当前版本为新版本号
+      ↓
+将选中版本的内容写入 settings.json
+      ↓
+触发所有 Agent 的重新加载
+      ↓
+发送测试通知验证配置有效性
+      ↓
+成功 → 完成 / 失败 → 自动回滚到之前版本
+```
+
+---
+
+## 二十二、关键代码引用速查
+
+### 22.1 核心框架
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2136,7 +2708,7 @@ function shouldSuppressNotification(
 | NotificationPayload | `server/lib/notifications/agents/agent.ts` | 9-24 |
 | Agent 注册 | `server/index.ts` | 132-143 |
 
-### 19.2 配置与存储
+### 22.2 配置与存储
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2149,7 +2721,7 @@ function shouldSuppressNotification(
 | User.settings 关联配置 | `server/entity/User.ts` | 137-142 |
 | 用户认证中间件 | `server/middleware/auth.ts` | 9-41 |
 
-### 19.3 各 Agent 实现
+### 22.3 各 Agent 实现
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2161,7 +2733,7 @@ function shouldSuppressNotification(
 | Pushover Agent | `server/lib/notifications/agents/pushover.ts` | 36-353 |
 | Telegram Agent | `server/lib/notifications/agents/telegram.ts` | 37-325 |
 
-### 19.4 业务触发点
+### 22.4 业务触发点
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2172,7 +2744,7 @@ function shouldSuppressNotification(
 | IssueCommentSubscriber | `server/subscriber/IssueCommentSubscriber.ts` | - |
 | MediaSubscriber | `server/subscriber/MediaSubscriber.ts` | - |
 
-### 19.5 重试、降级与去重相关
+### 22.5 重试、降级与去重相关
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2184,7 +2756,7 @@ function shouldSuppressNotification(
 | Manager 并发 fire-and-forget | `server/lib/notifications/index.ts` | 109-113 |
 | 状态跳转合并隐式去重 | `server/entity/MediaRequest.ts` | 682-696 |
 
-### 19.6 国际化与多语言
+### 22.6 国际化与多语言
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2196,7 +2768,7 @@ function shouldSuppressNotification(
 | Ntfy Agent 国际化使用 | `server/lib/notifications/agents/ntfy.ts` | 31-113 |
 | 用户 locale 字段 | `server/entity/UserSettings.ts` | 155-157 |
 
-### 19.7 日志与运维
+### 22.7 日志与运维
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2205,7 +2777,7 @@ function shouldSuppressNotification(
 | 测试通知特殊处理 | `server/lib/notifications/index.ts` | 37-39 |
 | 邮件模板目录 | `server/templates/email/` | - |
 
-### 19.8 Webhook 自定义端点扩展
+### 22.8 Webhook 自定义端点扩展
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2217,7 +2789,7 @@ function shouldSuppressNotification(
 | 三层请求头配置 | `server/lib/notifications/agents/webhook.ts` | 204-229 |
 | JSON 模板 Base64 编解码 | `server/routes/settings/notifications.ts` | 277-325 |
 
-### 19.9 通知设置路由 API
+### 22.9 通知设置路由 API
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2227,7 +2799,7 @@ function shouldSuppressNotification(
 | Webhook POST 配置（自动编码） | `server/routes/settings/notifications.ts` | 300-325 |
 | 各渠道 GET/POST/TEST 接口 | `server/routes/settings/notifications.ts` | 38-433 |
 
-### 19.10 优先级与静默相关
+### 22.10 优先级与静默相关
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -2242,3 +2814,41 @@ function shouldSuppressNotification(
 | Telegram 发送时使用 sendSilently | `server/lib/notifications/agents/telegram.ts` | 205 |
 | Telegram 发送时使用 messageThreadId | `server/lib/notifications/agents/telegram.ts` | 204 |
 | Ntfy 发送时使用 priority | `server/lib/notifications/agents/ntfy.ts` | 38 / 100 |
+
+### 22.11 用户订阅管理（取消订阅链路）
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| UserPushSubscription 实体 | `server/entity/UserPushSubscription.ts` | 12-46 |
+| 注册订阅接口 | `server/routes/user/index.ts` | 239-325 |
+| 查询用户所有订阅 | `server/routes/user/index.ts` | 327-344 |
+| 查询单个订阅 | `server/routes/user/index.ts` | 346-368 |
+| 删除订阅（取消订阅） | `server/routes/user/index.ts` | 370-405 |
+| WebPush 发送时清理失效订阅 | `server/lib/notifications/agents/webpush.ts` | 249-273 |
+| 用户通知设置 GET | `server/routes/user/usersettings.ts` | 517-559 |
+| 用户通知设置 POST | `server/routes/user/usersettings.ts` | 561-637 |
+| 管理员关闭系统级 Agent | `server/routes/settings/notifications.ts` | 95-119 |
+| User.pushSubscriptions 关联配置 | `server/entity/User.ts` | 143-146 |
+
+### 22.12 模板版本管理与迁移
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 设置迁移器 runMigrations | `server/lib/settings/migrator.ts` | 8-101 |
+| 设置迁移脚本目录 | `server/lib/settings/migrations/` | - |
+| 迁移示例 0008 blacklist→blocklist | `server/lib/settings/migrations/0008_migrate_blacklist_to_blocklist.ts` | 1-40 |
+| 设置迁移（Remove LunaSea 0006） | `server/lib/settings/migrations/0006_remove_lunasea.ts` | - |
+| 数据库迁移：CreateUserSettings | `server/migration/sqlite/1613615266968-CreateUserSettings.ts` | - |
+| 数据库迁移：AddNotificationTypes | `server/migration/sqlite/1619339817343-AddUserSettingsNotificationTypes.ts` | - |
+| 数据库迁移：CreateUserPushSubscriptions | `server/migration/sqlite/1618912653565-CreateUserPushSubscriptions.ts` | - |
+| 数据库迁移：AddUniqueConstraintToPushSubscription | `server/migration/sqlite/1765233385034-AddUniqueConstraintToPushSubscription.ts` | - |
+
+### 22.13 到达率与监控相关
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| winston 机器日志输出（JSON） | `server/logger.ts` | 49-70 |
+| 机器日志滚动配置 | `server/logger.ts` | 52-58 |
+| Debug 级发送开始日志 | `server/lib/notifications/agents/*` | 各 Agent send() 开头 |
+| Error 级发送失败日志 | `server/lib/notifications/agents/*` | 各 Agent send() catch 块 |
+| Info 级管理器总览日志 | `server/lib/notifications/index.ts` | 106-108 |
