@@ -388,6 +388,12 @@ Media AVAILABLE → 请求 COMPLETED（反向驱动）
 | `server/entity/User.ts` | 用户实体：配额字段、`getQuota()` 计算 |
 | `server/lib/permissions.ts` | 权限枚举与 `hasPermission()` 位运算检查 |
 | `server/lib/watchlistsync.ts` | Watchlist 同步：自动请求创建流程 |
+| `server/job/schedule.ts` | 定时任务调度：所有扫描/同步/清理任务的注册与 cron 配置 |
+| `server/job/blocklistedTagsProcessor.ts` | 拉黑标签处理器：唯一批量清理 Media + Request 的组件 |
+| `server/lib/scanners/baseScanner.ts` | 扫描器基类：processMovie / processShow 状态更新逻辑 |
+| `server/lib/scanners/radarr/index.ts` | Radarr 扫描器：正向同步 + 孤儿清理 |
+| `server/lib/scanners/sonarr/index.ts` | Sonarr 扫描器：正向同步 + 孤儿清理 |
+| `server/lib/settings/index.ts` | 全局设置：JobId / JobSettings / 默认 cron 表达式 |
 
 ---
 
@@ -1180,5 +1186,396 @@ Jellyseerr **不提供显式的请求优先级机制**。请求处理顺序遵�
 // TODO: make this better
 ```
 表明当前的优先级排序是临时方案，未来可能改进。
+
+---
+
+## 十三、请求过期清理与归档策略
+
+### 13.1 请求生命周期中的数据保留策略
+
+Jellyseerr **不提供请求过期自动清理或归档机制**。所有请求记录从创建起永久保留在数据库中，除非被管理员手动删除。
+
+**各终态请求的保留行为**：
+
+| 请求终态 | 数据保留 | 对配额的影响 | 备注 |
+|---|---|---|---|
+| `COMPLETED` | 永久保留 | 计入配额（直到超出时间窗口） | 关联的 Media 状态可能因 AvailabilitySync 变为 `DELETED`，但请求记录不变 |
+| `DECLINED` | 永久保留 | 不计入配额 | 可被相同媒体的后续新请求覆盖（去重检查跳过 DECLINED） |
+| `FAILED` | 永久保留 | 计入配额 | 可通过 `/retry` 重新激活 |
+| 已删除 | 物理删除 | 不再计入 | 删除后 Media 状态可能重置（见第七章） |
+
+### 13.2 定时清理任务
+
+Jellyseerr 的定时任务（`server/job/schedule.ts`）中，**没有任何任务负责清理请求记录**。所有定时清理任务均针对其他维度：
+
+| 定时任务 | 清理对象 | 默认周期 | 定义位置 |
+|---|---|---|---|
+| `image-cache-cleanup` | TMDB 图片缓存 + 用户头像缓存 | 每天 05:00 | `server/job/schedule.ts:228-244` |
+| `process-blocklisted-tags` | 基于标签的拉黑记录 + 关联 Media 记录 | 每 7 天 01:30 | `server/job/blocklistedTagsProcessor.ts:207-224` |
+| `availability-sync` | 标记为 AVAILABLE 但实际不存在的 Media | 每天 05:00 | `server/lib/availabilitySync.ts` |
+| `download-sync-reset` | 下载追踪器内存数据 | 每天 01:00 | `server/job/schedule.ts:213-225` |
+
+### 13.3 BlocklistedTagsProcessor — 唯一的批量清理逻辑
+
+`server/job/blocklistedTagsProcessor.ts` 是代码中唯一执行批量删除请求关联数据的组件：
+
+```
+BlocklistedTagsProcessor.run()
+    │
+    ├─ cleanBlocklist() — 事务内执行
+    │   └─ 查找所有 blocklistedTags IS NOT NULL 的 Media
+    │   └─ 批量删除（每批 500 条）
+    │       └─ Media 删除 → 级联删除 Blocklist + 关联的 Season + MediaRequest
+    │
+    └─ createBlocklistEntries() — 事务内执行
+        └─ 遍历 blocklistedTags 配置中的关键词
+        └─ 调用 TMDB Discover API 搜索匹配的媒体
+        └─ 将结果批量加入 Blocklist
+```
+
+**注意**：整个流程在一个数据库事务中执行。如果 `createBlocklistEntries` 阶段因 `AbortTransaction` 中断（`this.running = false`），事务会回滚，`cleanBlocklist` 的删除也不生效。
+
+### 13.4 Session 过期清理
+
+Session 实体（`server/entity/Session.ts`）是唯一有过期字段的实体：
+
+```typescript
+public expiredAt = Date.now();
+```
+
+但 Session 清理不通过定时任务，而是通过 TypeORM 的 `synchronize` 机制或手动清理。Session 的过期与请求生命周期无关。
+
+### 13.5 运维建议
+
+由于 Jellyseerr 不内置请求归档功能，生产环境中建议：
+
+| 场景 | 建议 |
+|---|---|
+| 请求表过大 | 定期手动导出 + 归档 COMPLETED/DECLINED 请求，然后通过 API 或 SQL 删除 |
+| 配额计算变慢 | 配额查询（`User.getQuota()`）使用 `COUNT` 查询，大表需添加 `createdAt` 索引 |
+| 数据库膨胀 | SQLite 场景下定期 `VACUUM`；PostgreSQL 场景下定期 `VACUUM ANALYZE` |
+| 历史审计 | 通过 `GET /api/v1/request` 分页导出，外部归档 |
+
+---
+
+## 十四、用户请求历史导出
+
+### 14.1 API 层面的导出能力
+
+Jellyseerr **不提供专用的请求导出 API**（无 CSV/JSON 批量下载端点）。但可以通过现有的请求列表 API 实现分页导出：
+
+**可用接口**：
+
+| 接口 | 方法 | 用途 |
+|---|---|---|
+| `GET /api/v1/request` | 分页查询 | 按状态/类型/用户筛选，返回完整请求对象 |
+| `GET /api/v1/request/count` | 聚合统计 | 返回各状态计数 |
+| `GET /api/v1/user/:id/requests` | 用户维度 | 查询特定用户的请求列表 |
+
+**分页查询参数**（`server/routes/request.ts:32-276`）：
+
+```
+GET /api/v1/request?take=20&skip=0&filter=all&mediaType=all&sort=added
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `take` | 20 | 每页条数 |
+| `skip` | 0 | 偏移量 |
+| `filter` | all | 状态筛选 |
+| `mediaType` | all | 媒体类型 |
+| `requestedBy` | — | 按用户筛选 |
+| `sort` | added | 排序方式 |
+
+**返回的请求对象包含以下可导出字段**：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `id` | int | 请求 ID |
+| `status` | int (enum) | 请求状态 |
+| `media.mediaType` | string | 媒体类型 (movie/tv) |
+| `media.tmdbId` | int | TMDB ID |
+| `media.tvdbId` | int | TVDB ID (TV) |
+| `requestedBy.id` | int | 请求用户 ID |
+| `requestedBy.displayName` | string | 请求用户名 |
+| `createdAt` | datetime | 创建时间 |
+| `updatedAt` | datetime | 更新时间 |
+| `modifiedBy` | int | 最后修改人 |
+| `is4k` | boolean | 是否 4K |
+| `isAutoRequest` | boolean | 是否自动请求 |
+| `seasons` | array | 关联季信息 (TV) |
+
+### 14.2 数据库层面的导出
+
+对于大规模导出，可直接操作数据库：
+
+**SQLite**：
+```bash
+sqlite3 config/db/jellyseerr.db \
+  "SELECT id, status, mediaType, tmdbId, requestedBy, createdAt, updatedAt FROM media_request;" \
+  -csv -header > requests_export.csv
+```
+
+**PostgreSQL**：
+```sql
+COPY (
+  SELECT r.id, r.status, m.media_type, m.tmdb_id, u.username, r.created_at, r.updated_at
+  FROM media_request r
+  JOIN media m ON r.media_id = m.id
+  JOIN "user" u ON r.requested_by_id = u.id
+) TO STDOUT WITH CSV HEADER;
+```
+
+### 14.3 导出数据的状态映射
+
+导出时需将数值状态码映射为可读文本：
+
+| MediaRequestStatus 值 | 文本 | MediaStatus 值 | 文本 |
+|---|---|---|---|
+| 1 | PENDING | 1 | UNKNOWN |
+| 2 | APPROVED | 2 | PENDING |
+| 3 | DECLINED | 3 | PROCESSING |
+| 4 | FAILED | 4 | PARTIALLY_AVAILABLE |
+| 5 | COMPLETED | 5 | AVAILABLE |
+| — | — | 6 | BLOCKLISTED |
+| — | — | 7 | DELETED |
+
+---
+
+## 十五、请求与媒体库同步状态的一致性核对
+
+一致性核对是 Jellyseerr 保证"请求状态"与"实际媒体可用性"不漂移的核心机制。通过多层定时任务实现：
+
+### 15.1 一致性核对体系总览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     一致性核对体系                                    │
+│                                                                     │
+│  ┌─────────────┐   ┌──────────────┐   ┌──────────────────────────┐ │
+│  │ 媒体服务器扫描 │   │ *arr 扫描    │   │ AvailabilitySync        │ │
+│  │ (正向同步)    │   │ (正向同步)    │   │ (反向核对)               │ │
+│  │             │   │              │   │                          │ │
+│  │ Plex Recent │   │ Radarr Scan  │   │ 检查 AVAILABLE 媒体      │ │
+│  │ Plex Full   │   │ Sonarr Scan  │   │ 是否仍然存在              │ │
+│  │ Jellyfin    │   │              │   │                          │ │
+│  │ Recent/Full │   │              │   │ 不存在 → DELETED          │ │
+│  └─────────────┘   └──────────────┘   └──────────────────────────┘ │
+│        │                  │                     │                   │
+│        ▼                  ▼                     ▼                   │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    Media / Season 状态                        │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│        │                                                           │
+│        ▼                                                           │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              MediaSubscriber (状态变更驱动器)                   │  │
+│  │     Media AVAILABLE → 关联请求 COMPLETED                       │  │
+│  │     Media PENDING → 关联 PENDING 请求 APPROVED                 │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 正向同步：媒体服务器扫描
+
+媒体服务器扫描将 Plex/Jellyfin 的实际库状态同步到 `Media` / `Season` 实体。
+
+**Plex 扫描**：
+
+| 任务 | 默认周期 | 扫描范围 | 定义位置 |
+|---|---|---|---|
+| `plex-recently-added-scan` | 每 5 分钟 | 最近新增的媒体 | `server/lib/scanners/plex/` |
+| `plex-full-scan` | 每天 03:00 | 全量库 | `server/lib/scanners/plex/` |
+
+**Jellyfin 扫描**：
+
+| 任务 | 默认周期 | 扫描范围 |
+|---|---|---|
+| `jellyfin-recently-added-scan` | 每 5 分钟 | 最近新增的媒体 |
+| `jellyfin-full-scan` | 每天 03:00 | 全量库 |
+
+**状态更新逻辑**（`BaseScanner.processMovie()` → `server/lib/scanners/baseScanner.ts:95-258`）：
+
+```
+扫描到电影（hasFile + 非processing）
+    └─ Media.status = AVAILABLE
+    └─ 触发 MediaSubscriber → 关联请求 COMPLETED
+
+扫描到电影（processing + 无文件）
+    └─ Media.status = PROCESSING（仅从 DELETED 以外的状态升级）
+
+未扫描到的已有记录
+    └─ 状态不变（交由 AvailabilitySync 处理）
+```
+
+**TV 季级别更新逻辑**（`BaseScanner.processShow()` → `server/lib/scanners/baseScanner.ts:270-450`）：
+
+```
+季的可用集数 == 总集数 且 > 0  → Season.status = AVAILABLE
+季的可用集数 > 0 但 < 总集数    → Season.status = PARTIALLY_AVAILABLE
+季标记为 processing 且无可用集   → Season.status = PROCESSING（不从 DELETED 升级）
+季非 processing 且无可用集
+  且原状态为 PROCESSING          → Season.status = UNKNOWN
+其他情况                         → 保持原状态
+```
+
+**关键防护**：已为 `AVAILABLE` 的季不会被降级（`existingSeason.status === MediaStatus.AVAILABLE` 强制保持），避免多个扫描器竞争导致状态抖动。
+
+### 15.3 正向同步：*arr 扫描
+
+Radarr/Sonarr 扫描将 *arr 的实际媒体记录同步到 `Media` 实体。
+
+**Radarr 扫描**（`server/lib/scanners/radarr/index.ts`）：
+
+| 任务 | 默认周期 |
+|---|---|
+| `radarr-scan` | 每天 04:00 |
+
+**扫描逻辑**：
+
+```
+遍历所有 Radarr 服务器（syncEnabled = true）
+    │
+    ├─ 获取所有 movie 列表
+    │
+    ├─ 逐条 processRadarrMovie()
+    │   └─ hasFile + monitored → 填入 hasFile: true, processing: false
+    │   └─ !hasFile + monitored → 填入 hasFile: false, processing: true
+    │   └─ !monitored → 填入 processing: false
+    │
+    └─ cleanupOrphanedMovies() — 扫描后清理孤儿记录
+```
+
+**孤儿清理逻辑**（`server/lib/scanners/radarr/index.ts:144-193`）：
+
+```
+所有标准 Radarr 服务器均已扫描（syncEnabled = true）
+    │
+    ├─ 查找 status = PROCESSING 的电影
+    │
+    └─ 若 tmdbId 不在本次扫描结果中
+        └─ Media.status = UNKNOWN
+        └─ 日志："Movie {tmdbId} not found in any Radarr server"
+```
+
+**安全条件**：如果任何一个同类型（标准/4K）服务器未启用同步，则**跳过孤儿清理**，避免误删存在于未扫描服务器上的媒体：
+
+```typescript
+// server/lib/scanners/radarr/index.ts:95-107
+const allStandardScanned = this.servers
+  .filter((s) => !this.enable4kMovie || !s.is4k)
+  .every((s) => s.syncEnabled);
+if (!allStandardScanned) {
+  this.didScanStandard = false; // 标记为未完成全量扫描，跳过孤儿清理
+}
+```
+
+**Sonarr 扫描**（`server/lib/scanners/sonarr/index.ts`）：逻辑与 Radarr 对称，额外处理：
+- 通过 TVDB ID 匹配（非 TMDB ID）
+- 孤儿清理时同时重置关联 `Season.status` 为 `UNKNOWN`
+
+### 15.4 反向核对：AvailabilitySync
+
+AvailabilitySync 是唯一执行**反向核对**的定时任务，检查标记为 AVAILABLE 的媒体是否仍然实际存在。
+
+**任务配置**：
+
+| 属性 | 值 |
+|---|---|
+| Job ID | `availability-sync` |
+| 默认周期 | 每天 05:00 |
+| 定义位置 | `server/lib/availabilitySync.ts` |
+
+**核对流程**：
+
+```
+遍历所有 status IN (AVAILABLE, PARTIALLY_AVAILABLE) 的 Media
+    │
+    ├─ 电影核对
+    │   ├─ 检查媒体服务器（Plex/Jellyfin）
+    │   ├─ 检查 *arr（Radarr/Sonarr）
+    │   │
+    │   ├─ 任一来源确认存在 → 保留 AVAILABLE
+    │   └─ 全部来源确认不存在 → mediaUpdater()
+    │       ├─ Media.status = DELETED
+    │       ├─ 若有 APPROVED 请求正在处理 → 保留 externalServiceId 等字段
+    │       └─ 若无处理中请求 → 清空所有外部关联字段
+    │
+    └─ TV 季核对
+        ├─ 交叉比对：媒体服务器季数据 + Sonarr 季数据 → finalSeasons Map
+        ├─ 对比 TMDB 的集数信息补充缺失的季
+        └─ seasonUpdater()
+            ├─ 不存在的季 → Season.status = DELETED
+            └─ 若部分季不存在 → Media.status 降级为 PARTIALLY_AVAILABLE
+```
+
+**容错策略**：
+
+| 异常场景 | 处理方式 | 原因 |
+|---|---|---|
+| *arr API 返回 404 | 视为不存在 | 媒体已被从 *arr 中删除 |
+| *arr API 返回非 404 错误 | **视为存在** | 避免网络抖动导致误删 |
+| Plex/Jellyfin API 返回 404 | 视为不存在 | 媒体已从媒体服务器删除 |
+| Plex/Jellyfin API 返回非 404 错误 | **视为存在** + 阻止季级别搜索 | 保守策略，宁可漏删不可误删 |
+| 获取季集数失败 | 假设季存在 | `seasonExistsInJellyfin/Plex` catch 块返回 `true` |
+
+**处理中请求保护**（`server/lib/availabilitySync.ts:506-543`）：
+
+```typescript
+// TV 类型：若有 APPROVED 请求正在处理，保留外部服务关联字段
+if (media.mediaType === 'tv') {
+  const request = await requestRepository
+    .createQueryBuilder('request')
+    .where('media.id = :id', { id: media.id })
+    .andWhere('request.is4k = :is4k AND request.status = :requestStatus', {
+      requestStatus: MediaRequestStatus.APPROVED,
+      is4k: is4k,
+    })
+    .getOne();
+  if (request) isMediaProcessing = true;
+}
+
+// 处理中的请求保留 serviceId、externalServiceId 等字段
+media.serviceId = isMediaProcessing ? media.serviceId : null;
+media.externalServiceId = isMediaProcessing ? media.externalServiceId : null;
+```
+
+### 15.5 一致性核对的完整时间线
+
+```
+00:00  ┌──────────────────────────┐
+       │  Plex/Jellyfin Recent    │ ← 每 5 分钟：增量同步媒体服务器
+       │  (*/5 * * * * *)         │
+       ├──────────────────────────┤
+03:00  │  Plex/Jellyfin Full      │ ← 每天：全量同步媒体服务器
+       │  (0 0 3 * * *)          │
+       ├──────────────────────────┤
+04:00  │  Radarr Scan             │ ← 每天：全量同步 Radarr + 孤儿清理
+       │  (0 0 4 * * *)          │
+04:30  │  Sonarr Scan             │ ← 每天：全量同步 Sonarr + 孤儿清理
+       │  (0 30 4 * * *)         │
+       ├──────────────────────────┤
+05:00  │  AvailabilitySync        │ ← 每天：反向核对 AVAILABLE 媒体
+       │  (0 0 5 * * *)          │
+       │  Image Cache Cleanup     │
+       ├──────────────────────────┤
+01:00  │  Download Sync Reset     │ ← 每天：重置下载追踪器
+       ├──────────────────────────┤
+01:30  │  Blocklisted Tags        │ ← 每 7 天：拉黑标签处理 + 批量清理
+       │  (0 30 1 */7 * *)       │
+       └──────────────────────────┘
+```
+
+### 15.6 潜在的一致性漂移场景
+
+| 场景 | 漂移方向 | 检测机制 | 修复时间 |
+|---|---|---|---|
+| 媒体在 Plex 中删除但 *arr 仍存在 | 无漂移（*arr 扫描确认存在） | Radarr/Sonarr Scan | ≤ 24h |
+| 媒体从 *arr 删除但 Plex 仍存在 | 无漂移（Plex 扫描确认存在） | Plex Recent Scan | ≤ 5min |
+| 媒体从所有来源删除 | Media 仍标记为 AVAILABLE | AvailabilitySync | ≤ 24h |
+| 请求 APPROVED 但 *arr 未收到推送 | 请求 APPROVED + Media PROCESSING | 无自动检测 | 需手动 retry |
+| Media AVAILABLE 但请求未 COMPLETED | 请求卡在 APPROVED | MediaSubscriber 需 Media 实体变更触发 | 需手动触发 Media 更新 |
+| 季部分集缺失 | Season 仍标记为 AVAILABLE | AvailabilitySync 季级别核对 | ≤ 24h |
+| *arr 服务器 syncEnabled=false | 孤儿清理被跳过 | 日志提示 "Skipping orphaned cleanup" | 不修复（设计预期） |
 
 
