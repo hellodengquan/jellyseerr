@@ -1576,9 +1576,555 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 
 ---
 
-## 十六、关键代码引用速查
+## 十六、Webhook 自定义通知端点扩展
 
-### 16.1 核心框架
+### 16.1 Webhook 的核心扩展能力
+
+Webhook Agent 是所有渠道中扩展性最强的，提供了从端点 URL 到请求体、认证方式的全面自定义。
+
+#### 配置结构定义
+
+```typescript
+export interface NotificationAgentWebhook extends NotificationAgentConfig {
+  options: {
+    webhookUrl: string;           // 端点 URL，支持变量替换
+    jsonPayload: string;          // Base64 编码的自定义 JSON 模板
+    authHeader?: string;          // 快捷 Authorization 头
+    customHeaders?: {             // 任意自定义请求头
+      key: string;
+      value: string;
+    }[];
+    supportVariables?: boolean;   // URL 是否启用变量替换
+  };
+}
+```
+
+### 16.2 端点 URL 的动态路由
+
+#### 静态端点模式（默认）
+
+```json
+{
+  "webhookUrl": "https://api.example.com/notify"
+}
+```
+
+所有通知都发送到同一个 URL，通过请求体中的字段区分业务类型。
+
+#### 动态端点模式（`supportVariables: true`）
+
+启用后，URL 路径中的 `{{变量}}` 会被替换为实际值，实现**按业务类型路由**：
+
+```typescript
+// 示例：按通知类型路由到不同端点
+{
+  "webhookUrl": "https://api.example.com/hook/{{notification_type}}?user={{notifyuser_username}}"
+}
+```
+
+发送时的替换逻辑（`webhook.ts:186-202`）：
+
+```typescript
+if (settings.options.supportVariables) {
+  Object.keys(KeyMap).forEach((keymapKey) => {
+    const variableValue = 
+      type === Notification.TEST_NOTIFICATION
+        ? 'test'
+        : typeof keymapValue === 'function'
+          ? keymapValue(payload, type)
+          : get(payload, keymapValue) || 'test';
+
+    webhookUrl = webhookUrl.replace(
+      new RegExp(`{{${keymapKey}}}`, 'g'),
+      encodeURIComponent(variableValue)  // URL 编码，防止特殊字符
+    );
+  });
+}
+```
+
+**动态路由应用场景：**
+1. **按通知类型分发**：`/hook/{{notification_type}}` → `/hook/MEDIA_AVAILABLE`
+2. **按用户分发**：`/hook/user/{{notifyuser_username}}`
+3. **按媒体类型分发**：`/hook/media/{{media_type}}`
+4. **查询参数透传**：`?media_id={{media_tmdbid}}&request_id={{request_id}}`
+
+### 16.3 自定义请求体模板
+
+#### 模板变量映射表
+
+Webhook 内置 **63 个预定义变量**，通过 `KeyMap` 映射到 `NotificationPayload` 字段：
+
+| 分类 | 变量名 | 说明 |
+|------|--------|------|
+| 通用 | `{{notification_type}}` | 通知类型枚举名 |
+| 通用 | `{{event}}`, `{{subject}}`, `{{message}}`, `{{image}}` | 基础字段 |
+| 通知用户 | `{{notifyuser_username}}`, `{{notifyuser_email}}`, `{{notifyuser_avatar}}` | 接收用户信息 |
+| 通知用户 | `{{notifyuser_settings_discordIds}}`, `{{notifyuser_settings_telegramChatId}}` | 用户渠道配置 |
+| 请求信息 | `{{request_id}}`, `{{requestedBy_username}}`, `{{requestedBy_email}}` | 请求相关 |
+| 请求信息 | `{{requestedBy_settings_discordIds}}` 等 | 请求发起者信息 |
+| 媒体信息 | `{{media_tmdbid}}`, `{{media_imdbid}}`, `{{media_tvdbid}}`, `{{media_type}}` | 媒体标识 |
+| 媒体信息 | `{{media_status}}`, `{{media_status4k}}`, `{{media_jellyfinMediaId}}` | 媒体状态 |
+| 问题信息 | `{{issue_id}}`, `{{issue_type}}`, `{{issue_status}}` | 问题相关 |
+| 问题信息 | `{{reportedBy_username}}`, `{{commentedBy_username}}`, `{{comment_message}}` | 问题相关 |
+
+**两种变量映射方式：**
+
+```typescript
+// 方式一：路径映射（直接从 payload 取值）
+media_tmdbid: 'media.tmdbId',
+
+// 方式二：函数映射（动态计算）
+media_jellyfinMediaId: (payload) =>
+  payload.media?.jellyfinMediaId ?? payload.media?.jellyfinMediaId4k ?? '',
+
+notification_type: (_payload, type) => Notification[type],
+```
+
+#### 特殊块变量
+
+除了标量变量，还支持 5 个**对象级块变量**，实现整块数据的透传：
+
+```typescript
+// parseKeys 中的特殊块处理
+if (key === '{{media}}') {
+  finalPayload.media = payload.media ? finalPayload[key] : null;
+  delete finalPayload[key];
+}
+// 同理：{{request}}, {{issue}}, {{comment}}, {{extra}}
+```
+
+**使用示例：**
+
+```json
+{
+  "event": "{{notification_type}}",
+  "title": "{{subject}}",
+  "{{media}}": {},
+  "{{request}}": {},
+  "custom": "data"
+}
+```
+
+发送后 `{{media}}` 会被替换为完整的 `media` 对象，没有媒体时为 `null`。
+
+#### 模板的编码存储
+
+出于安全考虑，JSON 模板在保存时做 **Base64 编码**：
+
+```typescript
+// 保存时：JSON → 字符串化 → Base64
+settings.notifications.agents.webhook = {
+  options: {
+    jsonPayload: Buffer.from(
+      JSON.stringify(req.body.options.jsonPayload)
+    ).toString('base64'),
+  },
+};
+
+// 读取时：Base64 → 字符串化 → JSON 解析
+private buildPayload(type, payload) {
+  const payloadString = Buffer.from(
+    this.getSettings().options.jsonPayload,
+    'base64'
+  ).toString('utf8');
+  const parsedJSON = JSON.parse(JSON.parse(payloadString)); // 双 parse！
+  return this.parseKeys(parsedJSON, payload, type);
+}
+```
+
+> **注意双 JSON.parse**：保存时 `JSON.stringify(对象)` 再编码，读取时解码后得到 `'{"key":"value"}'` 字符串，再 `JSON.parse` 一次得到对象。
+
+#### 模板递归解析
+
+`parseKeys()` 使用 **深度优先递归**，确保嵌套对象中的所有变量都被替换：
+
+```typescript
+private parseKeys(finalPayload, payload, type) {
+  Object.keys(finalPayload).forEach((key) => {
+    // 先处理特殊块变量 ...
+    
+    if (typeof finalPayload[key] === 'string') {
+      // 标量：遍历 KeyMap 做字符串替换
+      Object.keys(KeyMap).forEach((keymapKey) => {
+        finalPayload[key] = (finalPayload[key] as string).replace(
+          `{{${keymapKey}}}`,
+          value
+        );
+      });
+    } else if (finalPayload[key] && typeof finalPayload[key] === 'object') {
+      // 对象/数组：递归解析
+      finalPayload[key] = this.parseKeys(
+        finalPayload[key] as Record<string, unknown>,
+        payload,
+        type
+      );
+    }
+  });
+  return finalPayload;
+}
+```
+
+### 16.4 认证与自定义请求头
+
+#### 三层头配置
+
+```typescript
+const headers: Record<string, string> = {};
+
+// 第一层：快捷 Authorization 头
+if (settings.options.authHeader) {
+  headers.Authorization = settings.options.authHeader;
+}
+
+// 第二层：自定义请求头数组
+if (settings.options.customHeaders?.length > 0) {
+  settings.options.customHeaders.forEach((header) => {
+    const key = header.key?.trim();
+    const value = header.value?.trim();
+
+    if (key && value) {
+      // 第三层：保护机制 - 自定义 Authorization 不覆盖快捷配置
+      if (
+        key.toLowerCase() !== 'authorization' ||
+        !settings.options.authHeader
+      ) {
+        headers[key] = value;
+      }
+    }
+  });
+}
+```
+
+**认证配置示例：**
+
+| 场景 | 配置方式 |
+|------|---------|
+| Bearer Token | `authHeader: "Bearer abc123"` |
+| Basic Auth | `authHeader: "Basic dXNlcjpwYXNz"` |
+| API Key（自定义头） | `customHeaders: [{key: "X-API-Key", value: "xyz"}]` |
+| 签名回调 | `customHeaders: [{key: "X-Signature", value: "sha256=..."}]` |
+| 多租户标识 | `customHeaders: [{key: "X-Tenant-Id", value: "tenant-42"}]` |
+
+### 16.5 Webhook API 管理端点
+
+通知设置路由位于 `server/routes/settings/notifications.ts`，提供完整的 CRUD + Test 接口：
+
+| 方法 | 路径 | 功能 |
+|------|------|------|
+| GET | `/settings/notifications/webhook` | 获取配置（自动解码 JSON 模板） |
+| POST | `/settings/notifications/webhook` | 保存配置（自动编码 JSON 模板） |
+| POST | `/settings/notifications/webhook/test` | 发送测试通知 |
+
+所有 10 种渠道都有相同模式的三个接口（GET / POST / POST /test）。
+
+---
+
+## 十七、通知历史记录与审计查询
+
+### 17.1 当前状态：完全缺失
+
+**通知框架目前没有任何历史记录存储和审计查询功能。**
+
+| 能力 | 现状 | 说明 |
+|------|------|------|
+| 发送记录持久化 | ❌ 无 | 发送结果仅写入日志文件，不入库 |
+| 送达状态追踪 | ❌ 无 | 无法知道每条通知是否成功送达 |
+| 发送历史查询 API | ❌ 无 | 无任何查询接口 |
+| 管理员审计视图 | ❌ 无 | UI 层也没有通知历史页面 |
+| 用户发送记录查询 | ❌ 无 | 用户无法查看自己收到过哪些通知 |
+| 通知失败审计 | ❌ 无 | 失败记录仅在日志中，无法结构化查询 |
+
+### 17.2 当前唯一的记录方式：日志
+
+所有通知相关的信息仅通过 `winston` 日志系统记录：
+
+#### 发送开始日志（Debug 级别）
+
+```json
+{
+  "timestamp": "2026-06-14T10:30:00.100Z",
+  "level": "debug",
+  "label": "Notifications",
+  "message": "Sending Slack notification",
+  "type": "MEDIA_AVAILABLE",
+  "subject": "Inception (2010)"
+}
+```
+
+#### 发送成功日志（无显式记录）
+
+目前成功发送时，只有 `return true`，**没有对应的成功日志**。这是一个设计缺陷。
+
+#### 发送失败日志（Error 级别）
+
+```json
+{
+  "timestamp": "2026-06-14T10:30:00.150Z",
+  "level": "error",
+  "label": "Notifications",
+  "message": "Error sending Slack notification",
+  "type": "MEDIA_AVAILABLE",
+  "subject": "Inception (2010)",
+  "errorMessage": "Request failed with status code 401",
+  "response": { "message": "Invalid Webhook Token" }
+}
+```
+
+#### 管理器总览日志（Info 级别）
+
+```json
+{
+  "timestamp": "2026-06-14T10:30:00.090Z",
+  "level": "info",
+  "label": "Notifications",
+  "message": "Sending notification(s) for MEDIA_AVAILABLE",
+  "subject": "Inception (2010)"
+}
+```
+
+### 17.3 日志分析的局限性
+
+**为什么日志不能替代历史记录：**
+
+1. **查询困难**：需要登录服务器、grep 文本日志，无法按条件筛选
+2. **无法聚合**：无法统计某用户/某渠道/某类型的成功率
+3. **保留时间短**：`seerr.log` 仅保留 7 天，`.machinelogs.json` 仅保留 1 天
+4. **成功记录缺失**：成功发送没有对应日志条目，无法判断是否发送过
+5. **无关联数据**：日志中缺少 requestId、userId 等关联键，无法追溯
+
+### 17.4 建议的历史记录存储模型
+
+```typescript
+// 建议新增实体
+@Entity()
+export class NotificationLog {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  notificationType: Notification;  // MEDIA_PENDING 等
+
+  @Column({ type: 'varchar', length: 50 })
+  agentKey: NotificationAgentKey;  // discord/email 等
+
+  @Column({ nullable: true })
+  userId?: number;                 // 接收用户（如有）
+
+  @Column({ nullable: true })
+  requestId?: number;              // 关联请求（如有）
+
+  @Column({ nullable: true })
+  issueId?: number;                // 关联问题（如有）
+
+  @Column({ length: 500 })
+  subject: string;
+
+  @Column({ type: 'boolean' })
+  success: boolean;
+
+  @Column({ type: 'text', nullable: true })
+  errorMessage?: string;
+
+  @Column({ type: 'json', nullable: true })
+  errorResponse?: unknown;
+
+  @CreateDateColumn()
+  createdAt: Date;
+
+  @Column({ type: 'integer' })
+  durationMs: number;              // 发送耗时
+}
+```
+
+### 17.5 建议的查询接口
+
+| 接口 | 功能 | 权限 |
+|------|------|------|
+| `GET /api/v1/notifications/history` | 当前用户的发送记录 | 用户 |
+| `GET /api/v1/admin/notifications/history` | 全局发送记录 | 管理员 |
+| `GET /api/v1/admin/notifications/stats` | 发送统计仪表盘 | 管理员 |
+| `GET /api/v1/admin/notifications/failures` | 近期失败记录列表 | 管理员 |
+
+---
+
+## 十八、通知重要级别与静默时段策略
+
+### 18.1 通知重要级别（优先级）
+
+#### 各渠道的优先级实现
+
+通知框架没有**统一的优先级模型**，但部分渠道各自实现了类似概念：
+
+| 渠道 | 优先级机制 | 配置位置 | 取值范围 |
+|------|-----------|---------|---------|
+| Ntfy | `priority` 字段 | 系统设置 | 1-5，默认 3 |
+| Pushover | `sound` 字段（间接触发） | 系统设置 + 用户设置 | 各种铃声 |
+| Telegram | `sendSilently` 开关 | 系统设置 + 用户设置 | true/false |
+| Gotify | ❌ 无 | - | - |
+| Email | ❌ 无 | - | - |
+| Discord | ❌ 无 | - | - |
+| Slack | ❌ 无 | - | - |
+| WebPush | ❌ 无 | - | - |
+| Pushbullet | ❌ 无 | - | - |
+| Webhook | ❌ 无 | - | - |
+
+#### Ntfy 优先级实现
+
+```typescript
+// ntfy.ts:38
+const priority = settings.options.priority ?? 3;
+
+const ntfyPayload = {
+  topic,
+  priority,    // 1=最低, 3=默认, 5=紧急
+  title,
+  message,
+  markdown: true,
+};
+```
+
+#### Telegram 静默发送实现
+
+**系统级配置**（对所有通知生效）：
+
+```typescript
+// settings
+options: {
+  chatId: string;
+  messageThreadId: string;
+  sendSilently: boolean;  // 系统级静默开关
+}
+```
+
+**用户级配置**（用户个人偏好）：
+
+```typescript
+// UserSettings
+@Column({ nullable: true })
+public telegramSendSilently?: boolean;  // 用户级静默开关
+```
+
+发送时的实际使用：
+
+```typescript
+// telegram.ts:199-206
+await axios.post(endpoint, {
+  ...notificationPayload,
+  chat_id: settings.options.chatId,
+  message_thread_id: settings.options.messageThreadId,
+  disable_notification: !!settings.options.sendSilently,
+});
+```
+
+#### Telegram 话题线程（Topic Thread）扩展
+
+Telegram 支持将消息发送到超级群的特定话题线程中，实现**按业务分类到不同话题**：
+
+```typescript
+// 系统级话题线程
+message_thread_id: settings.options.messageThreadId,
+
+// 用户级话题线程（可进一步路由到用户专属话题）
+// payload.notifyUser.settings?.telegramMessageThreadId
+```
+
+#### Pushover 声音配置
+
+Pushover 通过不同铃声**间接区分重要性**，支持用户个性化：
+
+- **系统级默认声音**：`settings.notifications.agents.pushover.options.sound`
+- **用户级自定义声音**：`user.settings.pushoverSound`
+
+### 18.2 通知类型与重要级别映射（缺失）
+
+**当前问题：** 通知框架完全没有**按业务类型区分重要级别**的机制。
+
+所有通知类型都是**平级**发送：
+
+| 通知类型 | 实际重要程度 | 当前处理 |
+|---------|-------------|---------|
+| MEDIA_FAILED | 高（需处理） | 与低优先级通知无差异 |
+| ISSUE_CREATED | 高（需关注） | 与低优先级通知无差异 |
+| MEDIA_PENDING | 中（待审批） | 与低优先级通知无差异 |
+| MEDIA_AVAILABLE | 低（信息） | 与低优先级通知无差异 |
+| MEDIA_AUTO_REQUESTED | 很低 | 与低优先级通知无差异 |
+
+### 18.3 静默时段策略：完全缺失
+
+| 能力 | 现状 | 说明 |
+|------|------|------|
+| 用户级静默时段 | ❌ 无 | 用户无法设置夜间免打扰 |
+| 系统级静默时段 | ❌ 无 | 无法设置全局维护窗口 |
+| 按类型静默 | ❌ 无 | 无法只静默"可用通知"但接收"失败通知" |
+| 静默期紧急通知放行 | ❌ 无 | 没有高优先级通知穿透静默的机制 |
+| 用户时区支持 | ❌ 无 | 静默时段不按时区计算 |
+
+#### 用户时区问题
+
+用户分布在不同时区时，统一的"22:00-08:00 静默"没有意义。目前 `UserSettings` 中**不存在时区字段**。
+
+### 18.4 Telegram sendSilently 的双层设计分析
+
+Telegram 是唯一同时支持**系统级**和**用户级**静默配置的渠道，但目前实现有缺陷：
+
+```typescript
+// 当前：系统级 sendSilently 对所有发送生效
+disable_notification: !!settings.options.sendSilently,
+
+// 问题：用户级 telegramSendSilently 完全没有被使用！
+// payload.notifyUser.settings?.telegramSendSilently 没有参与逻辑
+```
+
+这是一个**代码遗漏**，用户设置的静默偏好没有实际生效。
+
+### 18.5 建议的优先级与静默模型
+
+#### 统一优先级模型
+
+```typescript
+enum NotificationPriority {
+  LOW = 1,      // 信息类：MEDIA_AVAILABLE, MEDIA_AUTO_REQUESTED
+  NORMAL = 2,   // 常规类：MEDIA_APPROVED, MEDIA_PENDING
+  HIGH = 3,     // 关注类：ISSUE_CREATED, ISSUE_COMMENT
+  URGENT = 4,   // 紧急类：MEDIA_FAILED, ISSUE_RESOLVED
+}
+```
+
+#### 静默时段配置建议
+
+```typescript
+// UserSettings 扩展
+interface QuietHours {
+  enabled: boolean;
+  startHour: number;      // 0-23
+  endHour: number;        // 0-23
+  timezone: string;       // IANA 时区：'Asia/Shanghai'
+  allowedPriorities: NotificationPriority[];  // 静默期允许哪些级别穿透
+}
+```
+
+#### 静默判定逻辑
+
+```typescript
+function shouldSuppressNotification(
+  priority: NotificationPriority,
+  quietHours: QuietHours,
+  userTimezone: string
+): boolean {
+  if (!quietHours.enabled) return false;
+  const now = getCurrentTimeInTimezone(userTimezone);
+  const inQuietHours = isHourInRange(now.hour, quietHours.startHour, quietHours.endHour);
+  
+  // 在静默期内，检查该优先级是否被允许穿透
+  return inQuietHours && !quietHours.allowedPriorities.includes(priority);
+}
+```
+
+---
+
+## 十九、关键代码引用速查
+
+### 19.1 核心框架
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1590,7 +2136,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | NotificationPayload | `server/lib/notifications/agents/agent.ts` | 9-24 |
 | Agent 注册 | `server/index.ts` | 132-143 |
 
-### 16.2 配置与存储
+### 19.2 配置与存储
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1603,7 +2149,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | User.settings 关联配置 | `server/entity/User.ts` | 137-142 |
 | 用户认证中间件 | `server/middleware/auth.ts` | 9-41 |
 
-### 16.3 各 Agent 实现
+### 19.3 各 Agent 实现
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1615,7 +2161,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | Pushover Agent | `server/lib/notifications/agents/pushover.ts` | 36-353 |
 | Telegram Agent | `server/lib/notifications/agents/telegram.ts` | 37-325 |
 
-### 16.4 业务触发点
+### 19.4 业务触发点
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1626,7 +2172,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | IssueCommentSubscriber | `server/subscriber/IssueCommentSubscriber.ts` | - |
 | MediaSubscriber | `server/subscriber/MediaSubscriber.ts` | - |
 
-### 16.5 重试、降级与去重相关
+### 19.5 重试、降级与去重相关
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1638,7 +2184,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | Manager 并发 fire-and-forget | `server/lib/notifications/index.ts` | 109-113 |
 | 状态跳转合并隐式去重 | `server/entity/MediaRequest.ts` | 682-696 |
 
-### 16.6 国际化与多语言
+### 19.6 国际化与多语言
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1650,7 +2196,7 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | Ntfy Agent 国际化使用 | `server/lib/notifications/agents/ntfy.ts` | 31-113 |
 | 用户 locale 字段 | `server/entity/UserSettings.ts` | 155-157 |
 
-### 16.7 日志与运维
+### 19.7 日志与运维
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1658,3 +2204,41 @@ notificationManager.sendNotification(Notification.TEST_NOTIFICATION, {
 | Agent 统一错误日志模式 | `server/lib/notifications/agents/*` | 各 Agent send() 方法 |
 | 测试通知特殊处理 | `server/lib/notifications/index.ts` | 37-39 |
 | 邮件模板目录 | `server/templates/email/` | - |
+
+### 19.8 Webhook 自定义端点扩展
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| NotificationAgentWebhook 接口 | `server/lib/settings/index.ts` | 290-298 |
+| KeyMap 变量映射表 | `server/lib/notifications/agents/webhook.ts` | 17-64 |
+| 特殊块变量处理 | `server/lib/notifications/agents/webhook.ts` | 86-122 |
+| 模板递归解析 parseKeys | `server/lib/notifications/agents/webhook.ts` | 80-144 |
+| URL 动态变量替换 | `server/lib/notifications/agents/webhook.ts` | 186-202 |
+| 三层请求头配置 | `server/lib/notifications/agents/webhook.ts` | 204-229 |
+| JSON 模板 Base64 编解码 | `server/routes/settings/notifications.ts` | 277-325 |
+
+### 19.9 通知设置路由 API
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 通知路由总入口 | `server/routes/settings/notifications.ts` | 19-433 |
+| sendTestNotification 测试函数 | `server/routes/settings/notifications.ts` | 26-36 |
+| Webhook GET 配置（自动解码） | `server/routes/settings/notifications.ts` | 276-298 |
+| Webhook POST 配置（自动编码） | `server/routes/settings/notifications.ts` | 300-325 |
+| 各渠道 GET/POST/TEST 接口 | `server/routes/settings/notifications.ts` | 38-433 |
+
+### 19.10 优先级与静默相关
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| Ntfy priority 配置 | `server/lib/settings/index.ts` | 318 / 563 |
+| Telegram sendSilently 配置（系统级） | `server/lib/settings/index.ts` | 271 / 509 |
+| Telegram messageThreadId 配置（系统级） | `server/lib/settings/index.ts` | 270 / 508 |
+| Pushover sound 配置（系统级） | `server/lib/settings/index.ts` | 286 / 527 |
+| Gotify priority 配置 | `server/lib/settings/index.ts` | 304 / 552 |
+| 用户 pushoverSound 字段 | `server/entity/UserSettings.ts` | 71 |
+| 用户 telegramSendSilently 字段 | `server/entity/UserSettings.ts` | 80 |
+| 用户 telegramMessageThreadId 字段 | `server/entity/UserSettings.ts` | 77 |
+| Telegram 发送时使用 sendSilently | `server/lib/notifications/agents/telegram.ts` | 205 |
+| Telegram 发送时使用 messageThreadId | `server/lib/notifications/agents/telegram.ts` | 204 |
+| Ntfy 发送时使用 priority | `server/lib/notifications/agents/ntfy.ts` | 38 / 100 |
