@@ -393,7 +393,13 @@ Media AVAILABLE → 请求 COMPLETED（反向驱动）
 | `server/lib/scanners/baseScanner.ts` | 扫描器基类：processMovie / processShow 状态更新逻辑 |
 | `server/lib/scanners/radarr/index.ts` | Radarr 扫描器：正向同步 + 孤儿清理 |
 | `server/lib/scanners/sonarr/index.ts` | Sonarr 扫描器：正向同步 + 孤儿清理 |
-| `server/lib/settings/index.ts` | 全局设置：JobId / JobSettings / 默认 cron 表达式 |
+| `server/lib/settings/index.ts` | 全局设置：JobId / JobSettings / 默认 cron 表达式 / Webhook 配置 |
+| `server/lib/notifications/index.ts` | 通知管理器：事件枚举、位掩码检查、管理员通知过滤 |
+| `server/lib/notifications/agents/webhook.ts` | Webhook Agent：模板引擎、变量替换、外发逻辑 |
+| `server/lib/notifications/agents/agent.ts` | 通知 Agent 基类与 Payload 接口定义 |
+| `server/lib/permissions.ts` | 权限枚举与 `hasPermission()` 位运算检查 |
+| `server/middleware/auth.ts` | 认证中间件：`isAuthenticated(permission)` 权限检查 |
+| `server/index.ts` | 服务入口：Agent 注册、任务启动 |
 
 ---
 
@@ -1577,5 +1583,492 @@ media.externalServiceId = isMediaProcessing ? media.externalServiceId : null;
 | Media AVAILABLE 但请求未 COMPLETED | 请求卡在 APPROVED | MediaSubscriber 需 Media 实体变更触发 | 需手动触发 Media 更新 |
 | 季部分集缺失 | Season 仍标记为 AVAILABLE | AvailabilitySync 季级别核对 | ≤ 24h |
 | *arr 服务器 syncEnabled=false | 孤儿清理被跳过 | 日志提示 "Skipping orphaned cleanup" | 不修复（设计预期） |
+
+---
+
+## 十六、管理员批量操作与撤销流程
+
+### 16.1 操作端点设计
+
+Jellyseerr **不提供批量操作 API**（无 `/bulk` 或 `/batch` 端点）。所有操作均为单条粒度，但通过通用的状态更新端点实现灵活性。
+
+**单条状态更新端点**（`server/routes/request.ts:663-705`）：
+
+```
+POST /api/v1/request/:requestId/:status
+```
+
+| URL 参数 | 允许值 | 对应目标状态 |
+|---|---|---|
+| `:status` | `pending` | `MediaRequestStatus.PENDING` |
+| `:status` | `approve` | `MediaRequestStatus.APPROVED` |
+| `:status` | `decline` | `MediaRequestStatus.DECLINED` |
+
+**权限要求**：`Permission.MANAGE_REQUESTS`
+
+**核心实现**：
+
+```typescript
+// server/routes/request.ts:678-694
+switch (req.params.status) {
+  case 'pending':  newStatus = MediaRequestStatus.PENDING;   break;
+  case 'approve':  newStatus = MediaRequestStatus.APPROVED;  break;
+  case 'decline':  newStatus = MediaRequestStatus.DECLINED;  break;
+}
+request.status = newStatus;
+request.modifiedBy = req.user;
+await requestRepository.save(request);
+```
+
+### 16.2 撤销批准的实现机制
+
+**撤销批准 = 状态回退到 PENDING**
+
+```
+管理员发现误批 → POST /:requestId/pending
+                    │
+                    ├─ request.status = PENDING
+                    ├─ request.modifiedBy = admin
+                    ├─ save() → afterUpdate 钩子触发
+                    │
+                    ├─ MediaRequestSubscriber.afterUpdate
+                    │   └─ updateParentStatus()
+                    │       ├─ 若无其他 APPROVED 请求
+                    │       │   └─ Media.status = UNKNOWN / PENDING
+                    │       └─ TV 季请求状态 → PENDING
+                    │
+                    └─ MediaRequest.notifyApprovedOrDeclined()
+                        └─ 仅 APPROVED/DECLINED 发通知，PENDING 跳过
+```
+
+**关键差异**：
+- 撤销操作 **不发送通知**（`notifyApprovedOrDeclined` 只处理 APPROVED/DECLINED）
+- 撤销后 `modifiedBy` 记录操作用户，便于审计
+- 撤销后 Media 状态回退规则与拒绝逻辑一致（`updateParentStatus` 复用）
+
+### 16.3 批量操作的前端实现
+
+前端通过循环调用单条端点实现批量操作。典型的前端流程：
+
+```
+管理员批量选择多条 PENDING 请求
+    │
+    ├─ 点击"全部批准"
+    │   └─ 遍历选择的 requestId
+    │       └─ 逐个 POST /:requestId/approve
+    │
+    ├─ 点击"全部拒绝"
+    │   └─ 遍历选择的 requestId
+    │       └─ 逐个 POST /:requestId/decline
+    │
+    └─ 发现误批后撤销
+        └─ 选择已批准的请求
+            └─ 逐个 POST /:requestId/pending
+```
+
+### 16.4 各状态间的合法转换
+
+| 起始状态 | 目标状态 | 允许吗？ | API |
+|---|---|---|---|
+| PENDING | APPROVED | ✅ | `POST /:id/approve` |
+| PENDING | DECLINED | ✅ | `POST /:id/decline` |
+| APPROVED | PENDING | ✅（撤销批准） | `POST /:id/pending` |
+| APPROVED | DECLINED | ✅（批准后拒绝） | `POST /:id/decline` |
+| DECLINED | APPROVED | ✅（拒绝后重批） | `POST /:id/approve` |
+| DECLINED | PENDING | ✅ | `POST /:id/pending` |
+| FAILED | APPROVED | ✅（重试专用） | `POST /:id/retry` |
+| FAILED | PENDING | ❌ | 无直接 API |
+| COMPLETED | 任意 | ❌ | 终态，不可修改 |
+
+### 16.5 撤销批准后的回收流程
+
+撤销批准（APPROVED → PENDING）触发的回收逻辑与拒绝请求**完全相同**（复用 `updateParentStatus`）：
+
+```
+APPROVED → PENDING
+    ├─ 若无其他 APPROVED 请求
+    │   ├─ 电影：Media.status = UNKNOWN（非 DELETED 时）
+    │   └─ TV：Season.status = PENDING（该季无其他 APPROVED 请求时）
+    │
+    ├─ MediaRequest.status = PENDING
+    ├─ request.modifiedBy = admin
+    └─ 无通知发送
+```
+
+**与拒绝请求的区别**：
+- 撤销只是回退到待审批状态，不影响未来重新批准
+- 拒绝是终态之一，需要用户重新提交或管理员拒绝后重批
+- 两者都会触发 Media 状态回收
+
+### 16.6 审计追踪
+
+每次状态变更都会更新以下字段：
+
+| 字段 | 用途 |
+|---|---|
+| `request.status` | 当前状态 |
+| `request.modifiedBy` | 最后修改人（关联 User） |
+| `request.updatedAt` | 更新时间 |
+| `request.createdAt` | 创建时间（只读） |
+
+通过对比 `createdAt` / `updatedAt` / `modifiedBy` 可以重建完整的审批历史，但 Jellyseerr 不提供独立的审计日志表。
+
+---
+
+## 十七、请求生命周期事件的 Webhook 外发
+
+### 17.1 通知体系总览
+
+Jellyseerr 的通知系统是一个多通道分发架构，Webhook 是其中一个代理（Agent）。
+
+```
+请求生命周期事件
+        │
+        ▼
+MediaRequest.sendNotification()
+        │
+        ├─ 根据事件类型构造 NotificationPayload
+        ├─ 设置 notifyAdmin / notifySystem / notifyUser
+        │
+        ▼
+notificationManager.sendNotification(type, payload)
+        │
+        ├─ 遍历所有已注册 Agent（Discord/Slack/Email/Webhook/...）
+        │
+        ├─ 每个 Agent.shouldSend() 检查是否启用
+        │
+        └─ 每个 Agent.send(type, payload)
+            │
+            ├─ hasNotificationType() 检查该类型是否在启用列表中
+            ├─ 构造消息格式
+            └─ 外发到目标通道
+```
+
+**Agent 注册**（`server/index.ts:10-18`）：
+```typescript
+notificationManager.registerAgents([
+  new DiscordAgent(),
+  new EmailAgent(),
+  new GotifyAgent(),
+  new NtfyAgent(),
+  new PushbulletAgent(),
+  new PushoverAgent(),
+  new SlackAgent(),
+  new TelegramAgent(),
+  new WebhookAgent(),
+  new WebPushAgent(),
+]);
+```
+
+### 17.2 请求相关的通知事件
+
+请求生命周期会触发以下 7 种通知事件（`server/lib/notifications/index.ts:6-20`）：
+
+| Notification 枚举值 | 值 | 触发时机 | notifyAdmin | notifySystem |
+|---|---|---|---|---|
+| `MEDIA_PENDING` | 2 | 请求创建（PENDING） | true | true |
+| `MEDIA_APPROVED` | 4 | 请求被批准（非自动） | false | true |
+| `MEDIA_AUTO_APPROVED` | 128 | 请求自动批准 | true | true |
+| `MEDIA_DECLINED` | 64 | 请求被拒绝 | false | true |
+| `MEDIA_AVAILABLE` | 8 | 媒体到位 | false | true |
+| `MEDIA_FAILED` | 16 | 推送到 *arr 失败 | true | true |
+| `MEDIA_AUTO_REQUESTED` | 4096 | 自动请求提交 | false | false |
+
+**事件触发点**（`server/entity/MediaRequest.ts:629-727`）：
+
+| 钩子 | 触发事件 |
+|---|---|
+| `@AfterInsert` | PENDING → `MEDIA_PENDING` + `MEDIA_AUTO_REQUESTED` |
+| `@AfterInsert` (auto) | APPROVED → `MEDIA_AUTO_APPROVED` |
+| `@AfterUpdate` | APPROVED → `MEDIA_APPROVED` / `MEDIA_AVAILABLE` |
+| `@AfterUpdate` | DECLINED → `MEDIA_DECLINED` |
+| 推送失败 catch | `MEDIA_FAILED` |
+
+### 17.3 Webhook Agent 配置
+
+**配置结构**（`server/lib/settings/index.ts`）：
+
+| 配置项 | 说明 |
+|---|---|
+| `enabled` | 是否启用 |
+| `types` | 位掩码，启用的事件类型 |
+| `options.webhookUrl` | Webhook URL，支持模板变量 |
+| `options.jsonPayload` | Base64 编码的 JSON 模板 |
+| `options.authHeader` | Authorization header 值 |
+| `options.customHeaders` | 自定义 header 数组 |
+| `options.supportVariables` | URL 是否支持模板变量替换 |
+
+### 17.4 Webhook Payload 模板引擎
+
+Webhook 支持强大的模板变量替换机制（`server/lib/notifications/agents/webhook.ts:17-64`）。
+
+**KeyMap 模板变量**（部分）：
+
+| 占位符 | 含义 |
+|---|---|
+| `{{notification_type}}` | 事件类型字符串（如 MEDIA_APPROVED） |
+| `{{subject}}` | 通知标题 |
+| `{{message}}` | 通知正文 |
+| `{{media_tmdbid}}` | 媒体 TMDB ID |
+| `{{media_tvdbid}}` | 媒体 TVDB ID |
+| `{{media_type}}` | 媒体类型 |
+| `{{media_status}}` | 媒体状态 |
+| `{{request_id}}` | 请求 ID |
+| `{{requestedBy_username}}` | 请求人用户名 |
+| `{{requestedBy_email}}` | 请求人邮箱 |
+| `{{extra}}` | 额外字段数组（TV 请求的季信息等） |
+| `{{media}}` | 完整 Media 对象 JSON |
+| `{{request}}` | 完整 MediaRequest 对象 JSON |
+
+**特殊对象占位符**：
+- `{{extra}}` → 展开为 `extra` 字段数组
+- `{{media}}` / `{{request}}` / `{{issue}}` / `{{comment}}` → 展开为完整对象
+
+### 17.5 Webhook 外发流程
+
+**完整调用链**：
+
+```
+MediaRequest.sendNotification()
+    │
+    ├─ notificationManager.sendNotification(type, payload)
+    │
+    ├─ WebhookAgent.shouldSend()
+    │   └─ enabled && webhookUrl 非空 → true
+    │
+    └─ WebhookAgent.send(type, payload)
+        │
+        ├─ hasNotificationType(type, types) → 位掩码检查
+        │
+        ├─ URL 变量替换（如果 supportVariables）
+        │   └─ 遍历 KeyMap，将 {{key}} 替换为实际值
+        │
+        ├─ buildPayload(type, payload)
+        │   ├─ Base64 解码 JSON 模板
+        │   └─ parseKeys() 递归替换模板变量
+        │
+        ├─ 构造 Headers
+        │   ├─ authHeader → Authorization
+        │   └─ customHeaders（不覆盖已有 Authorization）
+        │
+        └─ axios.post(webhookUrl, payload, headers)
+            ├─ 成功 → return true
+            └─ 失败 → 日志 error，return false
+```
+
+**URL 模板示例**：
+```
+https://example.com/webhook?user={{requestedBy_username}}&media={{media_tmdbid}}&type={{notification_type}}
+```
+
+**JSON Payload 模板示例**（Base64 编码）：
+```json
+{
+  "event": "{{event}}",
+  "subject": "{{subject}}",
+  "request": {{request}},
+  "media": {{media}}
+}
+```
+
+### 17.6 容错与重试
+
+Webhook 发送**不支持重试**：
+
+```typescript
+// server/lib/notifications/agents/webhook.ts:204-248
+try {
+  await axios.post(...);
+  return true;
+} catch (e) {
+  logger.error('Error sending webhook notification', { ... });
+  return false;  // 仅日志，不重试
+}
+```
+
+**设计考量**：
+- Webhook 是通知而非业务关键路径
+- 避免重试风暴打爆接收端
+- 由接收端保证最终一致性（可通过 API 轮询补充）
+
+### 17.7 管理员与普通用户通知分流
+
+**`notifyAdmin` 标志**（`server/entity/MediaRequest.ts:746-770`）：
+
+| 事件 | notifyAdmin | notifyUser | 接收对象 |
+|---|---|---|---|
+| `MEDIA_PENDING` | true | undefined | 所有管理员 |
+| `MEDIA_APPROVED` | false | 请求人 | 请求提交者 |
+| `MEDIA_AUTO_APPROVED` | true | 请求人 | 管理员 + 请求人 |
+| `MEDIA_DECLINED` | false | 请求人 | 请求提交者 |
+| `MEDIA_AVAILABLE` | false | 请求人 | 请求提交者 |
+| `MEDIA_FAILED` | true | undefined | 所有管理员 |
+
+**管理员通知过滤**（`server/lib/notifications/index.ts:67-90`）：
+
+```typescript
+shouldSendAdminNotification(type, user, payload): boolean {
+  return (
+    user.id !== payload.notifyUser?.id &&               // 排除操作者本人
+    user.hasPermission(getAdminPermission(type)) &&     // 有权限
+    (type !== MEDIA_AUTO_APPROVED ||                    // 排除自动批准的提交者
+      user.id !== (payload.request?.modifiedBy ?? payload.request?.requestedBy)?.id)
+  );
+}
+```
+
+---
+
+## 十八、多用户共享请求列表的访问控制
+
+### 18.1 权限体系基础
+
+访问控制基于位权限掩码（`server/lib/permissions.ts`），使用 `hasPermission()` 进行位运算检查。
+
+**请求相关权限**：
+
+| 权限 | 值 | 含义 |
+|---|---|---|
+| `REQUEST` | 1 | 提交请求（基础权限） |
+| `REQUEST_VIEW` | 2097152 | 查看所有请求 |
+| `REQUEST_ADVANCED` | 4194304 | 高级请求选项（修改 rootFolder 等） |
+| `MANAGE_REQUESTS` | 16 | 管理请求（审批/拒绝/重试/删除） |
+| `AUTO_APPROVE_*` | 128, 256, ... | 自动审批 |
+| `ADMIN` | 1 | 隐含所有权限 |
+
+**权限检查规则**：
+- `hasPermission([perm1, perm2, ...], { type: 'or' })` — 任一权限即通过
+- `value & Permission.ADMIN` 直接返回 true（ADMIN 隐含所有权限）
+
+### 18.2 请求列表查询的访问控制
+
+**入口**：`GET /api/v1/request` → `server/routes/request.ts:32-176`
+
+**访问控制逻辑**（`server/routes/request.ts:141-161`）：
+
+```typescript
+// 检查是否有查看所有请求的权限
+if (!req.user?.hasPermission(
+  [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
+  { type: 'or' }
+)) {
+  // 普通用户只能看自己的请求
+  if (requestedBy && requestedBy !== req.user?.id) {
+    return next({ status: 403, message: "You do not have permission to view this user's requests." });
+  }
+  // 强制过滤为当前用户
+  query = query.andWhere('requestedBy.id = :id', { id: req.user?.id });
+} else {
+  // 管理员/有 REQUEST_VIEW 权限 → 可按 requestedBy 筛选
+  if (requestedBy) {
+    query = query.andWhere('requestedBy.id = :id', { id: requestedBy });
+  }
+}
+```
+
+**访问控制矩阵**：
+
+| 用户角色 | 可查看范围 | `requestedBy` 参数 |
+|---|---|---|
+| 普通用户（仅 REQUEST 权限） | 仅自己的请求 | 指定他人 → 403；不指定 → 自动过滤为自己 |
+| 有 REQUEST_VIEW 权限 | 所有用户的请求 | 指定用户 → 筛选；不指定 → 全部 |
+| 有 MANAGE_REQUESTS 权限 | 所有用户的请求 | 指定用户 → 筛选；不指定 → 全部 |
+| ADMIN | 所有用户的请求 | 指定用户 → 筛选；不指定 → 全部 |
+
+### 18.3 单条请求操作的权限控制
+
+#### 修改请求（PUT /:requestId）
+
+```typescript
+// server/routes/request.ts:476-486
+if (
+  (request.requestedBy.id !== req.user?.id ||
+    (req.body.mediaType !== 'tv' &&
+      !req.user?.hasPermission(Permission.REQUEST_ADVANCED))) &&
+  !req.user?.hasPermission(Permission.MANAGE_REQUESTS)
+) {
+  return next({ status: 403, ... });
+}
+```
+
+**修改权限规则**：
+- `MANAGE_REQUESTS` → 可修改任何请求
+- 本人请求 + TV 类型 → 可修改（TV 请求允许修改季）
+- 本人请求 + 非 TV 类型 + `REQUEST_ADVANCED` → 可修改
+- 本人请求 + 非 TV 类型 + 无 `REQUEST_ADVANCED` → 403
+
+#### 删除请求（DELETE /:requestId）
+
+```typescript
+// server/routes/request.ts:610-619
+if (
+  !req.user?.hasPermission(Permission.MANAGE_REQUESTS) &&
+  (request.requestedBy.id !== req.user?.id ||
+    request.status !== MediaRequestStatus.PENDING)
+) {
+  return next({ status: 401, ... });
+}
+```
+
+**删除权限规则**：
+- `MANAGE_REQUESTS` → 可删除任何请求
+- 本人请求 + 状态为 PENDING → 可删除
+- 本人请求 + 非 PENDING → 403（已批准的请求不能自己撤销，需管理员操作）
+
+#### 状态操作（POST /:requestId/:status）
+
+```typescript
+// server/routes/request.ts:668
+isAuthenticated(Permission.MANAGE_REQUESTS)
+```
+
+**仅限管理员**，普通用户无权限。
+
+### 18.4 跨用户数据隔离的实现细节
+
+**查询构建时的强制过滤**：
+
+```typescript
+// 无权限查看所有请求时，强制加入用户 ID 过滤
+query = query
+  .leftJoinAndSelect('request.requestedBy', 'requestedBy')
+  .where('request.status IN (:...requestStatus)', { ... })
+  .andWhere('((request.is4k = false AND media.status IN ...) OR ...)');
+
+// 普通用户强制过滤
+if (!hasViewAllPermission) {
+  if (requestedBy && requestedBy !== req.user.id) {
+    return 403;
+  }
+  query.andWhere('requestedBy.id = :id', { id: req.user.id });
+}
+```
+
+**为什么要先检查 requestedBy 再强制过滤**：
+
+这是双重防护：
+1. 第一重：普通用户试图查看他人请求时直接 403，暴露的信息更少
+2. 第二重：即使绕过第一重（如参数伪造），查询也会被强制过滤为当前用户
+
+### 18.5 媒体列表的访问控制
+
+请求列表的访问控制是**粗粒度**的（基于请求人），而媒体详情页的可见性由另一套规则控制：
+
+| 设置项 | 效果 |
+|---|---|
+| `hideAvailable` | 对非管理员隐藏已可用的媒体 |
+| `hideBlocklisted` | 对非管理员隐藏已拉黑的媒体 |
+
+这两个设置控制前端是否显示媒体卡片，不影响 API 层面的请求数据查询。
+
+### 18.6 访问控制潜在风险点
+
+| 风险点 | 说明 | 缓解措施 |
+|---|---|---|
+| 枚举攻击 | `requestedBy` 参数可枚举用户 ID | 第一重校验直接 403，不泄露该用户是否有请求 |
+| 越权查看 | 前端参数注入 `requestedBy` | 第二重强制 SQL AND 过滤 |
+| 横向越权修改 | 修改他人请求 | `requestedBy.id` 检查 + `MANAGE_REQUESTS` 权限 |
+| 审批日志篡改 | `modifiedBy` 字段 | 由后端自动填入 `req.user`，不接受客户端参数 |
+| 未授权状态变更 | 普通用户调用状态 API | `isAuthenticated(Permission.MANAGE_REQUESTS)` 中间件保护 |
 
 
