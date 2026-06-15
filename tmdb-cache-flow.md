@@ -1695,7 +1695,503 @@ TMDB 使用 ISO 639-1（如 `zh-CN`），TVDB 使用三字母编码（如 `chi`/
 
 > **缓存膨胀风险**：10 个用户使用 10 种不同语言访问同一部电影，会产生 10 条 tmdb 缓存。但 node-cache 的 stdTTL 会自动清理，不会无限增长。
 
-## 16. 关键设计特点总结
+---
+
+## 16. 通知 Channel Adapter 与缓存衔接
+
+### 16.1 Adapter 架构
+
+通知系统采用经典的 **Adapter 模式**，10 个 Channel 共享同一接口：
+
+```
+事件触发 (MediaRequestSubscriber / IssueSubscriber / ...)
+    │
+    ▼
+NotificationManager.sendNotification(type, payload)
+    │
+    ├─ 遍历 activeAgents
+    │   ├─ agent.shouldSend() → 检查 enabled + 配置完整性
+    │   └─ agent.send(type, payload) → 发送通知
+    │
+    ▼ 各 Agent 独立处理
+┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────┐ ┌──────────┐
+│ Discord │ │  Email  │ │Telegram │ │  Webhook │ │  Slack   │ ...
+└─────────┘ └─────────┘ └─────────┘ └──────────┘ └──────────┘
+     │            │           │            │            │
+  axios.post   SMTP/Nodemailer  axios.post   axios.post   axios.post
+     │            │           │            │            │
+  Discord API   SMTP Server  Telegram API  用户自定义URL  Slack API
+```
+
+**文件**: `server/lib/notifications/index.ts:92-115`
+
+```typescript
+class NotificationManager {
+  private activeAgents: NotificationAgent[] = [];
+
+  public sendNotification(type: Notification, payload: NotificationPayload): void {
+    this.activeAgents.forEach((agent) => {
+      if (agent.shouldSend()) {
+        agent.send(type, payload);  // 各 Agent 独立、并行
+      }
+    });
+  }
+}
+```
+
+### 16.2 Agent 注册与初始化
+
+**文件**: `server/index.ts:132-143`
+
+所有 Agent 在服务启动时一次性注册，不传 settings 参数（延迟到运行时读取）：
+
+```typescript
+notificationManager.registerAgents([
+  new DiscordAgent(),     // 无参构造 → 运行时 getSettings()
+  new EmailAgent(),
+  new GotifyAgent(),
+  new NtfyAgent(),
+  new PushbulletAgent(),
+  new PushoverAgent(),
+  new SlackAgent(),
+  new TelegramAgent(),
+  new WebhookAgent(),
+  new WebPushAgent(),
+]);
+```
+
+### 16.3 Settings 的延迟读取策略
+
+**关键设计**：Agent 构造时不缓存 settings，每次 `send()` / `shouldSend()` 时实时读取。
+
+**文件**: `server/lib/notifications/agents/discord.ts:82-90`
+
+```typescript
+class DiscordAgent extends BaseAgent<NotificationAgentDiscord> {
+  protected getSettings(): NotificationAgentDiscord {
+    if (this.settings) {
+      return this.settings;  // 如果有注入的 settings（测试用）
+    }
+    const settings = getSettings();  // 运行时从 Settings 单例读取
+    return settings.notifications.agents.discord;
+  }
+}
+```
+
+**为什么不用缓存？** 因为 `getSettings()` 本身就是内存单例（见第 17 章），读取成本极低（一次属性访问），且保证永远拿到最新配置（管理员修改设置后立即生效，无需重启或刷新缓存）。
+
+### 16.4 通知中的 TMDB 元数据请求与缓存
+
+发送通知时通常需要获取媒体标题和简介，这会触发 TMDB API 调用：
+
+**文件**: `server/subscriber/MediaRequestSubscriber.ts:71-86`
+
+```typescript
+const tmdb = new TheMovieDb();
+
+try {
+  const movie = await tmdb.getMovie({ movieId: entity.media.tmdbId });
+  // ↑ 命中 node-cache（TTL 12h），几乎不会穿透到 TMDB
+
+  notificationManager.sendNotification(Notification.MEDIA_AVAILABLE, {
+    subject: `${movie.title} (${movie.release_date.slice(0, 4)})`,
+    image: `https://image.tmdb.org/t/p/w300${movie.poster_path}`,
+    message: truncate(movie.overview, { length: 500 }),
+    // ...
+  });
+} catch (e) {
+  // TMDB 失败 → 不发通知（静默跳过）
+  logger.error('Something went wrong sending media available notification');
+}
+```
+
+**缓存影响**：
+- 通知触发时调用的 `getMovie()` / `getTvShow()` 会命中 `tmdb` 缓存实例
+- 如果之前已有用户访问过该媒体详情，缓存必然存在
+- 只有在冷启动后首个通知触发时才会穿透到 TMDB
+
+### 16.5 Discord Agent 详解
+
+**发送流程** (`server/lib/notifications/agents/discord.ts:233-349`)：
+
+```
+send(type, payload)
+    │
+    ├─ 1. 检查 notifySystem + hasNotificationType → 跳过不匹配的类型
+    │
+    ├─ 2. 构建用户 @mention 列表
+    │    ├─ notifyUser → 查该用户的 discordIds 设置
+    │    └─ notifyAdmin → 查所有管理员用户的 discordIds
+    │       ↑ 每次通知都查 User 表！无缓存！
+    │
+    ├─ 3. 确定语言
+    │    ├─ useUserLocale=true → 使用被通知用户的 locale
+    │    └─ useUserLocale=false → 使用 Discord Agent 配置的 locale
+    │
+    ├─ 4. buildEmbed(type, payload, locale) → 构建 Discord Embed
+    │    └─ getIntl(locale) → 从 i18n 内存 Map 获取格式化器
+    │
+    └─ 5. axios.post(webhookUrl, payload) → 发送到 Discord
+         └─ 失败 → logger.error + return false（不重试）
+```
+
+### 16.6 各 Channel 的缓存特点
+
+| Channel | 自身缓存 | 依赖外部缓存 | Settings 读取 | 重试策略 |
+|---------|---------|------------|-------------|---------|
+| Discord | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Email | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Telegram | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Webhook | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Slack | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| WebPush | 无 | 无（纯推送） | 每次实时读 | 无 |
+| Gotify | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Ntfy | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Pushbullet | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+| Pushover | 无 | TMDB 元数据 (node-cache) | 每次实时读 | 无 |
+
+**共同特征**：
+- 无自身缓存：通知是即时推送，不需要缓存历史
+- 无重试：发送失败只记日志，不重试
+- Settings 延迟读取：保证配置变更实时生效
+- 依赖 TMDB 缓存：获取媒体标题/海报时受益于 node-cache
+
+### 16.7 通知中 User 查询的性能问题
+
+Discord、Telegram、Email 的 `notifyAdmin` 路径每次都会查询所有用户：
+
+```typescript
+// discord.ts:271-291
+const userRepository = getRepository(User);
+const users = await userRepository.find();  // 全量查询！无缓存！
+```
+
+**风险**：用户量大时（1000+），每次通知都全量查 User 表。但通知频率本身不高（请求状态变更才触发），实际影响可控。
+
+---
+
+## 17. Admin 后台 Settings Store
+
+### 17.1 架构：文件持久化的内存单例
+
+Settings Store 采用 **JSON 文件持久化 + 内存单例** 模式，不使用数据库也不使用 node-cache：
+
+```
+┌────────────────────────────────────────┐
+│         Settings 单例 (内存)            │
+│                                        │
+│  this.data: AllSettings                │ ← 内存中的完整配置树
+│  this.saveLock: Promise                │ ← 防并发写入的锁
+│                                        │
+│  读取：直接返回 this.data 的属性         │
+│  写入：merge → 内存更新 → 写文件         │
+└──────────┬─────────────────────────────┘
+           │ 启动时 load()
+           │ 修改时 save()
+           ▼
+   CONFIG_DIRECTORY/settings.json         ← 磁盘持久化
+```
+
+### 17.2 单例获取
+
+**文件**: `server/lib/settings/index.ts:888-896`
+
+```typescript
+let settings: Settings | undefined;
+
+export const getSettings = (initialSettings?: AllSettings): Settings => {
+  if (!settings) {
+    settings = new Settings(initialSettings);  // 首次创建
+  }
+  return settings;  // 后续直接返回内存单例
+};
+```
+
+**关键特性**：
+- 进程内全局唯一，任何 `getSettings()` 调用都返回同一对象
+- 没有缓存失效问题——它本身就是缓存
+- 读取速度是对象属性访问，比数据库查询快 1000x+
+
+### 17.3 加载流程
+
+**文件**: `server/lib/settings/index.ts:812-871`
+
+```typescript
+public async load(overrideSettings?: AllSettings, raw = false): Promise<Settings> {
+  // 1. 如有 override，直接替换内存数据
+  if (overrideSettings) {
+    this.data = overrideSettings;
+    return this;
+  }
+
+  // 2. 从文件读取
+  let data;
+  try {
+    data = await fs.readFile(SETTINGS_PATH, 'utf-8');
+  } catch {
+    await this.save();  // 文件不存在 → 用默认值创建
+  }
+
+  // 3. 解析 + 迁移 + 合并
+  if (data && !raw) {
+    const parsedJson = JSON.parse(data);
+    const migratedData = await runMigrations(parsedJson, SETTINGS_PATH);  // 版本迁移
+    const merged = mergeSettings(this.data, migratedData);               // 深度合并
+    this.data = merged;
+  }
+
+  // 4. 补全缺失字段（apiKey、clientId、sessionSecret、vapidKeys）
+  if (!this.data.main.apiKey) { this.data.main.apiKey = this.generateApiKey(); change = true; }
+  if (!this.data.clientId)    { this.data.clientId = randomUUID(); change = true; }
+  if (!this.data.sessionSecret) { this.data.sessionSecret = randomBytes(32).toString('hex'); change = true; }
+  if (!this.data.vapidPublic || !this.data.vapidPrivate) { /* 生成 VAPID keys */ change = true; }
+
+  if (change) { await this.save(); }  // 有变更 → 回写文件
+  return this;
+}
+```
+
+### 17.4 保存流程（防并发写入）
+
+**文件**: `server/lib/settings/index.ts:873-885`
+
+```typescript
+public async save(): Promise<void> {
+  const savePromise = this.saveLock.then(async () => {
+    const tmp = SETTINGS_PATH + '.tmp';
+    await fs.writeFile(tmp, JSON.stringify(this.data, undefined, ' '));  // 写临时文件
+    await fs.rename(tmp, SETTINGS_PATH);  // 原子重命名
+  });
+
+  this.saveLock = savePromise.catch(() => {});  // 防止链断裂
+  return savePromise;
+}
+```
+
+**并发保护**：
+- `saveLock` 是一个 Promise 链，每次 save 都等上一次完成后再执行
+- 使用 `tmp → rename` 实现原子写入，避免写到一半崩溃导致文件损坏
+- 即使某次 save 失败，`catch(() => {})` 保证链不中断
+
+### 17.5 设置的深度合并
+
+**文件**: `server/lib/settings/index.ts:12-15`
+
+```typescript
+const mergeSettings = <T>(current: T, incoming: Partial<T>): T =>
+  mergeWith({}, current, incoming, (_objValue, srcValue) =>
+    Array.isArray(srcValue) ? srcValue : undefined  // 数组直接替换，不合并
+  ) as T;
+```
+
+**合并策略**：
+- 对象：递归深度合并（新增字段保留，已有字段覆盖）
+- 数组：直接替换（不合并数组元素，避免旧条目残留）
+- 基本类型：直接覆盖
+
+### 17.6 Settings 与缓存的关系
+
+**Settings 自身不使用 node-cache**，但 Settings 的数据**影响缓存行为**：
+
+| Setting 字段 | 影响的缓存行为 |
+|-------------|--------------|
+| `main.locale` | 默认 language 参数 → 影响 TMDB 缓存 Key |
+| `main.discoverRegion` | 默认 watch_region → 影响 Discover 缓存 Key |
+| `main.originalLanguage` | 默认 with_original_language → 影响 Discover 缓存 Key |
+| `main.cacheImages` | 控制前端是否缓存图片到本地 |
+| `metadataSettings.tv/anime` | 选择 TMDB/TVDB → 影响使用哪个缓存实例 |
+| `notifications.agents.*` | 通知 Agent 配置（不缓存，实时读取） |
+| `network.dnsCache` | DNS 缓存开关和 TTL |
+| `network.apiRequestTimeout` | 外部 API 超时时间 |
+
+**配置变更的即时性**：
+- 修改 `main.locale` → 下次 API 请求使用新 locale → 产生新的缓存 Key → 穿透到 TMDB
+- 旧 locale 的缓存条目自然过期（stdTTL），不需要主动失效
+
+### 17.7 Settings 的公共接口
+
+管理员设置和公共设置是不同的接口：
+
+| 路由 | 权限 | 返回内容 |
+|-----|------|---------|
+| `/api/v1/settings/public` | 无需认证 | `fullPublicSettings`（只含安全字段） |
+| `/api/v1/settings/main` | ADMIN | 完整 main 设置 |
+| `/api/v1/settings/notifications` | ADMIN | 完整通知设置 |
+| `/api/v1/settings/jobs` | ADMIN | 定时任务配置 |
+
+**公共设置** (`server/lib/settings/index.ts:705-739`) 是从多个 settings 域聚合的安全子集，不暴露 API Key、SMTP 密码等敏感信息。
+
+---
+
+## 18. 首屏 Discover 接口的缓存衔接
+
+### 18.1 前端首屏加载链路
+
+```
+用户访问首页 (/)
+    │
+    ▼ Next.js SSR
+_app.tsx → getInitialProps
+    │
+    ├─ 1. useUser() → /api/v1/auth/me  (SWR 缓存)
+    ├─ 2. useSettings() → /api/v1/settings/public  (SWR 缓存)
+    │
+    ▼ 客户端 hydration
+Discover 组件挂载
+    │
+    ├─ useDiscover('/api/v1/discover/trending')
+    │   ├─ SWR Infinite: initialSize=3 → 前 3 页并行请求
+    │   ├─ dedupingInterval: 30000 → 30s 内相同请求合并
+    │   └─ revalidateFirstPage: false → 首页不自动刷新
+    │
+    ├─ useDiscover('/api/v1/discover/movies')
+    ├─ useDiscover('/api/v1/discover/tv')
+    │
+    └─ GenreSlider → /api/v1/discover/genreslider/movie
+                      /api/v1/discover/genreslider/tv
+```
+
+### 18.2 前端 SWR Infinite 缓存策略
+
+**文件**: `src/hooks/useDiscover.ts:67-95`
+
+```typescript
+useSWRInfinite<BaseSearchResult<T> & S>(
+  (pageIndex, previousPageData) => {
+    // 构建分页 URL：endpoint?page=N
+    if (previousPageData && pageIndex + 1 > previousPageData.totalPages) {
+      return null;  // 已到最后一页，停止加载
+    }
+    return `${endpoint}?page=${pageIndex + 1}&...`;
+  },
+  {
+    initialSize: 3,             // 首屏并行加载前 3 页
+    revalidateFirstPage: false, // 不自动重新验证首页
+    dedupingInterval: 30000,    // 30s 内相同请求去重
+    revalidateOnFocus: false,   // 切换标签不触发重新验证
+  }
+);
+```
+
+**首屏请求量**：
+- Trending: 3 页 × 20 条 = 60 条（或 3 条 if mediaType=all）
+- Movies: 3 页 × 20 条 = 60 条
+- TV: 3 页 × 20 条 = 60 条
+- Genre Slider (Movie): 1 次（内部 N 个 genre 并行）
+- Genre Slider (TV): 1 次（内部 N 个 genre 并行）
+
+**总计约 9+ 个并发 API 请求**，但 SWR 的 `dedupingInterval` 会合并 30s 内相同请求。
+
+### 18.3 服务端 Discover 路由的缓存衔接
+
+**文件**: `server/routes/discover.ts:97-182`
+
+每个 Discover 请求经过以下缓存链路：
+
+```
+前端 SWR → /api/v1/discover/movies?page=1&language=zh-CN
+    │
+    ▼
+Express 路由 (discoverRoutes.get('/movies'))
+    │
+    ├─ 1. createTmdbWithRegionLanguage(req.user)
+    │     ├─ 读取用户 settings.streamingRegion → 否则全局 settings
+    │     ├─ 读取用户 settings.originalLanguage → 否则全局 settings
+    │     └─ new TheMovieDb({ discoverRegion, originalLanguage })
+    │
+    ├─ 2. tmdb.getDiscoverMovies({ page, language: req.locale, ... })
+    │     │
+    │     ├─ ExternalAPI.get('/discover/movie', { params: { page, language, ... } })
+    │     │   │
+    │     │   ├─ 生成 cacheKey:
+    │     │   │   "https://api.themoviedb.org/3/discover/movie{"page":1,"language":"zh-CN","with_original_language":"zh","watch_region":"CN","headers":{}}"
+    │     │   │
+    │     │   ├─ cache.get(cacheKey) → 命中 → 直接返回
+    │     │   │
+    │     │   └─ 未命中 → axios-rate-limit 排队 → 请求 TMDB → cache.set(cacheKey, data, 21600)
+    │     │
+    │     └─ 返回 TmdbDiscoverMovieResponse
+    │
+    ├─ 3. Media.getRelatedMedia(user, tmdbIds)
+    │     └─ 查询 SQLite/PG 数据库（本地 Media 表），不走 TMDB 缓存
+    │         → 返回每条媒体的请求状态 (PENDING/AVAILABLE/etc.)
+    │
+    ├─ 4. 如果有 keywords → tmdb.getKeywordDetails() → 同样走缓存
+    │
+    └─ 5. mapMovieResult() → 组装最终响应
+         └─ TMDB 数据 + 本地 Media 状态 → JSON 响应
+```
+
+### 18.4 缓存 Key 的多维度组合
+
+Discover 接口的缓存 Key 由以下维度组合：
+
+| 维度 | 来源 | 示例值 |
+|------|------|-------|
+| baseUrl | TheMovieDb 构造参数 | `https://api.themoviedb.org/3` |
+| endpoint | API 方法 | `/discover/movie` |
+| page | 前端分页参数 | `1` |
+| language | req.locale → 前端 language query | `zh-CN` |
+| originalLanguage | 用户/全局设置 | `zh` |
+| watch_region | 用户 streamingRegion 设置 | `CN` |
+| genre / studio / network | 前端筛选参数 | `28` |
+| sortBy | 前端排序参数 | `popularity.desc` |
+| certification* | 前端分级筛选 | `PG-13` |
+
+**不同用户访问同一页面**：
+- 用户 A（中文，中国区）和用户 B（英文，美国区）访问 `/discover/movies`
+- 产生的缓存 Key 不同 → 各自独立缓存
+- **不会互相命中**，但也不会互相干扰
+
+### 18.5 Genre Slider 的 N+1 缓存问题
+
+**文件**: `server/routes/discover.ts:834-876`
+
+Genre Slider 是 Discover 页面中缓存最密集的接口：
+
+```typescript
+discoverRoutes.get('/genreslider/movie', async (req, res) => {
+  const genres = await tmdb.getMovieGenres({ language });  // 1 次请求
+
+  await Promise.all(
+    genres.map(async (genre) => {
+      const genreData = await tmdb.getDiscoverMovies({
+        genre: genre.id.toString(),  // 每个体裁 1 次请求
+      });
+      mappedGenres.push({ id, name, backdrops });
+    })
+  );
+});
+```
+
+**请求量**：
+- 1 次 `getMovieGenres()` → 命中 `tmdb` 缓存（TTL 24h）
+- N 次 `getDiscoverMovies({ genre })` → N 次缓存查询
+- 电影通常 16 个体裁 → 最多 17 个 TMDB 请求
+- **全部命中缓存时**：0 次穿透到 TMDB
+- **冷启动时**：17 次穿透，受 axios-rate-limit 排队
+
+### 18.6 首屏请求优化总结
+
+| 优化手段 | 位置 | 效果 |
+|---------|------|------|
+| SWR dedupingInterval | 前端 | 30s 内相同请求合并，减少网络流量 |
+| SWR initialSize=3 | 前端 | 首屏预加载 3 页，减少翻页延迟 |
+| SWR revalidateFirstPage=false | 前端 | 首页不自动刷新，减少无谓请求 |
+| node-cache (6-12h TTL) | 服务端 | TMDB 请求绝大多数命中缓存 |
+| axios-rate-limit | 服务端 | 防止冷启动时打爆 TMDB |
+| Media.getRelatedMedia | 数据库 | 本地状态查询不走 TMDB |
+| Genre Slider 缓存 | 服务端 | 体裁数据 24h TTL，Discover 6h TTL |
+
+**冷启动场景**（进程重启后首个用户访问）：
+1. 所有 node-cache 为空
+2. 首屏 ~9 个 API 请求 → 每个可能触发多次 TMDB 请求
+3. Genre Slider 最严重（最多 17 次穿透）
+4. axios-rate-limit 会将请求排队，按 50 RPS 限流
+5. 用户可能感受到 2-5 秒延迟
+6. 后续用户访问全部命中缓存
+
+## 19. 关键设计特点总结
 
 1. **四层缓存**：前端 SWR + 服务端 node-cache + 文件系统图片缓存 + DNS 缓存
 2. **分级 TTL**：不同类型数据使用不同过期时间，平衡新鲜度和性能
@@ -1716,10 +2212,14 @@ TMDB 使用 ISO 639-1（如 `zh-CN`），TVDB 使用三字母编码（如 `chi`/
 17. **无主动降级**：429 直接失败，依赖缓存屏障 + 定时轮询重试实现最终一致性
 18. **双路径 i18n**：前端 UI (react-intl) 与后端 Metadata (TMDB language param) 独立，共享 locale 配置
 19. **多语言缓存膨胀**：不同 language 产生不同缓存 Key，多语言用户场景下缓存空间倍增
+20. **通知无缓存**：10 个 Channel Adapter 无自身缓存，依赖 TMDB node-cache + Settings 内存单例
+21. **Settings 内存单例**：JSON 文件持久化 + 内存单例，读取零延迟，配置变更即时生效
+22. **Settings 防并发写入**：Promise 链锁 + tmp→rename 原子写入，保证数据完整性
+23. **Discover 首屏优化**：SWR Infinite initialSize=3 + dedupingInterval=30s + revalidateFirstPage=false
 
 ---
 
-## 17. 代码位置速查表（完整版）
+## 20. 代码位置速查表（完整版）
 
 | 功能 | 文件路径 | 关键行 |
 |-----|---------|-------|
@@ -1792,3 +2292,29 @@ TMDB 使用 ISO 639-1（如 `zh-CN`），TVDB 使用三字母编码（如 `chi`/
 | 前端 IntlProvider | `src/pages/_app.tsx` | 199-204 |
 | 发现页语言/区域定制 | `server/routes/discover.ts` | 29-49 |
 | TVDB 语言映射 | `server/api/tvdb/interfaces.ts` | - |
+| **通知 Channel Adapter** | | |
+| NotificationManager | `server/lib/notifications/index.ts` | 92-115 |
+| Notification 接口/类型 | `server/lib/notifications/agents/agent.ts` | 全部 |
+| Discord Agent | `server/lib/notifications/agents/discord.ts` | 全部 |
+| Email Agent | `server/lib/notifications/agents/email.ts` | 全部 |
+| Telegram Agent | `server/lib/notifications/agents/telegram.ts` | 全部 |
+| Webhook Agent | `server/lib/notifications/agents/webhook.ts` | 全部 |
+| Slack Agent | `server/lib/notifications/agents/slack.ts` | 全部 |
+| Agent 注册 | `server/index.ts` | 132-143 |
+| 通知触发 (MediaRequestSubscriber) | `server/subscriber/MediaRequestSubscriber.ts` | 68-86 |
+| **Settings Store** | | |
+| Settings 类 (单例) | `server/lib/settings/index.ts` | 395-896 |
+| getSettings() 工厂函数 | `server/lib/settings/index.ts` | 888-896 |
+| Settings.load() 加载 | `server/lib/settings/index.ts` | 812-871 |
+| Settings.save() 防并发写入 | `server/lib/settings/index.ts` | 873-885 |
+| mergeSettings 深度合并 | `server/lib/settings/index.ts` | 12-15 |
+| fullPublicSettings 安全子集 | `server/lib/settings/index.ts` | 705-739 |
+| Settings 迁移 | `server/lib/settings/migrator.ts` | 全部 |
+| **Discover 首屏** | | |
+| Discover 路由 (全部) | `server/routes/discover.ts` | 全部 |
+| createTmdbWithRegionLanguage | `server/routes/discover.ts` | 29-49 |
+| Genre Slider (Movie) | `server/routes/discover.ts` | 834-876 |
+| Genre Slider (TV) | `server/routes/discover.ts` | 878-920 |
+| Discover Watchlist | `server/routes/discover.ts` | 922-983 |
+| useDiscover 前端 Hook | `src/hooks/useDiscover.ts` | 54-173 |
+| SWR Infinite 配置 | `src/hooks/useDiscover.ts` | 89-94 |
