@@ -1188,7 +1188,514 @@ private getCacheKey(path: string) {
 
 ---
 
-## 13. 关键设计特点总结
+## 13. Watchlist 同步与多用户共享
+
+### 13.1 整体架构
+
+Watchlist 同步是 **Plex 专属功能**，仅当媒体服务器类型为 Plex 时才启动定时任务。Jellyfin/Emby 模式下不存在 watchlist sync。
+
+```
+定时任务 (plex-watchlist-sync)
+    │
+    ▼
+WatchlistSync.syncWatchlist()
+    │
+    ├─ 查询所有有 plexToken 的用户
+    │
+    ▼ 逐个用户循环
+syncUserWatchlist(user)
+    │
+    ├─ 权限检查 (AUTO_REQUEST)
+    ├─ 用户设置检查 (watchlistSyncMovies/watchlistSyncTv)
+    │
+    ├─ PlexTvAPI.getWatchlist() → 获取远端 Watchlist
+    ├─ Media.getRelatedMedia() → 查本地已有媒体
+    ├─ 查已有 auto-request → 过滤已请求的
+    │
+    └─ 对「不可用」项发起新请求
+```
+
+### 13.2 多用户共享模型
+
+**文件**: `server/lib/watchlistsync.ts:18-32`
+
+```typescript
+public async syncWatchlist() {
+  const users = await userRepository
+    .createQueryBuilder('user')
+    .addSelect('user.plexToken')
+    .leftJoinAndSelect('user.settings', 'settings')
+    .where("user.plexToken != ''")
+    .getMany();
+
+  for (const user of users) {
+    await this.syncUserWatchlist(user);  // 串行处理每个用户
+  }
+}
+```
+
+**共享行为**：
+
+| 场景 | 行为 |
+|------|------|
+| 用户 A 和 B 都 watchlist 了同一电影 | 各自独立创建 auto-request，共享同一个 Media 记录 |
+| 用户 A 的 watchlist 中有已可用的媒体 | 跳过，不发请求 |
+| 用户 A 的 watchlist 中有已 blocklisted 的媒体 | 跳过，不发请求 |
+| 用户 A 的 auto-request 已完成但 Media 被删除 | 重新发起 auto-request |
+
+**数据库模型** (`server/entity/Watchlist.ts:28-68`)：
+```typescript
+@Entity()
+@Unique('UNIQUE_USER_DB', ['tmdbId', 'mediaType', 'requestedBy'])
+export class Watchlist {
+  @ManyToOne(() => User, { eager: true, onDelete: 'CASCADE' })
+  public requestedBy: User;     // 多对一：多个 watchlist 属于同一个用户
+
+  @ManyToOne(() => Media, { eager: true, onDelete: 'CASCADE' })
+  public media: Media;          // 多对一：多个 watchlist 关联同一个媒体
+
+  // 联合唯一约束：同一用户对同一媒体只能有一条 watchlist
+}
+```
+
+**多用户共享的关键**：
+- `Media` 表是**全局共享**的：不管哪个用户请求，同一 tmdbId 只有一条 Media 记录
+- `Watchlist` 表是**用户维度**的：同一电影可以被多个用户加入 watchlist
+- `MediaRequest` 表也是**用户维度**的：同一媒体可以有多个 auto-request（不同用户）
+
+### 13.3 Watchlist 缓存：ETag 机制
+
+**文件**: `server/api/plextv.ts:271-312`
+
+Plex Watchlist 使用 HTTP ETag 实现条件请求：
+
+```typescript
+public async getWatchlist({ offset, size }) {
+  const watchlistCache = cacheManager.getCache('plexwatchlist');
+  let cachedWatchlist = watchlistCache.data.get<PlexWatchlistCache>(this.authToken);
+
+  const response = await this.axios.get<WatchlistResponse>(
+    '/library/sections/watchlist/all',
+    {
+      params: { 'X-Plex-Container-Start': offset, 'X-Plex-Container-Size': size },
+      headers: {
+        'If-None-Match': cachedWatchlist?.etag,  // 发送上次缓存的 ETag
+      },
+      baseURL: 'https://discover.provider.plex.tv',
+      validateStatus: (status) => status < 400,  // 304 不算错误
+    }
+  );
+
+  // 200-299：数据有更新
+  if (response.status >= 200 && response.status <= 299) {
+    cachedWatchlist = {
+      etag: response.headers.etag,
+      response: response.data,
+    };
+    watchlistCache.data.set<PlexWatchlistCache>(this.authToken, cachedWatchlist);
+  }
+  // 304：数据未变化，使用缓存
+}
+```
+
+**缓存 Key**：`this.authToken`（按用户 Plex Token 区分，天然隔离多用户）
+
+**ETag 流程**：
+```
+首次请求 → 无 If-None-Match → 200 + ETag → 缓存 { etag, response }
+后续请求 → If-None-Match: <etag> →
+  ├─ 304 Not Modified → 使用缓存，省带宽
+  └─ 200 OK → 数据有变 → 更新缓存
+```
+
+### 13.4 Watchlist Item 的 TMDB ID 提取
+
+获取 watchlist 列表后，每个 item 还需要请求详情来获取 tmdbId：
+
+```typescript
+const watchlistDetails = await Promise.all(
+  cachedWatchlist.response.MediaContainer.Metadata.map(async (watchlistItem) => {
+    // 滚动缓存每个 item 的 metadata 详情
+    const detailedResponse = await this.getRolling<MetadataResponse>(
+      `/library/metadata/${watchlistItem.ratingKey}`,
+      { baseURL: 'https://discover.provider.plex.tv' }
+    );
+
+    // 从 Guid 数组中提取 tmdb/tvdb ID
+    const tmdbString = metadata.Guid?.find(guid => guid.id.startsWith('tmdb'));
+    const tvdbString = metadata.Guid?.find(guid => guid.id.startsWith('tvdb'));
+
+    return {
+      tmdbId: tmdbString ? Number(tmdbString.id.split('//')[1]) : 0,
+      tvdbId: tvdbString ? Number(tvdbString.id.split('//')[1]) : undefined,
+      title: metadata.title,
+      type: metadata.type,
+    };
+  })
+);
+```
+
+**缓存影响**：
+- `getRolling` 使用 `plextv` 缓存实例（TTL 7 天），watchlist item 的 metadata 几乎不变
+- 20 个 watchlist item 最多触发 20 个 metadata 请求（大多命中滚动缓存）
+
+### 13.5 Watchlist 与 Media 请求的状态过滤
+
+**文件**: `server/lib/watchlistsync.ts:100-117`
+
+不是所有 watchlist item 都会触发请求，有严格的状态过滤：
+
+```typescript
+const unavailableItems = response.items.filter((i) => {
+  const itemMediaType = i.type === 'show' ? MediaType.TV : MediaType.MOVIE;
+
+  return (
+    // 排除已有 auto-request 的（除非 Media 已删除）
+    !autoRequestedTmdbIds.has(`${itemMediaType}:${i.tmdbId}`) &&
+    // 排除已 blocklisted / 已可用的
+    !mediaItems.find(m =>
+      m.tmdbId === i.tmdbId &&
+      m.mediaType === itemMediaType &&
+      (m.status === MediaStatus.BLOCKLISTED ||
+        (itemMediaType === MediaType.MOVIE && m.status !== MediaStatus.UNKNOWN && m.status !== MediaStatus.DELETED) ||
+        (itemMediaType === MediaType.TV && m.status === MediaStatus.AVAILABLE))
+    )
+  );
+});
+```
+
+**过滤规则**：
+
+| 媒体状态 | 电影 | 剧集 | 是否发起请求 |
+|---------|------|------|------------|
+| UNKNOWN | ✓ | ✓ | ✅ 是 |
+| DELETED | ✓ | - | ✅ 是（重新请求） |
+| PENDING / PROCESSING | ✓ | - | ❌ 否（已在处理） |
+| AVAILABLE | - | ✓ | ❌ 否（已可看） |
+| PARTIALLY_AVAILABLE | - | ✓ | ✅ 是（部分可用，仍需请求） |
+| BLOCKLISTED | ✓ | ✓ | ❌ 否（黑名单） |
+
+---
+
+## 14. TMDB Rate Limit Hit 后的降级策略
+
+### 14.1 核心结论：无主动降级，依赖缓存屏障 + 静默失败
+
+Jellyseerr **没有实现**：
+- 429 状态码的自动退避重试
+- 指数退避（exponential backoff）
+- 熔断器（circuit breaker）
+- 服务降级（graceful degradation to stale data）
+
+但通过**缓存屏障**和**分层错误处理**实现了事实上的降级。
+
+### 14.2 三道防线
+
+```
+请求到达
+    │
+    ▼ 第 1 道：缓存屏障
+node-cache 命中？ → 直接返回，根本不触碰 TMDB API
+    │
+    ▼ 第 2 道：客户端限流
+axios-rate-limit (maxRequests: 20, maxRPS: 50)
+    │  排队延迟，但不丢弃
+    │
+    ▼ 第 3 道：业务层错误处理
+各 API 方法的 try/catch → 返回空数据/回退数据
+```
+
+### 14.3 缓存作为第一道防线
+
+缓存是抵御 rate limit 的**最主要手段**。在正常运行中，绝大多数请求都会命中缓存：
+
+| 缓存类型 | TTL | 命中场景 |
+|---------|-----|---------|
+| TMDB 元数据 | 6-12h | 详情页、列表页反复访问 |
+| TMDB 图片 | 按过期时间 | 前端 CachedImage |
+| Plex GUID | 7d | 扫描器 ID 解析 |
+| Plex TV Watchlist | 5min | 定时同步 |
+| Plex TV Metadata | 7d (滚动) | Watchlist 详情 |
+
+**冷启动场景**：进程重启后所有内存缓存丢失，大量请求同时穿透到 TMDB，此时 rate limit 最容易被打满。
+
+### 14.4 Rate Limit 被打满时的行为
+
+```
+TMDB 返回 429
+    │
+    ▼
+axios 抛出 AxiosError (status: 429)
+    │
+    ▼ ExternalAPI.get() 没有捕获 → 向上传播
+    │
+    ▼ 调用方的 try/catch 处理：
+    │
+    ├─ searchMulti() → 返回空结果 { results: [], total_results: 0 }
+    ├─ searchMovies() → 返回空结果
+    ├─ searchTv() → 返回空结果
+    ├─ getMovie() (路由层) → 返回 500 "Unable to retrieve movie."
+    ├─ getTvShow() (路由层) → 返回 500 "Unable to retrieve series."
+    └─ Scanner 中 → 跳过该条目，继续下一条
+```
+
+**用户感知**：
+
+| 场景 | 用户看到 |
+|------|---------|
+| 搜索页面 | 空结果（无报错） |
+| 电影详情页 | 500 错误页 |
+| 发现列表 | 部分列表项缺失 |
+| Watchlist 同步 | 跳过失败项，下一轮重试 |
+| Scanner 同步 | 跳过失败媒体 |
+
+### 14.5 Watchlist Sync 的重试机制
+
+**文件**: `server/lib/watchlistsync.ts:119-194`
+
+Watchlist 同步虽然不是真正的"重试"，但通过**定时轮询**实现了最终一致性：
+
+```typescript
+for (const mediaItem of unavailableItems) {
+  try {
+    await MediaRequest.request({ ... }, user, { isAutoRequest: true });
+  } catch (e) {
+    // 不同错误不同处理：
+    switch (e.constructor) {
+      case RequestPermissionError:    // 权限不足 → debug 日志
+      case DuplicateMediaRequestError: // 重复请求 → debug 日志
+      case QuotaRestrictedError:      // 配额限制 → debug 日志
+      case NoSeasonsAvailableError:   // 无可用季 → debug 日志
+      case BlocklistedMediaError:     // 黑名单 → 静默忽略（不记日志）
+        break;
+      default:
+        logger.error('Failed to create media request from watchlist', { ... });
+    }
+  }
+}
+```
+
+**定时任务调度** (`server/job/schedule.ts:89-107`)：
+- Plex 模式下注册 `plex-watchlist-sync` 定时任务
+- 调度频率由用户配置决定（默认每隔一段时间运行）
+- 每次运行都从头扫描所有用户的 watchlist
+- 上一轮失败的请求在下一轮会被重新尝试（因为 Media 状态未改变）
+
+### 14.6 定时扫描器（Scanner）的容错
+
+扫描器同样依赖定时重试而非即时重试：
+
+```
+Scanner 同步失败
+    │
+    ├─ 单条媒体失败 → logger.error + continue（跳过，继续下一条）
+    │
+    └─ 整个扫描失败 → 进程退出，等待下一轮定时任务
+```
+
+**没有 backoff 机制**：即使 TMDB 持续返回 429，定时任务仍按原定频率运行，可能导致连续失败。
+
+---
+
+## 15. Metadata 多语言 i18n 加载衔接
+
+### 15.1 两条独立的 i18n 路径
+
+Jellyseerr 的国际化有两条完全独立的路径：
+
+| 路径 | 作用域 | 实现方式 | 数据源 |
+|------|--------|---------|--------|
+| 前端 UI i18n | 界面文本（按钮、标签、提示） | react-intl | `src/i18n/locale/*.json` |
+| 后端 Metadata i18n | TMDB 元数据（标题、简介） | TMDB API language 参数 | TMDB 服务端 |
+
+```
+┌──────────────────────────────────────┐
+│  前端 UI i18n                        │
+│  IntlProvider + react-intl           │
+│  影响范围：按钮、标签、错误消息等      │
+├──────────────────────────────────────┤
+│  后端 Metadata i18n                  │
+│  TMDB API ?language=zh-CN            │
+│  影响范围：电影标题、简介、海报等      │
+└──────────────────────────────────────┘
+两条路径共享同一个 locale 配置（用户设置中的 locale 字段）
+```
+
+### 15.2 Locale 的确定链路
+
+**文件**: `server/middleware/auth.ts:36-38`
+
+每个 API 请求的 locale 由中间件确定：
+
+```typescript
+req.locale = user?.settings?.locale
+  ? user.settings.locale        // 优先用户设置
+  : settings.main.locale;       // 回退到全局设置
+```
+
+**优先级**：`用户 settings.locale` > `全局 main.locale` > `默认 en`
+
+### 15.3 前端 UI i18n 加载
+
+**文件**: `src/pages/_app.tsx`
+
+#### SSR 阶段（首次加载）
+
+```typescript
+CoreApp.getInitialProps = async (initialProps) => {
+  const locale = user?.settings?.locale
+    ? user.settings.locale
+    : currentSettings.locale;
+
+  const messages = await loadLocaleData(locale as AvailableLocale);
+  // loadLocaleData 是动态 import：
+  //   case 'zh-CN': return import('../i18n/locale/zh_Hans.json');
+  //   case 'en':    return import('../i18n/locale/en.json');
+  //   default:      return import('../i18n/locale/en.json');
+
+  return { ...appInitialProps, user, messages, locale, currentSettings };
+};
+```
+
+#### CSR 阶段（切换语言）
+
+```typescript
+const [loadedMessages, setMessages] = useState<MessagesType>(messages);
+const [currentLocale, setLocale] = useState<AvailableLocale>(locale);
+
+useEffect(() => {
+  loadLocaleData(currentLocale).then(setMessages);
+}, [currentLocale]);
+```
+
+**LanguageContext** 提供全局语言切换：
+```tsx
+<LanguageContext.Provider value={{ locale: currentLocale, setLocale }}>
+  <IntlProvider locale={currentLocale} defaultLocale="en" messages={loadedMessages}>
+    {/* 所有子组件通过 useIntl() 获取翻译 */}
+  </IntlProvider>
+</LanguageContext.Provider>
+```
+
+**支持 38 种语言** (`server/types/languages.ts:1-39`)：ar, bg, ca, cs, da, de, en, el, es, es-MX, et, fi, fr, hr, he, hi, hu, it, ja, ko, lb, lt, nb-NO, nl, pl, pt-BR, pt-PT, ro, ru, sq, sr, sv, tr, uk, zh-CN, zh-TW, vi
+
+### 15.4 后端 Metadata i18n 加载
+
+后端元数据的国际化是通过 TMDB API 的 `language` 参数实现的：
+
+**路由层** (`server/routes/movie.ts:20-23`)：
+```typescript
+const tmdbMovie = await tmdb.getMovie({
+  movieId: Number(req.params.id),
+  language: (req.query.language as string) ?? req.locale,
+  // 优先 URL query → 回退 req.locale
+});
+```
+
+**API 层** (`server/api/themoviedb/index.ts`)：
+```typescript
+public getMovie = async ({ movieId, language = this.locale }) => {
+  const data = await this.get<TmdbMovieDetails>(
+    `/movie/${movieId}`,
+    { params: { language, append_to_response: '...' } },
+    43200
+  );
+  return data;
+};
+```
+
+**language 参数如何影响缓存 Key**：
+
+```
+cacheKey = baseUrl + endpoint + JSON.stringify({ language, ... })
+
+/movie/123{"language":"zh-CN","headers":{}}
+/movie/123{"language":"en","headers":{}}
+```
+
+> ⚠️ **重要**：不同语言的请求会产生不同的缓存 Key。如果用户 A 用中文访问，用户 B 用英文访问同一部电影，会产生两条缓存条目。这意味着 38 种语言最多 38 倍缓存空间。
+
+### 15.5 发现页面的语言定制
+
+**文件**: `server/routes/discover.ts:29-49`
+
+发现页面除了 UI 语言外，还有两个额外的区域/语言维度：
+
+```typescript
+export const createTmdbWithRegionLanguage = (user?: User): TheMovieDb => {
+  const discoverRegion =
+    user?.settings?.streamingRegion === 'all'
+      ? ''
+      : user?.settings?.streamingRegion ?? settings.main.discoverRegion;
+
+  const originalLanguage =
+    user?.settings?.originalLanguage === 'all'
+      ? ''
+      : user?.settings?.originalLanguage ?? settings.main.originalLanguage;
+
+  return new TheMovieDb({ discoverRegion, originalLanguage });
+};
+```
+
+**三维度定制**：
+
+| 维度 | 影响范围 | TMDB 参数 | 用户设置 |
+|------|---------|----------|---------|
+| locale | 元数据语言（标题、简介） | `language` | `settings.locale` |
+| streamingRegion | 流媒体提供商（各国不同） | `watch_region` | `settings.streamingRegion` |
+| originalLanguage | 原始语言过滤（发现页） | `with_original_language` | `settings.originalLanguage` |
+
+### 15.6 服务端 i18n（通知系统）
+
+**文件**: `server/i18n/index.ts`
+
+服务端也有独立的 i18n 系统，用于发送本地化通知：
+
+```typescript
+export function initI18n(): void {
+  for (const locale of availableLocales) {
+    const filePath = path.join(__dirname, `locale/${locale}.json`);
+    const messages = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+    intls.set(locale, createIntl({ locale, messages, defaultLocale: 'en' }, cache));
+  }
+}
+```
+
+**启动时加载** (`server/index.ts:87`)：
+```typescript
+initI18n();  // 服务启动时一次性加载所有语言的翻译文件到内存
+```
+
+**使用场景**：通知模板（Discord、Email、Telegram 等）中需要本地化的文本。
+
+### 15.7 TVDB 的语言映射
+
+**文件**: `server/api/tvdb/interfaces.ts` + `server/api/tvdb/index.ts:350-353`
+
+TVDB 使用不同的语言编码体系，需要映射：
+
+```typescript
+const wantedTranslation = convertTmdbLanguageToTvdbWithFallback(
+  language,                   // TMDB 格式: 'zh-CN'
+  Tvdb.DEFAULT_LANGUAGE       // TVDB 默认: 'eng'
+);
+```
+
+TMDB 使用 ISO 639-1（如 `zh-CN`），TVDB 使用三字母编码（如 `chi`/`eng`）。`convertTmdbLanguageToTvdbWithFallback` 负责转换，无匹配时回退到英文。
+
+### 15.8 i18n 与缓存的关系
+
+| i18n 类型 | 缓存影响 |
+|-----------|---------|
+| 前端 UI | 无影响（静态 JSON，无缓存） |
+| TMDB Metadata | 不同 language 产生不同缓存 Key，多语言多倍缓存 |
+| 服务端通知 | 无影响（内存 Map，启动时全量加载） |
+| TVDB Metadata | 语言转换后作为 headers 参数，影响 TVDB 缓存 Key |
+
+> **缓存膨胀风险**：10 个用户使用 10 种不同语言访问同一部电影，会产生 10 条 tmdb 缓存。但 node-cache 的 stdTTL 会自动清理，不会无限增长。
+
+## 16. 关键设计特点总结
 
 1. **四层缓存**：前端 SWR + 服务端 node-cache + 文件系统图片缓存 + DNS 缓存
 2. **分级 TTL**：不同类型数据使用不同过期时间，平衡新鲜度和性能
@@ -1204,10 +1711,15 @@ private getCacheKey(path: string) {
 12. **三层 Normalize**：Provider 接口层 + Scanner ID 层 + Model 映射层，多数据源统一输出
 13. **命名空间隔离**：10 个独立缓存实例 + baseUrl 前缀，从架构上避免 Key 碰撞
 14. **TMDB 为中心**：所有扫描器都以 tmdbId 为主键，其他 ID 反查 TMDB
+15. **Watchlist ETag 缓存**：Plex Watchlist 使用 HTTP ETag 条件请求，304 免传输
+16. **多用户串行同步**：Watchlist 逐用户串行处理，Media 全局共享，Request 用户维度隔离
+17. **无主动降级**：429 直接失败，依赖缓存屏障 + 定时轮询重试实现最终一致性
+18. **双路径 i18n**：前端 UI (react-intl) 与后端 Metadata (TMDB language param) 独立，共享 locale 配置
+19. **多语言缓存膨胀**：不同 language 产生不同缓存 Key，多语言用户场景下缓存空间倍增
 
 ---
 
-## 14. 代码位置速查表（完整版）
+## 17. 代码位置速查表（完整版）
 
 | 功能 | 文件路径 | 关键行 |
 |-----|---------|-------|
@@ -1260,3 +1772,23 @@ private getCacheKey(path: string) {
 | 电影详情路由 | `server/routes/movie.ts` | 16-57 |
 | 搜索路由 | `server/routes/search.ts` | 11-61 |
 | 电影详情页 (SSR) | `src/pages/movie/[movieId]/index.tsx` | 14-33 |
+| **Watchlist 同步** | | |
+| Watchlist 同步核心 | `server/lib/watchlistsync.ts` | 全部 |
+| Watchlist 同步测试 | `server/lib/watchlistsync.test.ts` | 全部 |
+| Watchlist 路由 | `server/routes/watchlist.ts` | 全部 |
+| Watchlist Entity | `server/entity/Watchlist.ts` | 28-68 |
+| Plex TV Watchlist ETag | `server/api/plextv.ts` | 271-312 |
+| Watchlist 定时任务 | `server/job/schedule.ts` | 89-107 |
+| **Rate Limit 降级** | | |
+| 搜索静默降级 | `server/api/themoviedb/index.ts` | 153-172 |
+| TVDB Provider 回退 | `server/api/tvdb/index.ts` | 168-196 |
+| 路由层 500 错误处理 | `server/routes/movie.ts` | 46-56 |
+| Scanner 容错（跳过） | `server/lib/scanners/plex/index.ts` | 218-224 |
+| **i18n** | | |
+| 服务端 i18n 初始化 | `server/i18n/index.ts` | 全部 |
+| 可用语言列表 | `server/types/languages.ts` | 1-39 |
+| Locale 中间件 | `server/middleware/auth.ts` | 36-38 |
+| 前端 loadLocaleData | `src/pages/_app.tsx` | 28-105 |
+| 前端 IntlProvider | `src/pages/_app.tsx` | 199-204 |
+| 发现页语言/区域定制 | `server/routes/discover.ts` | 29-49 |
+| TVDB 语言映射 | `server/api/tvdb/interfaces.ts` | - |
