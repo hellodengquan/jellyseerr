@@ -706,9 +706,491 @@ axios 发送 HTTP 请求到 TMDB
 
 ---
 
-## 10. 关键设计特点总结
+## 10. TMDB API 重试回退机制（Retry/Fallback）
 
-1. **双层+缓存**：前端 SWR + 服务端 node-cache + 文件系统图片缓存 + DNS 缓存，共四层
+### 10.1 概述：无自动重试，多层 Fallback
+
+Jellyseerr 的 TMDB API 调用**没有内置自动重试**（没有 axios-retry、没有 429 退避），但在业务逻辑层面有多层 **fallback**（降级/回退）策略。
+
+| 回退类型 | 场景 | 回退行为 | 代码位置 |
+|---------|------|---------|---------|
+| 语言回退 | 请求语言无 overview | 回退到英文版本 | `routes/movie.ts:40-43` |
+| Provider 回退 | TVDB 接口失败 | 回退到纯 TMDB 数据 | `api/tvdb/index.ts:188-191` |
+| 搜索回退 | 搜索接口抛异常 | 返回空结果集 | `api/themoviedb/index.ts:165-172` |
+| ID 回退 | 只有 IMDb/TVDB/AniDB ID | 通过 TMDB 查找对应 tmdbId | `scanners/plex/index.ts:382-532` |
+| 空数据回退 | TVDB 季数据为空 | 返回空 season 结构 | `api/tvdb/index.ts:330-333` |
+
+### 10.2 语言回退（Language Fallback）
+
+**文件**: `server/routes/movie.ts:39-43` 与 `server/routes/tv.ts:47-53`
+
+TMDB 存在一个已知 bug：当请求的语言没有对应 overview 时，不会自动回退到英文，而是返回空字符串。
+
+```typescript
+// 电影详情路由
+const data = mapMovieDetails(tmdbMovie, media, onUserWatchlist);
+
+// TMDB issue where it doesnt fallback to English when no overview is available in requested locale.
+if (!data.overview) {
+  const tvEnglish = await tmdb.getMovie({ movieId: Number(req.params.id) });
+  data.overview = tvEnglish.overview;  // 用英文 overview 填充
+}
+```
+
+**注意事项**：
+- 这是**路由层**的回退，不是 `TheMovieDb` 类内部的回退
+- 会触发第二次 API 调用（但第二次会命中缓存，因为默认语言是英文）
+- 仅针对 `overview` 字段，其他字段（标题、海报等）仍保留原语言
+
+### 10.3 TVDB → TMDB 数据回退
+
+**文件**: `server/api/tvdb/index.ts:168-196`
+
+Tvdb 类实现 `TvShowProvider` 接口，内部先请求 TMDB，再尝试用 TVDB 数据增强。任何一步失败都回退到上一层。
+
+```typescript
+public async getTvShow({ tvId, language }): Promise<TmdbTvDetails> {
+  try {
+    // 第 1 层：先从 TMDB 获取基础数据
+    const tmdbTvShow = await this.tmdb.getTvShow({ tvId, language });
+
+    try {
+      // 第 2 层：尝试用 TVDB 增强（季数据更准确）
+      await this.refreshToken();
+      const tvdbId = this.getTvdbIdFromTmdb(tmdbTvShow);
+
+      if (this.isValidTvdbId(tvdbId)) {
+        return await this.enrichTmdbShowWithTvdbData(tmdbTvShow, tvdbId);
+      }
+      return tmdbTvShow;  // TVDB 不可用，回退到纯 TMDB
+    } catch (error) {
+      // TVDB 增强失败 → 回退到纯 TMDB 数据
+      this.handleError('Failed to fetch TV show details', error);
+      return tmdbTvShow;
+    }
+  } catch (error) {
+    // TMDB 本身失败 → 再试一次纯 TMDB（？这里逻辑有点怪）
+    this.handleError('Failed to fetch TV show details', error);
+    return this.tmdb.getTvShow({ tvId, language });
+  }
+}
+```
+
+**回退层级**：
+```
+请求 getTvShow()
+    │
+    ├─ TMDB 请求成功？
+    │    ├─ 是 → 尝试 TVDB 增强
+    │    │      ├─ TVDB 成功 → 返回增强数据
+    │    │      └─ TVDB 失败 → 返回纯 TMDB 数据 ←────┐
+    │    │                                                │
+    │    └─ 否 → 抛出异常 → catch 中再试一次 TMDB ──────┘
+    │                （实际上是重复请求，可能也会失败）
+    │
+    ▼
+最终结果
+```
+
+> **设计疑问**：最外层 catch 中再次调用 `this.tmdb.getTvShow()` 实际上是重试一次 TMDB，但如果第一次失败了，第二次大概率也会失败。这可能是为了给缓存一个机会，或者是代码遗留问题。
+
+### 10.4 搜索接口的静默回退
+
+**文件**: `server/api/themoviedb/index.ts:153-173`
+
+搜索接口失败时不抛异常，而是返回空结果集：
+
+```typescript
+public searchMulti = async ({ query, page = 1, includeAdult = false, language }): Promise<TmdbSearchMultiResponse> => {
+  try {
+    const data = await this.get<TmdbSearchMultiResponse>('/search/multi', {
+      params: { query, page, include_adult: includeAdult, language },
+    });
+    return data;
+  } catch {
+    // 静默回退：返回空结果，不报错
+    return {
+      page: 1,
+      results: [],
+      total_pages: 1,
+      total_results: 0,
+    };
+  }
+};
+```
+
+**设计考量**：搜索是体验型功能，失败了不应让整个页面崩溃。空结果比错误页面对用户更友好。
+
+### 10.5 ID 解析回退链（Scanner 层）
+
+**文件**: `server/lib/scanners/plex/index.ts:382-532`
+
+Plex 扫描器从各种 guid 格式中提取 ID，形成长长的回退链：
+
+```
+Plex Item GUID
+    │
+    ├─ plex:// 格式（新版 Plex Agent）
+    │    ├─ Guid 数组中有 tmdb:// → 直接提取 tmdbId ✓
+    │    ├─ Guid 数组中有 imdb:// → 通过 IMDb 查 TMDB → tmdbId ✓
+    │    └─ Guid 数组中有 tvdb:// → 通过 TVDB 查 TMDB → tmdbId ✓
+    │
+    ├─ imdb://tt1234567 → 通过 IMDb 查 TMDB → tmdbId ✓
+    │
+    ├─ tmdb://12345 → 直接提取 tmdbId ✓
+    │
+    ├─ tvdb://12345 → 通过 TVDB 查 TMDB → tmdbId ✓
+    │
+    ├─ themoviedb://12345 → 直接提取 tmdbId ✓
+    │
+    ├─ hama://tvdb-12345 → TVDB → 查 TMDB → tmdbId ✓
+    │
+    └─ hama://anidb-12345 → AniDB 映射表
+             ├─ 有 tvdbId → TVDB → 查 TMDB → tmdbId ✓
+             ├─ 有 tmdbId → 直接用 tmdbId ✓
+             └─ 有 imdbId → IMDb → 查 TMDB → tmdbId ✓
+```
+
+**缓存优化** (`plex/index.ts:386-396`)：
+```typescript
+const guidCache = cacheManager.getCache('plexguid');
+const cachedGuids = guidCache.data.get<MediaIds>(plexitem.ratingKey);
+
+if (cachedGuids) {
+  mediaIds = cachedGuids; // 命中缓存，跳过整个 ID 解析链
+}
+```
+
+`plexguid` 缓存 TTL 为 **7 天**（`server/lib/cache.ts:65-68`），因为 Plex 媒体的 ID 几乎不会变。
+
+---
+
+## 11. 多数据源元数据 Normalize
+
+### 11.1 三层 Normalize 架构
+
+Jellyseerr 有三层数据归一化，确保来自不同 source 的数据最终以统一格式呈现：
+
+```
+┌───────────────────────────────────────────────────┐
+│  Layer 1: Provider 接口层                         │
+│  TheMovieDb / Tvdb → TmdbTvDetails 统一接口       │
+├───────────────────────────────────────────────────┤
+│  Layer 2: Scanner ID 归一化                       │
+│  Plex / Jellyfin → MediaIds { tmdbId, imdbId... } │
+├───────────────────────────────────────────────────┤
+│  Layer 3: Model 映射层                            │
+│  mapMovieDetails / mapTvDetails → MovieDetails    │
+└───────────────────────────────────────────────────┘
+```
+
+### 11.2 Layer 1：Provider 接口归一化
+
+**文件**: `server/api/provider.ts` (接口定义) + `server/api/themoviedb/index.ts` + `server/api/tvdb/index.ts`
+
+`TvShowProvider` 接口定义了统一的方法签名：
+
+```typescript
+interface TvShowProvider {
+  getTvShow: (options: { tvId: number; language?: string }) => Promise<TmdbTvDetails>;
+  getTvSeason: (options: { tvId: number; seasonNumber: number; language?: string }) => Promise<TmdbSeasonWithEpisodes>;
+  // ...
+}
+```
+
+**关键设计**：两个 Provider 都返回 `TmdbTvDetails` 类型，而不是各自的原生类型。
+- `TheMovieDb`：直接返回 TMDB 原生数据
+- `Tvdb`：内部调用 TMDB 获取基础数据，再用 TVDB 的季/集数据覆盖增强，最终返回同类型
+
+**元数据提供者选择** (`server/api/metadata.ts:7-39`)：
+```typescript
+export const getMetadataProvider = async (mediaType) => {
+  const settings = await getSettings();
+  
+  // 电影永远用 TMDB
+  if (mediaType == 'movie') return new TheMovieDb();
+  
+  // TV/Anime 可配置为 TVDB 或 TMDB
+  if (mediaType == 'tv' && settings.metadataSettings.tv == MetadataProviderType.TVDB) {
+    return await Tvdb.getInstance();
+  }
+  if (mediaType == 'anime' && settings.metadataSettings.anime == MetadataProviderType.TVDB) {
+    return await Tvdb.getInstance();
+  }
+  
+  return new TheMovieDb(); // 默认 TMDB
+};
+```
+
+**调用方无感切换** (`server/routes/tv.ts:24-32`)：
+```typescript
+const metadataProvider = tmdbTv.keywords.results.some(k => k.id === ANIME_KEYWORD_ID)
+  ? await getMetadataProvider('anime')
+  : await getMetadataProvider('tv');
+
+const tv = await metadataProvider.getTvShow({ tvId, language });
+// 不管底层是 TMDB 还是 TVDB，返回类型都是 TmdbTvDetails
+```
+
+### 11.3 Layer 2：Scanner ID 归一化
+
+**Plex 扫描器** (`server/lib/scanners/plex/index.ts:382-532`)：
+- 支持 7+ 种 GUID 格式（plex://, imdb://, tmdb://, tvdb://, themoviedb://, hama://tvdb, hama://anidb）
+- 最终输出统一的 `MediaIds` 结构：`{ tmdbId, imdbId?, tvdbId?, isHama? }`
+- **tmdbId 是唯一主键**，所有其他 ID 都用来反查 tmdbId
+
+**Jellyfin 扫描器** (`server/lib/scanners/jellyfin/index.ts:48-121`)：
+- 从 `ProviderIds` 对象中提取（Tmdb, TheMovieDb, Imdb, AniDB）
+- 同样以 tmdbId 为最终主键
+- 回退链：AniDB → TMDB/IMDb → TMDB
+
+**统一处理入口** (`server/lib/scanners/baseScanner.ts:95-150`)：
+```typescript
+protected async processMovie(tmdbId: number, options?: ProcessOptions) {
+  // 所有 scanner 都走这个统一入口
+  // 只需要 tmdbId，底层数据源透明
+  const mediaRepository = getRepository(Media);
+  const existing = await this.getExisting(tmdbId, MediaType.MOVIE);
+  // ...
+}
+```
+
+### 11.4 Layer 3：Model 映射层
+
+**文件**: `server/models/Movie.ts`、`server/models/Tv.ts`、`server/models/Search.ts`、`server/models/common.ts`
+
+Model 层将 TMDB/TVDB 的原始 API 响应映射为前端使用的标准化格式。
+
+**命名转换**：snake_case → camelCase
+```typescript
+// server/models/Movie.ts:103-154
+export const mapMovieDetails = (movie, media?, userWatchlist?): MovieDetails => ({
+  id: movie.id,
+  title: movie.title,
+  backdropPath: movie.backdrop_path,      // snake → camel
+  posterPath: movie.poster_path,
+  originalTitle: movie.original_title,
+  releaseDate: movie.release_date,
+  voteAverage: movie.vote_average,
+  voteCount: movie.vote_count,
+  // ...
+  credits: {
+    cast: movie.credits.cast.map(mapCast),  // 递归映射
+    crew: movie.credits.crew.map(mapCrew),
+  },
+  externalIds: mapExternalIds(movie.external_ids),
+});
+```
+
+**列表 vs 详情的不同映射**：
+- `mapMovieResult`：精简字段，用于列表/搜索结果（10 个字段左右）
+- `mapMovieDetails`：完整字段，用于详情页（40+ 字段，含 credits、keywords、watchProviders 等）
+
+### 11.5 Plex vs Jellyfin 扫描器对比
+
+| 维度 | Plex Scanner | Jellyfin Scanner |
+|-----|-------------|------------------|
+| 数据源 | Plex API (XML → JSON) | Jellyfin API (JSON) |
+| ID 来源 | GUID 字符串正则匹配 | ProviderIds 对象直接读取 |
+| Agent 类型 | 7+ 种（plex/imdb/tmdb/tvdb/hama） | 4 种（Tmdb/TheMovieDb/Imdb/AniDB） |
+| 媒体信息 | Media 数组（多版本） | MediaSources 数组 |
+| 4K 检测 | `videoResolution === '4k'` | 视频宽度 > 2000px |
+| GUID 缓存 | 有（plexguid，7 天） | 无 |
+| Hama/Anime 支持 | 完整支持 | 部分支持（AniDB ID） |
+| 基础类 | BaseScanner | BaseScanner |
+
+### 11.6 Normalize 与缓存的关系
+
+**两层缓存各自独立**：
+1. **API 层缓存**：缓存原始 TMDB/TVDB 响应，由 `ExternalAPI.get()` 管理
+2. **Scanner 层缓存**：缓存 ID 解析结果（plexguid），由扫描器直接调用 cacheManager
+
+Model 层的 `map*` 函数**不涉及缓存**，每次调用都重新计算。
+
+> **优化空间**：map 函数是纯函数，如果对同一数据反复调用可以加 memoization。但实际中详情页只调用一次，列表页每条结果也只映射一次，收益不大。
+
+---
+
+## 12. 缓存 Key Collision 处理
+
+### 12.1 核心结论：无显式 Collision 处理
+
+Jellyseerr **没有任何显式的缓存 Key 碰撞检测或处理机制**。依赖于缓存 Key 的设计来避免碰撞。
+
+### 12.2 命名空间隔离
+
+**第一层隔离：按 API 分缓存实例**
+
+`server/lib/cache.ts:45-78` 中为每个外部 API 创建独立的 `Cache` 实例：
+
+| 缓存 ID | 用途 | TTL |
+|--------|------|-----|
+| `tmdb` | TMDB API 数据 | 21600s (6h) |
+| `tvdb` | TVDB API 数据 | 21600s (6h) |
+| `radarr` | Radarr API 数据 | 300s (5min) |
+| `sonarr` | Sonarr API 数据 | 300s (5min) |
+| `rt` | Rotten Tomatoes | 43200s (12h) |
+| `imdb` | IMDB (via Radarr) | 43200s (12h) |
+| `github` | GitHub API | 21600s (6h) |
+| `plexguid` | Plex GUID → MediaIds | 604800s (7d) |
+| `plextv` | Plex TV API | 604800s (7d) |
+| `plexwatchlist` | Plex Watchlist | 300s (5min) |
+
+每个实例是独立的 `NodeCache` 对象，拥有各自的内存存储空间。**跨 API 的 Key 碰撞是不可能的**，因为根本不在同一个 Map 里。
+
+### 12.3 同 API 内的 Key 生成
+
+**文件**: `server/api/externalapi.ts:146-155`
+
+同一个缓存实例内，Key 生成公式为：
+
+```
+cacheKey = baseUrl + endpoint + JSON.stringify(options)
+```
+
+其中 GET 请求的 `options` 包含：
+- `params`：所有查询参数（page, language, sort_by 等）
+- `headers`：所有请求头
+
+**示例 Key**：
+```
+https://api.themoviedb.org/3/movie/123{"language":"zh-CN","headers":{}}
+```
+
+**设计特点**：
+- ✅ `baseUrl` 前缀：即使不同 API 用同一个缓存实例（实际上不会），也不会撞 Key
+- ✅ 所有 params 参与：不同语言、分页、排序都是独立 Key
+- ✅ headers 参与：不同认证 token（如 TVDB 的 Bearer token）也是独立 Key
+- ⚠️ `JSON.stringify` 依赖对象 key 顺序：如果 params 以不同顺序传入，会生成不同 Key
+
+### 12.4 潜在碰撞风险点
+
+#### 风险 1：params key 顺序不一致
+
+`JSON.stringify({a:1,b:2})` 和 `JSON.stringify({b:2,a:1})` 产生不同字符串。
+
+**是否实际会发生？** 不会。因为每个 API 方法调用 `this.get()` 时，`params` 对象的 key 顺序在代码中是固定的。例如：
+
+```typescript
+// server/api/themoviedb/index.ts
+this.get('/discover/movie', {
+  params: {
+    page,           // 永远第一个
+    sort_by: sortBy, // 永远第二个
+    language,       // 永远第三个
+    // ...
+  },
+});
+```
+
+只要代码不重构改变 key 顺序，就不会有碰撞问题。
+
+#### 风险 2：TheMovieDb 多实例共享同一缓存
+
+**文件**: `server/api/themoviedb/index.ts:141`
+
+所有 `TheMovieDb` 实例都共享同一个 `tmdb` 缓存实例：
+
+```typescript
+super(
+  'https://api.themoviedb.org/3',
+  { api_key: '431a8708161bcd1f1fbe7536137e61ed' },
+  {
+    nodeCache: cacheManager.getCache('tmdb').data,  // 所有实例共用
+    rateLimit: { ... },
+  }
+);
+```
+
+**不同 locale 的实例**：
+- 实例 A：`locale = 'zh-CN'`
+- 实例 B：`locale = 'en-US'`
+
+它们生成的缓存 Key 会不同吗？
+
+**答案**：会不同。因为 `language` 参数会出现在 params 中：
+```typescript
+// getMovie 方法
+const data = await this.get<TmdbMovieDetails>(
+  `/movie/${movieId}`,
+  { params: { language, ... } },
+  43200
+);
+```
+每个调用都显式传入 `language`，因此 Key 中包含语言信息，不同 locale 的实例不会发生 Key 碰撞。
+
+#### 风险 3：POST 请求的 Key
+
+POST 请求的 Key 还包含 `data`：
+
+```typescript
+// server/api/externalapi.ts:85-88
+const cacheKey = this.serializeCacheKey(endpoint, {
+  config: config?.params,
+  ...(data ? { data } : {}),  // POST body 也参与 Key 生成
+});
+```
+
+只要 body 内容不同，Key 就不同。
+
+### 12.5 TVDB 与 TMDB 的 Key 关系
+
+TVDB 的 `getTvShow()` 内部会调用 `this.tmdb.getTvShow()`，即**一次请求写入两个缓存**：
+
+```
+Tvdb.getTvShow(tvId=123, language='zh')
+    │
+    ├─ 查 tvdb 缓存（key 含 tvdb baseUrl）
+    │    └─ 未命中 → 继续
+    │
+    ├─ 调用 this.tmdb.getTvShow(tvId=123, language='zh')
+    │    ├─ 查 tmdb 缓存 → 命中/未命中
+    │    └─ 写入 tmdb 缓存
+    │
+    ├─ 调用 TVDB API 增强数据
+    │    └─ 写入 tvdb 缓存
+    │
+    └─ 返回合并结果
+```
+
+**两个缓存互不干扰**，因为：
+- 使用不同的 `Cache` 实例（`tvdb` vs `tmdb`）
+- `baseUrl` 不同（`https://api4.thetvdb.com/v4` vs `https://api.themoviedb.org/3`）
+
+### 12.6 图片缓存的 Key
+
+**文件**: `server/lib/imageproxy.ts:148-156`
+
+图片缓存使用 MD5 哈希作为目录名，避免路径特殊字符问题：
+
+```typescript
+private getCacheKey(path: string) {
+  const hash = createHash('md5');
+  hash.update(path);
+  const digest = hash.digest('hex');
+  return `${this.cacheKey}-${digest}`;
+}
+```
+
+**碰撞概率**：MD5 是 128 位哈希，对于图片 URL 这种规模的数据，碰撞概率可以忽略不计。
+
+### 12.7 Collision 风险评估
+
+| 场景 | 碰撞概率 | 严重性 | 备注 |
+|-----|---------|--------|------|
+| 跨 API 碰撞 | 0 | 高 | 独立缓存实例，完全隔离 |
+| 同 API 不同参数 | ≈0 | 中 | JSON.stringify key 顺序固定 |
+| 同 API 同参数不同 locale | ≈0 | 中 | language 参与 Key |
+| 图片 URL 碰撞 | ≈0 | 低 | MD5 哈希，概率可忽略 |
+| 多实例写入同一 Key | 无影响 | - | 最后写入者胜出，内容相同 |
+
+**结论**：当前架构下缓存 Key 碰撞的风险极低，不需要额外的碰撞检测机制。
+
+---
+
+## 13. 关键设计特点总结
+
+1. **四层缓存**：前端 SWR + 服务端 node-cache + 文件系统图片缓存 + DNS 缓存
 2. **分级 TTL**：不同类型数据使用不同过期时间，平衡新鲜度和性能
 3. **滚动刷新**：对配置类数据使用后台刷新，保证用户永远快速响应
 4. **精细 Key**：包含所有参数（语言、地区、分页等），确保缓存正确性
@@ -718,13 +1200,18 @@ axios 发送 HTTP 请求到 TMDB
 8. **无 Redis**：依赖 node-cache 内存缓存 + SQLite/PG 持久化 + 文件系统图片缓存
 9. **无自动重试**：axios 没有配置重试，429/网络错误直接失败
 10. **客户端限流**：axios-rate-limit 排队机制，保护 TMDB 不被打爆，但可能造成请求延迟
+11. **多层 Fallback**：语言回退、Provider 回退、ID 解析回退链，确保可用性
+12. **三层 Normalize**：Provider 接口层 + Scanner ID 层 + Model 映射层，多数据源统一输出
+13. **命名空间隔离**：10 个独立缓存实例 + baseUrl 前缀，从架构上避免 Key 碰撞
+14. **TMDB 为中心**：所有扫描器都以 tmdbId 为主键，其他 ID 反查 TMDB
 
 ---
 
-## 11. 代码位置速查表（扩展版）
+## 14. 代码位置速查表（完整版）
 
 | 功能 | 文件路径 | 关键行 |
 |-----|---------|-------|
+| **缓存核心** | | |
 | 缓存管理器 | `server/lib/cache.ts` | 45-87 |
 | cache.flush() 全量清空 | `server/lib/cache.ts` | 40-42 |
 | ExternalAPI 基类 | `server/api/externalapi.ts` | 全部 |
@@ -733,13 +1220,38 @@ axios 发送 HTTP 请求到 TMDB
 | axios-rate-limit 接入 | `server/api/externalapi.ts` | 45-50 |
 | 缓存 Key 生成 | `server/api/externalapi.ts` | 146-155 |
 | TMDB API 封装 + 限流配置 | `server/api/themoviedb/index.ts` | 127-147 |
+| TVDB API 封装 | `server/api/tvdb/index.ts` | 42-66 |
+| 元数据 Provider 选择器 | `server/api/metadata.ts` | 7-39 |
+| **图片缓存** | | |
 | 图片缓存代理 | `server/lib/imageproxy.ts` | 全部 |
 | 图片缓存精确删除 | `server/lib/imageproxy.ts` | 187-226 |
+| 图片缓存 Key (MD5) | `server/lib/imageproxy.ts` | 148-156 |
 | 过期图片定时清理 | `server/job/schedule.ts` | 227-244 |
 | 头像版本检查与失效 | `server/routes/avatarproxy.ts` | 52-116 |
+| **缓存失效** | | |
 | 管理员 Flush 缓存路由 | `server/routes/settings/index.ts` | 781-807 |
+| 头像缓存精确失效 | `server/routes/avatarproxy.ts` | 52-116 |
+| **Retry/Fallback** | | |
+| 语言回退（overview 空） | `server/routes/movie.ts` | 39-43 |
+| TVDB → TMDB Provider 回退 | `server/api/tvdb/index.ts` | 168-196 |
+| 搜索接口静默回退 | `server/api/themoviedb/index.ts` | 153-173 |
+| Plex Scanner ID 解析回退链 | `server/lib/scanners/plex/index.ts` | 382-532 |
+| Jellyfin Scanner ID 提取 | `server/lib/scanners/jellyfin/index.ts` | 48-121 |
+| Plex GUID 缓存 | `server/lib/scanners/plex/index.ts` | 386-396 |
+| **数据 Normalize** | | |
+| Provider 接口定义 | `server/api/provider.ts` | - |
+| Plex Scanner getMediaIds | `server/lib/scanners/plex/index.ts` | 382-532 |
+| Jellyfin GUID 归一化 | `server/utils/jellyfin.ts` | 1-15 |
+| BaseScanner 统一处理入口 | `server/lib/scanners/baseScanner.ts` | 95-150 |
+| mapMovieDetails（详情映射） | `server/models/Movie.ts` | 103-154 |
+| mapTvDetails（剧集映射） | `server/models/Tv.ts` | 163-229 |
+| mapMovieResult（列表映射） | `server/models/Search.ts` | 71-91 |
+| mapTvResult（剧集列表映射） | `server/models/Search.ts` | 93-113 |
+| 公共映射（cast/crew/externalIds） | `server/models/common.ts` | 全部 |
+| **存储层** | | |
 | 数据源配置 (SQLite/PG) | `server/datasource.ts` | 50-147 |
 | DNS 缓存初始化 | `server/utils/dnsCache.ts` | 1-26 |
+| **前端** | | |
 | 前端 useDiscover | `src/hooks/useDiscover.ts` | 54-173 |
 | SWR 全局配置 | `src/pages/_app.tsx` | 191-198 |
 | CachedImage 前端组件 | `src/components/Common/CachedImage/index.tsx` | 全部 |
