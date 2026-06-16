@@ -205,6 +205,44 @@ Emby 与 Jellyfin API 高度兼容，因此**共用同一套扫描器代码**，
 - 差异通过 `ServerType` 枚举字符串区分（`server/constants/server.ts:8-11`）
 - 这种 "兼容服务器共享扫描器" 的模式是扩展新类型时的重要参考
 
+### 2.7 插件市场扩展点的发现机制
+
+**重要澄清：系统没有插件市场 / 动态扩展发现机制**。
+
+所有功能模块都是**编译时硬编码**的，不存在运行时发现、加载、卸载插件的能力。以下是几个"伪扩展点"：
+
+**通知代理的注册模式** (`server/lib/notifications/index.ts:92-98`)：
+```typescript
+class NotificationManager {
+  private activeAgents: NotificationAgent[] = [];
+
+  public registerAgents = (agents: NotificationAgent[]): void => {
+    this.activeAgents = [...this.activeAgents, ...agents];
+    logger.info('Registered notification agents', { label: 'Notifications' });
+  };
+}
+```
+
+这是**静态注册**，不是动态发现：
+- 所有 12 个通知代理（Discord、Email、Telegram、Slack 等）在 `server/index.ts` 启动时一次性 `registerAgents()`
+- 没有目录扫描、没有反射、没有 npm 包自动加载
+- 要新增通知代理，必须修改源码、重新编译、重启服务
+
+**与真正插件系统的差异**：
+
+| 特性 | 当前实现 | 标准插件市场 |
+|------|---------|-------------|
+| 动态加载 | 否，编译时注入 | 是，运行时加载 |
+| 版本管理 | 随主版本发布 | 独立版本号 |
+| 热插拔 | 否，必须重启 | 是，无需重启 |
+| 发现机制 | 硬编码 import | 目录扫描 / npm registry |
+| 沙箱隔离 | 无，同进程同权限 | 有，权限按需授予 |
+
+**扩展性的实际路径**：
+- Fork 项目 → 添加代码 → 重新编译 → 部署
+- 没有 API Hook、没有中间件链、没有事件总线供第三方插件订阅
+- 唯一"外部集成"方式是 Webhook 通知（向外发送 HTTP 请求）
+
 ---
 
 ## 三、媒体匹配逻辑：从扫描结果到 TMDB ID
@@ -327,6 +365,35 @@ const best = (results, name, year) =>
 - Jellyfin 扫描时写入 `DateCreated`
 - 两个条目同 tmdbId 但不同 mediaAddedAt 时，后扫描的会覆盖（因为 tmdbId 是唯一键）
 - 这实际上是"同一内容不同版本"的最终一致性解决策略：以最新入库的文件为准
+
+### 3.6 atime 漂移与指纹三元组的影响
+
+**重要澄清：系统不使用文件系统时间三元组 (atime/mtime/ctime) 做指纹匹配**。
+
+代码中完全没有：
+- `fs.stat()` / `statSync()` 调用（扫描器不直接读文件）
+- `atime` / `mtime` / `ctime` 字段使用
+- 文件 hash / checksum 计算
+- 基于文件大小 + 时长的指纹
+
+**扫描器的"指纹"实际上是三层 ID**：
+```
+第一层：tmdbId              (跨服务主键，最可靠)
+第二层：ratingKey           (Plex 内唯一，仅 Plex 用)
+        / jellyfinMediaId   (Jellyfin 内唯一，仅 Jellyfin 用)
+第三层：externalServiceId   (Radarr/Sonarr 内 ID，仅 *arr 用)
+```
+
+**atime 漂移为什么不相关**：
+1. **架构层面**：Jellyseerr/Seerr 不直接扫描磁盘文件，所有信息都来自 Plex/Jellyfin/Radarr/Sonarr 的 HTTP API
+2. **atime 的不可靠性**：
+   - `noatime` / `relatime` mount 选项会导致 atime 不更新或惰性更新
+   - Docker / NFS / 网络存储的 atime 语义不一致
+   - 媒体播放器会频繁更新 atime，造成"漂移"
+3. **上游已经做了去重**：Plex/Jellyfin 入库时已经完成了文件→元数据的匹配，扫描器只消费结果
+
+**如果要做文件级去重（假设场景）**：
+理论上可以基于 Plex `Media[0].Part[0].key`（文件路径）+ `Part[0].size`（文件大小）+ `Part[0].duration`（时长）构造指纹三元组，但当前代码没有实现这个路径。所有去重都在 tmdbId 维度完成。
 
 ---
 
@@ -565,6 +632,37 @@ await requestRepository.save(request);
 - 对于 **FAILED** 请求，只要它保持 FAILED 状态，就会阻止同 tmdbId+is4k 下的新请求创建
 - 只有以下两种方式解除：管理员 retry（回到 APPROVED），或管理员删除该 FAILED 请求
 - 这形成了一个"隐性窗口期"：FAILED 状态存在期间 = 同内容不可重新请求
+
+### 4.8 回溯期内已 DECLINED 请求是否被重新唤起
+
+**明确结论：不会**。扫描器完全不读取、不修改 `MediaRequest` 表。
+
+**代码层证据**：
+- 搜索 `server/lib/scanners/` 目录下的 `getRepository(MediaRequest)`、`MediaRequest.find`、`requestRepository`：**零匹配**
+- `BaseScanner.processMovie()` 只操作 `Media` 实体，对 `MediaRequest` 无任何读写
+- Plex/Jellyfin 增量扫描的 10 分钟回溯窗口，只会影响 `Media.status` 的更新，不会回溯到请求
+
+**完整的"扫描→请求"交互时序**：
+```
+T0: 用户请求 → MediaRequest[PENDING]
+T1: 管理员拒绝 → MediaRequest[DECLINED]
+     ↓ 系统没有任何自动化流程会改变 DECLINED 状态
+T2: Plex 增量扫描 (since=T1-10min)
+     → 检测到该媒体已入库
+     → 仅更新 Media.status = AVAILABLE
+     → 不触碰 MediaRequest
+T3: 用户查看请求列表 → 该请求仍显示 DECLINED
+     → 需要用户手动重新提交（或管理员手动重置 PENDING）
+```
+
+**为什么不自动恢复 DECLINED 请求**：
+1. **语义正确**：管理员的拒绝决策可能有非技术原因（内容违规、用户配额耗尽、版权等），扫描器不应该替管理员撤销
+2. **职责分离**：扫描器只管"媒体是否存在"，不管"用户是否应该获得这个媒体"
+3. **可观测性**：如果自动恢复，管理员看不到"拒绝→自动恢复"的事件链，破坏审计
+
+**唯一的"自动唤起"路径**：
+- 用户重新发起请求（DECLINED 状态不参与去重拦截，所以可以重复提交）
+- 新请求走独立生命周期，与旧的 DECLINED 请求无关联（可以同时存在多条，状态独立）
 
 ---
 
@@ -849,6 +947,48 @@ if (isPermanentFailure) {
 - 如果推送返回 410/404，自动删除订阅记录（用户取消了通知权限）
 - 如果推送返回其他错误（429 限流、5xx），保留订阅，下次事件触发时重试（隐式重试）
 
+### 6.6 浏览器 Tab 隐藏时的轮询暂停行为
+
+**重要澄清：没有 WebSocket，也就没有 WebSocket reconnect 暂停的问题**。
+
+替代方案是 **SWR 的 `refreshWhenHidden` 选项** —— 浏览器 Tab 隐藏时自动暂停轮询：
+
+```typescript
+// Setup 页面 (src/components/Setup/index.tsx:103-107)
+const { data: backdrops } = useSWR<string[]>('/api/v1/backdrops', {
+  refreshInterval: 0,            // 不轮询，只拉一次
+  refreshWhenHidden: false,      // Tab 隐藏时也不拉取
+  revalidateOnFocus: false,      // 切回 Tab 时也不强制刷新
+});
+
+// 高级请求组件 (AdvancedRequester/index.tsx:75)
+refreshWhenHidden: false,
+```
+
+**`refreshWhenHidden: false` 的具体行为**：
+1. 用户切换到其他 Tab → `document.hidden === true` → SWR 停止 `setInterval` 轮询
+2. 用户切回本 Tab → `visibilitychange` 事件触发 → SWR 恢复轮询，可能触发一次 revalidate
+3. 浏览器最小化 / 锁屏 → 同样视为 hidden，暂停轮询
+
+**为什么暂停隐藏 Tab 的轮询**：
+- 节省带宽（用户看不到，没必要持续刷新）
+- 减少服务器压力（大型部署可能有几百个打开的 Tab）
+- 避免后台 Tab 被浏览器节流（Chrome 对后台 Tab 的 setTimeout 有 1 分钟最小间隔）
+
+**扫描进度页面的实际行为**：
+- SettingsPlex.tsx 中的扫描进度 SWR 轮询没显式设置 `refreshWhenHidden`，**默认为 `true`**（全局 SWR config）
+- 意味着：切换到其他 Tab 时，扫描进度轮询仍然在跑（1 秒 1 次）
+- 这是合理的，因为用户可能开着进度页在另一个 Tab 工作，偶尔切回来查看
+
+**与真正 WebSocket reconnect 的对比**：
+
+| 特性 | SWR + refreshWhenHidden | WebSocket reconnect |
+|------|-------------------------|--------------------|
+| 隐藏时行为 | 完全停止轮询 | 通常保持连接但暂停心跳 |
+| 恢复时行为 | visibilitychange 触发单次 revalidate | 自动 resume，补发离线期间消息 |
+| 消息可靠性 | 最多丢失 1 秒数据（轮询间隔） | 依赖服务端缓冲，消息不丢 |
+| 资源占用 | hidden 时降至 0 | 仍需维持 TCP 连接 |
+
 ---
 
 ## 七、定时任务频率与调度策略
@@ -955,6 +1095,70 @@ this.axios = rateLimit(this.axios, {
 // TVDB 配置: maxRequests=30, maxRPS=1
 // Plex/Jellyfin/Radarr/Sonarr 无内置限流，靠批次间 4s 间隔限制
 ```
+
+### 7.5 不同媒体类型的 RecheckWindow 差异化配置
+
+**重要澄清：没有 RecheckWindow / recheckWindow 配置**。
+
+系统不存在"按媒体类型设置差异化复查窗口"的机制。所有调度都是**全局 cron**，不区分电影/剧集/4K：
+
+| 检查维度 | 当前实现 | 假设的 RecheckWindow 应该是 |
+|----------|---------|---------------------------|
+| 电影可用性检查 | 每日 availabilitySync（所有电影一起跑） | MOVIE_RECHECK_WINDOW=24h |
+| 剧集可用性检查 | 同上，所有剧集一起跑 | TV_RECHECK_WINDOW=12h (剧集更新更频繁) |
+| 4K 电影检查 | 同非 4K，不区分 | MOVIE_4K_RECHECK_WINDOW=48h |
+| 处理中 (PROCESSING) | 不额外复查，等每日扫描 | PROCESSING_RECHECK_WINDOW=1h |
+| 失败请求 (FAILED) | 不自动重试，需手动 retry | FAILED_RECHECK_WINDOW=15min |
+
+**最接近"差异化检查频率"的实现**：
+- **增量 vs 全量**：Plex/Jellyfin 有每 5 分钟增量 + 每日全量，这是按"入库时间"区分，不是按媒体类型
+- **Download Tracker**：每分钟同步下载队列，PROCESSING 状态的媒体实际间接每 1 分钟被"检查"一次（但只更新队列进度，不改 Media 状态）
+- **MediaRequestSubscriber**：状态变更时即时处理（事件驱动，非轮询）
+
+**为什么不做差异化窗口**：
+1. 扫描器是幂等的，重复跑不会出错，只是浪费一点 API 调用
+2. 每日一次 + 每 5 分钟增量的组合对绝大多数场景足够
+3. 增加差异化配置会显著增加 UI 复杂度和测试矩阵
+4. 真有需求可以通过修改 cron 表达式实现（虽然不区分媒体类型）
+
+### 7.6 多 Cron Job 资源仲裁
+
+**重要澄清：没有中央资源仲裁器**。
+
+所有 13 个定时任务之间**完全独立**，没有信号量、没有互斥锁、没有优先级队列。
+
+**现状：靠时间错开实现松散仲裁**：
+```
+03:00 - Plex 全量 + Jellyfin 全量  → 可能并行（两个独立扫描器）
+04:00 - Radarr 全量
+04:30 - Sonarr 全量
+05:00 - Availability Sync + Token 刷新 + 缓存清理
+```
+
+**可能发生的冲突场景**：
+1. **Plex + Jellyfin 同时扫描**：两个独立 BaseScanner 实例，无协调，可能同时压数据库
+2. **增量扫描与全量扫描重叠**：Plex 每 5 分钟增量 + 3:00 全量，如果全量扫到 3:10 还没结束，3:05 的增量会被 `running` 标志挡掉（同扫描器实例）
+3. **Availability Sync 与 Plex 扫描重叠**：同时修改 Media.status，可能有写冲突，但 AsyncLock 按 tmdbId 串行化，保证最终一致
+4. **Download Tracker 与 Sonarr 扫描重叠**：Download Tracker 只读不写，Sonarr 扫描读+写，无冲突
+
+**单扫描器内的自仲裁** (`BaseScanner.running` 标志)：
+```typescript
+async run() {
+  if (this.running) {
+    logger.debug('Scan already running, skipping this tick');
+    return;
+  }
+  // ... 开始扫描
+}
+```
+- 同类型扫描器（如 PlexRecent）最大并发 = 1
+- 不同类型扫描器之间无限制，可以并行
+- 理论上极端情况下可以同时跑：PlexRecent + JellyfinRecent + Radarr + Sonarr + AvailabilitySync + DownloadTracker = 6 个并发任务
+
+**数据库层面的天然仲裁**：
+- SQLite：文件级写锁，所有写操作自动串行化
+- PostgreSQL：行级锁，AsyncLock 提供额外的应用层保护
+- 所以即使多个扫描器并行，数据库层面不会出现真正的并行写
 
 ---
 
@@ -1076,6 +1280,85 @@ store: new TypeormStore({
 3. 暴露配置会增加测试负担和用户困惑
 4. 真需要调优的用户可以 fork 代码修改
 
+### 8.6 SCAN_CONCURRENCY 热生效路径
+
+**重要澄清：没有 SCAN_CONCURRENCY 环境变量**。
+
+搜索 `server/` 下所有 `process.env` 引用，找到的与扫描 / 并发相关的环境变量只有：
+
+```
+CONFIG_DIRECTORY  → 配置文件路径
+API_KEY           → 全局 API Key（可热更新）
+DB_HOST / DB_PORT / DB_USER / DB_PASS → 数据库配置（启动时读取）
+PORT / HOST       → 服务端口（启动时读取）
+LOG_LEVEL         → 日志级别（启动时读取，不可热更新）
+TZ                → 时区（启动时读取）
+JELLYFIN_TYPE     → Jellyfin/Emby 切换（启动时读取）
+```
+
+与扫描并发相关的参数全部**硬编码在类属性中**：
+```typescript
+class BaseScanner<T> {
+  protected bundleSize = 50;     // 不可热更新
+  protected updateRate = 4000;   // 不可热更新
+  public running = false;        // 运行时状态，可变但不是"配置"
+}
+```
+
+**热生效路径的完全缺失**：
+
+| 参数 | 修改方式 | 生效时机 |
+|------|---------|----------|
+| bundleSize | 修改源码 + 重新编译 + 重启 | 下次运行 |
+| updateRate | 修改源码 + 重新编译 + 重启 | 下次运行 |
+| cron 表达式 | Settings Jobs UI 修改 | 立即（通过 `rescheduleJob`） |
+| maxRPS (TMDB) | 修改源码 + 重新编译 + 重启 | 下次 API 调用 |
+| cleanupLimit | 修改源码 + 重新编译 + 重启 | 下次 session 过期清理 |
+
+**唯一可热更新的运行相关配置**：cron 表达式（通过 UI 修改后调用 `rescheduleJob()` 立即生效）。其余所有参数都是编译期常量。
+
+### 8.7 降权后用户感知延迟
+
+**权限系统的实现方式**：位运算实时计算，无缓存，零延迟。
+
+**`hasPermission()` 的实现** (`server/lib/permissions.ts:47-74`)：
+```typescript
+export const hasPermission = (
+  permissions: Permission | Permission[],
+  value: number,  // 这是 User.permissions，存在 User 表中
+  options: PermissionCheckOptions = { type: 'and' }
+): boolean => {
+  // 直接按位与，无任何缓存、无任何异步、无任何 IO
+  return !!(value & Permission.ADMIN) || !!(value & total);
+};
+```
+
+**权限的读路径**：
+1. 每个 HTTP 请求通过 `auth` 中间件 (`server/middleware/auth.ts`) 从 session 中读取 User
+2. `user.permissions` 字段（number 类型，bitmask）存在 User 对象上
+3. 路由调用 `hasPermission(requiredPerm, user.permissions)` 实时计算
+4. 计算是纯 CPU 位运算，耗时纳秒级
+
+**降权的生效时序**：
+```
+T0: 管理员修改用户权限（PUT /api/v1/user/:id → User.permissions = newMask）
+T1: User entity 保存到数据库
+T2: 该用户发起新请求 → auth 中间件从数据库重新加载 User
+     → 加载到的 permissions 是新值
+     → hasPermission() 返回 false
+```
+**延迟 = 该用户下一次请求的 HTTP 往返时间**，通常 < 100ms。
+
+**会话缓存的潜在延迟**：
+- `express-session` 默认内存存储（生产环境推荐 Redis），session 有 `saveUninitialized` / `resave` 选项
+- 如果 session store 有缓存，可能导致降权在 session 过期前不生效
+- 但 `req.user` 是通过 TypeORM `getRepository(User).findOne()` 从数据库实时加载的（不是从 session 中直接取），所以**权限变更对下一次请求即时生效**
+
+**权限降级的用户感知**：
+- **UI 侧**：权限是前端加载用户信息时拿到的，用户可能需要刷新页面才能看到按钮消失
+- **API 侧**：降权后立即生效，未刷新页面的用户点击按钮会收到 403
+- **正在进行中的请求**：降权不影响已经通过权限校验的请求（请求只在入口处校验一次）
+
 ---
 
 ## 九、可用性反向校验与异常修正
@@ -1140,7 +1423,340 @@ Jellyfin 中 AniDB 条目常把一部动漫的多季拆成多个 Series。`proce
 
 ---
 
-## 十一、关键文件索引
+## 十一、UI 状态持久化与恢复
+
+### 11.1 用户手动恢复 alertDismissed 的路径
+
+**唯一的 dismissed 状态**：`StatusChecker` 组件的"重启提醒"弹窗。
+
+**实现细节** (`src/components/StatusChecker/index.tsx:29-35`)：
+```typescript
+const [alertDismissed, setAlertDismissed] = useState(false);
+
+useEffect(() => {
+  if (!data?.restartRequired) {
+    setAlertDismissed(false);  // 条件满足时自动恢复
+  }
+}, [data?.restartRequired]);
+```
+
+**dismiss 与恢复的完整生命周期**：
+1. 管理员修改设置 → `data.restartRequired = true` → 弹窗出现
+2. 管理员点击 Close → `setAlertDismissed(true)` → 弹窗消失
+3. 管理员重启服务器 → `data.restartRequired = false` → `useEffect` 自动 `setAlertDismissed(false)`
+4. 下次 `restartRequired = true` 时，弹窗会再次出现
+
+**关键特征**：
+- **dismiss 状态是组件级**：`useState` 存储在 React 组件内存中，页面刷新即丢失
+- **没有持久化**：不写入 localStorage、不写入数据库
+- **没有手动恢复按钮**：用户 dismiss 后，只能通过刷新页面或等待 `restartRequired` 变为 `false` 再变回 `true` 来重新看到弹窗
+- **每个 Tab 独立**：不同浏览器 Tab 各有自己的 `alertDismissed` 状态
+
+**系统内没有通用的 `user_dismissed` 持久化机制**。所有通知 / 提醒都是即时的：
+- Toast 通知（`useToasts`）：4 秒自动消失（`autoDismiss: true`），或无限持续（`autoDismiss: false`），不存储已读状态
+- 模态框（StatusChecker）：仅 `useState(false)`，不持久化
+- Web Push 通知：由操作系统管理，与 Seerr 前端无关
+
+### 11.2 插件签名校验机制
+
+**重要澄清：没有运行时插件签名校验**。系统不存在插件加载器，因此也不存在签名校验。
+
+**CI/CD 层面的制品签名**：仅用于 Docker 镜像和 Helm Chart 的发布可信度验证（`docs/using-seerr/advanced/verifying-signed-artifacts.mdx`）：
+- 使用 **Sigstore Cosign** 对容器镜像和 Helm Chart 签名
+- 通过 GitHub OIDC 身份 + Fulcio 证书签发
+- 每个镜像附带 CycloneDX SBOM (Software Bill of Materials)
+- 用户可以用 `cosign verify` 手动校验镜像是否被篡改
+
+**但这是部署时校验，不是运行时校验**：
+- 不在应用代码中执行
+- 不阻止未签名的代码运行
+- 不阻止自定义构建的 Docker 镜像部署
+- 纯粹是"发布供应链"的完整性保障
+
+**与插件系统的关系**：因为不存在插件系统，所以不存在插件签名校验的需求。如果未来引入插件系统，签名校验将是一个全新的安全层。
+
+### 11.3 NTFS Journaling 下 mtime/ctime Timing 差异
+
+**重要澄清：系统不读取文件系统元数据，NTFS timing 差异不影响扫描**。
+
+前面 3.6 节已分析过系统不使用 atime/mtime/ctime。这里补充 NTFS 场景下"为什么不受影响"的技术原理：
+
+**NTFS vs ext4 的 mtime/ctime 行为差异**：
+
+| 行为 | ext4 | NTFS |
+|------|------|------|
+| mtime 更新时机 | write() 系统调用时立即 | 写入 USN Journal 后异步 |
+| ctime 含义 | inode 元数据变更时间 | 等价于 mtime (NTFS 无 inode) |
+| 时钟精度 | 纳秒 | 100 纳秒 (FILETIME) |
+| Journal 对 mtime 的影响 | 无（直接写入 inode） | 可能延迟几毫秒（先 Journal 后 MFT） |
+
+**为什么这些差异对 Seerr 无影响**：
+1. Seerr 的"时间戳"来自 **Plex/Jellyfin 的 API**，不是文件系统
+2. Plex 的 `addedAt` 是**媒体入库时间**（Plex 数据库记录），不是文件 mtime
+3. Jellyfin 的 `DateCreated` 同理，是 Jellyfin 数据库记录
+4. 即使 Plex 内部使用 mtime 做文件变更检测，那也是 Plex 的实现细节，对 Seerr 不可见
+
+**如果未来做文件级扫描**（假设）：
+- 需要处理 NTFS 的 `FileTime` → Unix timestamp 转换（精度差异）
+- 需要处理 SMB/CIFS 挂载的时间戳精度损失
+- 需要处理 Docker volume 挂载下的时间戳一致性（Windows 宿主 + Linux 容器）
+- 当前架构避开了所有这些复杂性
+
+### 11.4 Anime 与 Documentary 子类型 RecheckWindow
+
+**重要澄清：没有按子类型区分的 RecheckWindow**。
+
+但 anime 子类型在扫描系统中有**独立的配置路径**，体现在以下层面：
+
+**Sonarr anime 配置** (`server/lib/settings/index.ts:94-101`)：
+```typescript
+interface SonarrSettings {
+  seriesType: 'standard' | 'daily' | 'anime';
+  animeSeriesType: 'standard' | 'daily' | 'anime';
+  activeAnimeDirectory?: string;        // 动漫专用根目录
+  activeAnimeProfileId?: number;        // 动漫专用质量配置
+  activeAnimeLanguageProfileId?: number; // 动漫专用语言配置
+  animeTags?: number[];                  // 动漫专用标签
+}
+```
+
+**anime 识别机制** (`server/subscriber/MediaRequestSubscriber.ts:578-601`)：
+```typescript
+// 入队时通过 TMDB 关键词检测 anime 类型
+const isAnime = tmdbKeywords.some(
+  (keyword) => keyword.id === ANIME_KEYWORD_ID
+);
+
+if (isAnime) {
+  seriesType = sonarrSettings.animeSeriesType ?? 'anime';
+  // 切换到 anime 专用配置
+  rootFolder = seriesType === 'anime' && sonarrSettings.activeAnimeDirectory
+    ? sonarrSettings.activeAnimeDirectory : sonarrSettings.activeDirectory;
+  qualityProfile = seriesType === 'anime' && sonarrSettings.activeAnimeProfileId
+    ? sonarrSettings.activeAnimeProfileId : sonarrSettings.activeProfileId;
+}
+```
+
+**anime 与 documentary 的扫描差异**：
+
+| 维度 | Anime | Documentary | 普通剧集 |
+|------|-------|-------------|---------|
+| 扫描频率 | 相同（全局 cron） | 相同 | 相同 |
+| ID 解析 | AniDB 映射表 | 标准 TMDB/TVDB | 标准 TMDB/TVDB |
+| 入队配置 | 独立 anime 配置 | 无独立配置 | 默认配置 |
+| 季合并策略 | AniDB 多季合并 | 无特殊处理 | 无特殊处理 |
+| RecheckWindow | 不存在 | 不存在 | 不存在 |
+
+**documentary（纪录片）在系统中没有特殊处理**：
+- TMDB 将纪录片标记为电影/剧集类型的一种，但 Seerr 的扫描器不区分
+- 如果需要纪录片走独立配置，需要在 Sonarr 层面（而非 Seerr 层面）设置
+- Seerr 的 anime 特殊处理是唯一存在的子类型差异化逻辑
+
+### 11.5 断网时 ETA Progress 占位策略
+
+**下载进度数据来源**：DownloadTracker 从 Radarr/Sonarr 的 Queue API 获取，每分钟更新一次。
+
+**DownloadingItem 数据结构** (`server/lib/downloadtracker.ts:14-25`)：
+```typescript
+interface DownloadingItem {
+  mediaType: MediaType;
+  externalId: number;
+  size: number;           // 总大小 (bytes)
+  sizeLeft: number;       // 剩余大小 (bytes)
+  status: string;         // 下载状态字符串
+  timeLeft: string;       // 剩余时间 (Sonarr/Radarr 格式)
+  estimatedCompletionTime: Date;  // 预计完成时间
+  title: string;
+  downloadId: string;
+  episode?: EpisodeNumberResult;
+}
+```
+
+**断网时的行为**：
+
+`DownloadTracker.updateDownloads()` 内部 (`downloadtracker.ts:88-117`)：
+```typescript
+try {
+  await radarr.refreshMonitoredDownloads();
+  const queueItems = await radarr.getQueue();
+  this.radarrServers[server.id] = queueItems.map(...);
+} catch {
+  logger.error(`Unable to get queue from Radarr server: ${server.name}`);
+  // 关键：catch 中不更新 this.radarrServers
+  // 旧数据保留，不覆盖为空
+}
+```
+
+**断网占位策略 = 保留旧数据，不覆盖**：
+- 上一次成功获取的进度数据**保留在内存中**
+- 不会显示为 0% 或空白，而是停留在最后一次已知的状态
+- 用户看到的进度条和 ETA 是"过时的"而非"空白的"
+
+**前端 DownloadBlock 的渲染逻辑** (`src/components/DownloadBlock/index.tsx:77-93`)：
+```typescript
+{downloadItem.estimatedCompletionTime
+  ? intl.formatMessage(messages.estimatedtime, {
+      time: <FormattedRelativeTime
+        value={Math.floor(
+          (new Date(downloadItem.estimatedCompletionTime).getTime() - Date.now()) / 1000
+        )}
+        updateIntervalInSeconds={1}
+      />
+    })
+  : ''  // 无 ETA 时显示空字符串，不是占位符
+}
+```
+
+**断网时各字段的表现**：
+
+| 字段 | 断网时的值 | 用户看到的 |
+|------|-----------|-----------|
+| 进度百分比 | 旧值（基于 size/sizeLeft 计算） | 停滞的进度条 |
+| ETA | 旧值（`estimatedCompletionTime`） | `FormattedRelativeTime` 会继续倒计时甚至变成负数 |
+| status | 旧值 | 可能显示 "downloading" |
+| title | 旧值 | 正常显示 |
+
+**ETA 负数问题**：
+`FormattedRelativeTime` 的 value 是 `(estimatedCompletionTime - Date.now()) / 1000`。如果断网导致 ETA 过期，这个值会变成负数，显示为"X 秒前"而不是"X 秒后"。这是已知的 UX 瑕疵，目前没有做 clamping。
+
+**PWA 离线页面的兜底** (`public/sw.js:40-70`)：
+- Service Worker 拦截导航请求（`mode: 'navigate'`）
+- 网络优先策略：先尝试 `fetch()`，失败后返回缓存的 `/offline.html`
+- 离线页面有自动重连机制：每 2.5 秒尝试 `fetch('.')`，成功则 `reload()`
+- 监听 `window.addEventListener('online')` 事件，上线后自动刷新
+
+### 11.6 PWA 后台时 Visibility API 兜底
+
+**系统具备 PWA 能力**：
+- Service Worker (`public/sw.js`)：离线页面 + Web Push 接收
+- Web App Manifest (`public/site.webmanifest`)：安装到主屏幕
+- PWA Header (`src/components/PWAHeader/index.tsx`)：Apple splash screen、theme-color 等
+- ServiceWorkerSetup (`src/components/ServiceWorkerSetup/index.tsx`)：注册 SW + 验证推送订阅
+
+**PWA 后台时的推送行为**：
+- Web Push 通过 Service Worker 的 `push` 事件接收（`sw.js:73-130`）
+- 即使 PWA 在后台/关闭，Service Worker 仍然可以接收推送
+- 推送时可以显示系统级通知 + 设置应用角标 (`navigator.setAppBadge`)
+- 通知按钮支持"Approve"和"Decline"（`sw.js:97-107`），无需打开应用即可操作
+
+**Visibility API 在 SW 中的使用**：
+- Service Worker **无法使用** `document.visibilityState` / `visibilitychange`（没有 document 对象）
+- 但 Service Worker 可以通过 `self.registration.showNotification()` 向用户展示通知
+- 即使用户在另一个应用中，也能收到推送通知
+
+**前端 Visibility API 的实际使用**：
+- SWR 的 `refreshWhenHidden` 选项依赖 `document.visibilityState`
+- Tab 隐藏时暂停轮询（参见 6.6 节）
+- Tab 恢复时触发 `visibilitychange` 重新校验数据
+
+**PWA 后台恢复的完整流程**：
+```
+1. 用户将 PWA 切到后台 → SWR 轮询暂停
+2. 扫描完成 → 服务端触发 Web Push
+3. Service Worker 收到 push 事件 → 显示系统通知
+4. 用户点击通知 → clients.openWindow() 打开 PWA
+5. PWA 重新可见 → SWR 恢复轮询 → UI 更新到最新状态
+```
+
+**离线恢复的兜底策略** (`public/offline.html`)：
+- 显示"You are offline"页面
+- 手动 Reload 按钮
+- 监听 `online` 事件自动刷新
+- 每 2.5 秒主动探测服务可用性 (`checkNetworkAndReload()`)
+
+### 11.7 jobMutex 死锁检测
+
+**重要澄清：系统没有 jobMutex / Mutex，也没有死锁检测**。
+
+**唯一的锁机制**：`AsyncLock`（按 tmdbId 维度），已在 10.1 节分析。
+
+**AsyncLock 的实现** (`server/utils/asyncLock.ts`)：
+```typescript
+class AsyncLock {
+  private locks: Record<string, boolean> = {};
+
+  dispatch<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      if (this.locks[key]) {
+        // 锁已存在：等待释放后重试
+        const event = `${key}_released`;
+        this.emitter.setMaxListeners(0);
+        this.emitter.once(event, () => {
+          this.dispatch(key, fn).then(resolve).catch(reject);
+        });
+      } else {
+        // 获取锁
+        this.locks[key] = true;
+        fn()
+          .then(resolve)
+          .catch(reject)
+          .finally(() => {
+            delete this.locks[key];
+            setImmediate(() => this.emitter.emit(`${key}_released`));
+          });
+      }
+    });
+  }
+}
+```
+
+**死锁风险分析**：
+
+| 场景 | 是否可能死锁 | 原因 |
+|------|-------------|------|
+| 同一 tmdbId 递归调用 | 否 | JS 单线程，fn() 是异步但不会在同一调用栈重入 |
+| 不同 tmdbId 交叉等待 | 否 | 每个 key 独立，无交叉依赖 |
+| fn() 抛出未捕获异常 | 否 | `.catch(reject)` + `.finally(释放锁)` 保证锁一定释放 |
+| fn() 永远不 resolve/reject | **是** | 锁永远不会释放，后续同 key 请求永远等待 |
+| 事件循环阻塞 | **是** | `setImmediate` 无法执行，锁释放事件无法发送 |
+
+**没有死锁检测 / 超时机制**：
+- AsyncLock 不设置超时，不监控等待时长
+- 没有死锁日志 / 告警
+- 没有强制释放锁的能力
+- 如果 `processMovie()` 内部发生无限循环或永远 pending 的 Promise，该 tmdbId 的锁将永久持有
+
+**实际风险较低的原因**：
+- `processMovie()` 的所有异步操作都有网络超时（axios 默认 30s）
+- BaseScanner 的 `loop()` 有 `running` 标志可以中断
+- 即使锁永久持有，只影响同 tmdbId 的后续处理，不影响其他媒体
+
+### 11.8 Windows 容器下 SIGUSR1 兼容
+
+**重要澄清：系统没有注册任何信号处理器**。
+
+搜索 `server/` 下的 `process.on('SIGTERM')`、`process.on('SIGINT')`、`process.on('SIGUSR1')`：**零匹配**。
+
+**Node.js 的默认信号行为**：
+
+| 信号 | 默认行为 | SIGUSR1 特殊性 |
+|------|---------|---------------|
+| SIGTERM | 终止进程 | - |
+| SIGINT | 终止进程（Ctrl+C） | - |
+| SIGUSR1 | 启用调试器 | Windows 上不存在此信号 |
+
+**Windows 容器场景**：
+- Windows 没有 `SIGUSR1` 信号
+- Docker 的 `docker stop` 在 Windows 容器上发送的是 `SIGTERM`（通过 Job Object 模拟）
+- `node-schedule` 的定时任务不依赖任何信号
+- `BaseScanner.running` 是内存标志，进程终止后自然消失
+
+**没有优雅关闭的实现**：
+- 没有注册 `process.on('SIGTERM')` 来做优雅关闭
+- 进程被 SIGTERM 时，Node.js 默认直接退出
+- 正在进行的扫描会中断，但：
+  - 数据库写入是即时的（每条处理完就 save），不存在批量提交
+  - 下次启动后，扫描器会从头重新扫描（幂等）
+  - `library.lastScan` 可能停留在旧值，导致下次增量扫描覆盖范围偏大（10 分钟缓冲会吸收部分偏差）
+
+**Windows 容器下不需要 SIGUSR1 兼容**：
+- Seerr 不使用 SIGUSR1
+- 不做热重载 / 调试器附加
+- 唯一需要关心的是 SIGTERM 的优雅处理，但当前也没有实现
+
+---
+
+## 十二、关键文件索引
 
 | 文件路径 | 职责 |
 |----------|------|
@@ -1160,12 +1776,26 @@ Jellyfin 中 AniDB 条目常把一部动漫的多季拆成多个 Series。`proce
 | `server/subscriber/MediaRequestSubscriber.ts` | 批准后 Radarr/Sonarr 入队 + 状态回填 |
 | `server/lib/availabilitySync.ts` | 反向可用性校验防误删 |
 | `server/lib/downloadtracker.ts` | 下载队列实时追踪（每分钟） |
+| `server/lib/permissions.ts` | 权限位运算 hasPermission()、降权即时生效 |
 | `server/lib/notifications/index.ts` | Notification 枚举与管理器 |
 | `server/lib/notifications/agents/webpush.ts` | WebPush 推送实现、410/404 永久失效清理 |
 | `server/lib/notifications/agents/agent.ts` | NotificationAgent 抽象基类 |
-| `server/utils/asyncLock.ts` | 单媒体维度的并发锁 |
+| `server/middleware/auth.ts` | 认证中间件、User 实时加载 |
+| `server/utils/asyncLock.ts` | 单媒体维度的并发锁（无超时/死锁检测） |
 | `server/routes/settings/index.ts` | 扫描状态查询 / 启动 / 取消 API |
 | `server/routes/request.ts` | 请求 CRUD / retry / decline API 路由 |
+| `server/routes/user/index.ts` | 用户权限修改 API、降权触发入口 |
+| `server/index.ts` | Session store cleanupLimit、通知代理注册、无信号处理 |
 | `src/components/Settings/SettingsPlex.tsx` | Plex 设置页 + 扫描进度 UI (SWR 1s 轮询) |
 | `src/components/Settings/SettingsJobsCache/index.tsx` | 定时任务管理页 |
-| `src/components/Setup/index.tsx` | Setup 页面、server type 选择 UI |
+| `src/components/StatusChecker/index.tsx` | 重启/更新提醒弹窗、alertDismissed 恢复 |
+| `src/components/DownloadBlock/index.tsx` | 下载进度条、ETA 渲染 |
+| `src/components/Setup/index.tsx` | Setup 页面、server type 选择 UI、refreshWhenHidden 配置 |
+| `src/components/RequestModal/AdvancedRequester/index.tsx` | 高级请求组件、SWR refreshWhenHidden 配置 |
+| `src/components/ServiceWorkerSetup/index.tsx` | SW 注册 + Push 订阅验证 |
+| `src/components/PWAHeader/index.tsx` | PWA manifest、Apple splash、theme-color |
+| `src/components/Login/index.tsx` | 登录页、SWR refreshWhenHidden 配置 |
+| `src/hooks/useToasts.tsx` | Toast 通知系统、4s 自动消失、无持久化 |
+| `public/sw.js` | Service Worker：离线页面、Web Push 接收、通知按钮 |
+| `public/offline.html` | 离线兜底页面、自动重连、2.5s 探测 |
+| `docs/using-seerr/advanced/verifying-signed-artifacts.mdx` | Cosign 镜像签名校验文档（部署时，非运行时） |
