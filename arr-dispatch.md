@@ -371,6 +371,63 @@ await requestRepository.save(mediaRequest);
 
 **重试次数限制**：代码中**无重试次数限制**，用户可无限次点击重试。
 
+### 4.3.1 FAILED 重试的指数退避策略
+
+**结论：Jellyseerr 没有内置指数退避机制。**
+
+重试完全是**手动触发**的，每次点击「重试」按钮都会：
+1. 将 `status` 从 `FAILED` 重置为 `APPROVED`
+2. 更新 `modifiedBy` 和 `updatedAt`
+3. 触发 TypeORM `afterUpdate` 钩子，从头执行完整分流流程
+
+代码位于 `server/routes/request.ts:633-661`：
+```typescript
+mediaRequest.status = MediaRequestStatus.APPROVED;
+mediaRequest.modifiedBy = req.user;
+await requestRepository.save(mediaRequest);
+```
+
+**退避策略对比**：
+
+| 策略类型 | 是否实现 | 说明 |
+|---|---|---|
+| 自动指数退避 | ❌ 无 | 没有定时器或后台 job 自动重试 |
+| 重试次数限制 | ❌ 无 | 可无限次手动重试 |
+| 失败历史记录 | ❌ 无 | 不记录失败次数或上次失败时间 |
+| 手动重试 | ✅ 有 | 管理员点击重试按钮触发 |
+
+**隐含的"退避"**：由于每次重试都需要管理员手动点击，人为操作间隔起到了自然退避效果。如果未来需要自动退避，可基于 `updatedAt` 字段计算距上次失败的时间。
+
+### 4.3.2 TVDB 缺失错误的手动恢复路径
+
+当 Sonarr 分流时检测不到 TVDB ID，会执行**破坏性处理**——直接删除 media 和 request 实体 (`server/subscriber/MediaRequestSubscriber.ts:569-574`)：
+
+```typescript
+if (!tvdbId) {
+  const requestRepository = getRepository(MediaRequest);
+  await mediaRepository.remove(media);
+  await requestRepository.remove(entity);
+  throw new Error('TVDB ID not found');
+}
+```
+
+**TVDB ID 查找顺序**：
+1. `series.external_ids.tvdb_id`（TMDB 实时查询结果）
+2. `media.tvdbId`（数据库中已缓存的）
+3. 两者皆空 → 删除并报错
+
+**手动恢复路径**：
+
+由于实体已被删除，无法通过「重试」按钮恢复。必须：
+
+| 恢复方式 | 操作路径 | 前提条件 |
+|---|---|---|
+| 重新请求 | 用户在搜索结果中重新发起请求 | TMDB 已更新 tvdb_id 映射 |
+| 手动补 tvdbId | 直接修改数据库 `media.tvdbId` 字段 | 知道正确的 TVDB ID |
+| 等待扫描 | 等待 *arr 扫描器同步时自动创建 Media 实体 | Sonarr 中已存在该剧 |
+
+**相关删除 API**：`DELETE /media/:mediaId` (`server/routes/media.ts:263-283`) 也会遇到同样的 TVDB ID 问题，但它是**真正的删除**（调用 `sonarr.removeSeries(tvdbId)` 从 Sonarr 中删除剧集），若 tvdbId 缺失则直接抛错不执行删除。
+
 ### 4.4 Radarr/Sonarr API 内部容错
 
 `server/api/servarr/radarr.ts:118-249` 的 `addMovie` 方法存在分级容错：
@@ -459,6 +516,52 @@ if (entity.status === MediaRequestStatus.APPROVED) {
 ```
 即不会覆盖已处于终态（AVAILABLE/PARTIALLY_AVAILABLE）的状态，但 PROCESSING 可被多次写入。
 
+### 5.1.2 四种不一致场景的优先级
+
+按**影响程度从高到低**排序：
+
+| 优先级 | 场景 | 影响 | 恢复方式 |
+|---|---|---|---|
+| 🔴 P0 | `Media.status=PROCESSING` 但 `MediaRequest.status=FAILED` | 用户看到"处理中"但实际已失败，产生误导 | 重试或删除请求 |
+| 🟠 P1 | `externalServiceId` 已设置但 `status` 未同步 | 前端可能显示错误链接 | 下次扫描或请求时自动修正 |
+| 🟡 P2 | 普通/4K 状态长期不一致（如一个 AVAILABLE 一个 PROCESSING） | 双画质状态不一致，影响用户判断 | 各自独立收敛，无强制同步 |
+| 🟢 P3 | Media 变 AVAILABLE 但 MediaRequest 仍为 APPROVED | 短暂延迟，最终会被 MediaSubscriber 同步 | `updateRelatedMediaRequest` 异步执行 |
+
+**为什么 P0 优先级最高**：
+- 处于 PROCESSING 状态的媒体在前端会显示"处理中"
+- 用户可能误以为系统正在工作，但实际已失败且不会自动恢复
+- 需要管理员手动点击重试才能推进
+
+### 5.1.3 status 与 status4k 回看一致性
+
+**回看一致性**：即从任一画质视角看，状态迁移路径是否与单画质系统一致。
+
+**单画质迁移路径**（正常流程）：
+```
+UNKNOWN → PENDING → PROCESSING → AVAILABLE
+                       ↓
+                     FAILED → APPROVED → PROCESSING → ...
+```
+
+**双画质并行时的一致性特点**：
+
+1. **完全隔离**：`status` 和 `status4k` 是两个独立的状态机，各自拥有完整的状态枚举
+2. **互不干扰**：一套状态的变迁不会触发另一套状态的变化
+3. **各自终态**：普通版可以是 `AVAILABLE`，4K 版可以是 `DELETED`，两者共存
+
+**代码佐证** (`server/subscriber/MediaRequestSubscriber.ts:834`)：
+```typescript
+const statusKey = entity.is4k ? 'status4k' : 'status';
+// 只操作 statusKey 对应的那一套，不碰另一套
+```
+
+**回看验证方式**：
+- 对于普通画质请求，只看 `media.status` 和 `serviceId` 等字段
+- 对于 4K 请求，只看 `media.status4k` 和 `serviceId4k` 等字段
+- 各自的状态迁移都是完整且自洽的
+
+**潜在不一致点**：`media.mediaAddedAt` 只有一个字段，无法区分普通版和 4K 版的入库时间。
+
 ### 5.2 审批通过 → 父 Media 状态更新
 
 `server/subscriber/MediaRequestSubscriber.ts:820-944` 的 `updateParentStatus()` 在 afterInsert/afterUpdate 中被调用：
@@ -537,6 +640,68 @@ if (hadCompleted) {
 3. 仍有其他活动请求时 → 不修改状态
 4. `PARTIALLY_AVAILABLE` 时删除 COMPLETED 请求 → 保留 `PARTIALLY_AVAILABLE`
 
+### 5.5.2 DELETED 软删除的真正删除时机
+
+`MediaStatus.DELETED` 是**软删除标记**，而非真正的物理删除。它只表示：
+> "这个媒体曾经在 *arr 库中存在过，现在已被移除"
+
+**真正的物理删除发生在以下时机**：
+
+| 删除方式 | 触发者 | 代码位置 | 后果 |
+|---|---|---|---|
+| 请求级删除 | 用户删除自己的请求 / 管理员删除请求 | `DELETE /request/:requestId` (`server/routes/request.ts`) | 仅删除 MediaRequest，Media 状态变为 DELETED/UNKNOWN |
+| 媒体级删除 | 管理员从媒体详情页删除 | `DELETE /media/:mediaId` (`server/routes/media.ts:263-283`) | 同时删除 *arr 中的条目 + Jellyseerr 的 Media 实体 |
+| 扫描器清理 | *arr 扫描时发现条目已不存在 | `baseScanner.ts` | 只更新状态为 DELETED，不物理删除 |
+| 级联删除 | 删除用户时级联删除其请求 | `server/routes/user/index.ts:626-635` | 请求被级联删除，但 Media 状态不会更新（因为级联不触发 afterRemove） |
+
+**`DELETE /media/:mediaId` 是唯一会真正删除 *arr 条目的操作**，流程：
+```typescript
+// server/routes/media.ts:273-282
+if (isMovie) {
+  await (service as RadarrAPI).removeMovie(media.tmdbId);
+} else {
+  const tvdbId = series.external_ids.tvdb_id ?? media.tvdbId;
+  await (service as SonarrAPI).removeSeries(tvdbId);
+}
+```
+
+`removeMovie` / `removeSeries` 会调用 *arr 的 DELETE API，并带参数：
+- `deleteFiles: true` — 删除媒体文件
+- `addImportExclusion: false` — 不加入排除列表（以后还能重新添加）
+
+### 5.5.3 externalServiceId 迁移
+
+`externalServiceId` / `externalServiceId4k` 是 *arr 系统内的主键 ID。它的变更（迁移）主要有两个途径：
+
+#### 途径 1：请求时写入（首次同步）
+`server/subscriber/MediaRequestSubscriber.ts:389,731`
+```typescript
+media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] = radarrMovie.id;
+```
+这是最常见的写入时机：审批通过 → 调用 *arr API 创建条目 → 写回 ID。
+
+#### 途径 2：扫描器同步（批量校正）
+`server/lib/scanners/baseScanner.ts:180-187`
+```typescript
+if (externalServiceId !== undefined &&
+    existing[is4k ? 'externalServiceId4k' : 'externalServiceId'] !== externalServiceId) {
+  existing[is4k ? 'externalServiceId4k' : 'externalServiceId'] = externalServiceId;
+  changedExisting = true;
+}
+```
+扫描器每次运行时，用 *arr 返回的 ID 覆盖本地 ID。
+
+**迁移场景**：
+
+| 场景 | 行为 |
+|---|---|
+| 换了新的 *arr 服务器 | 扫描时检测到 `serviceId` 变化，同步更新 `externalServiceId` |
+| *arr 中条目被删除后重新添加 | ID 可能变化，扫描器会更新 |
+| 从 1080p 升级到 4K | 两套独立字段，互不影响 |
+| 手动修改 `externalServiceId` | 下次扫描会被覆盖（以 *arr 为数据源） |
+
+**以谁为准**：*arr 系统是唯一真相源（source of truth），Jellyseerr 的 `externalServiceId` 只是缓存，每次扫描都会被校正。
+
 ### 5.6 可用通知触发
 
 在 `afterUpdate` 中检测到 `entity.status === COMPLETED` 时：
@@ -554,6 +719,100 @@ if (hadCompleted) {
 ```
 MediaRequest.APPROVED → Media.PROCESSING → *arr 下载 → Media.AVAILABLE → MediaRequest.COMPLETED
 ```
+
+### 5.7.1 状态闭环的环路检测
+
+双向 Subscriber 形成了一个理论上的状态闭环，但**实际上不会发生无限循环**，因为各层都有状态守卫：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  MediaRequestSubscriber.afterUpdate                         │
+│    → 检测到 APPROVED → 更新 Media.status = PROCESSING       │
+│    → 调用 *arr API（异步）→ 写回 externalServiceId          │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+              Media.status = PROCESSING
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MediaSubscriber.afterUpdate (Media 状态变化)               │
+│    → 只有 status 变为 AVAILABLE / PARTIALLY_AVAILABLE /     │
+│      DELETED 时才触发 updateRelatedMediaRequest              │
+│    → 将关联的 APPROVED/FAILED 请求标记为 COMPLETED           │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+              MediaRequest.status = COMPLETED
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MediaRequestSubscriber.afterUpdate (再次触发)               │
+│    → sendToRadarr/Sonarr 守卫：status 不是 APPROVED，跳过    │
+│    → updateParentStatus：请求是 COMPLETED，不修改 Media       │
+│    → notifyAvailableMovie/Series：发送通知（仅一次）          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**环路抑制机制**（三层守卫）：
+
+| 守卫位置 | 检查条件 | 作用 |
+|---|---|---|
+| `sendToRadarr` / `sendToSonarr` 入口 | `entity.status === APPROVED` | COMPLETED 状态不会触发 *arr API 调用 |
+| `updateParentStatus` | 仅 APPROVED / DECLINED 状态才修改 Media | COMPLETED 状态不会回写 Media |
+| `MediaSubscriber.updateRelatedMediaRequest` | 只处理 APPROVED / FAILED 状态的请求 | COMPLETED 状态不会被重复处理 |
+
+**潜在的小循环**：
+- Media AVAILABLE → MediaRequest COMPLETED → notifyAvailable 再次读取 Media 确认 → 无写操作 → 终结
+- 这个"读取确认"步骤是安全的，因为它只有读操作没有写操作，不会触发下一轮更新
+
+**测试验证**：`server/routes/request.test.ts` 中的审批测试没有出现无限循环或堆栈溢出，证明环路抑制有效。
+
+### 5.8 1080p 与 4K 切换
+
+**结论：Jellyseerr 没有"切换"概念，1080p 和 4K 是完全独立的两套体系。**
+
+#### 双轨并行设计
+
+| 维度 | 1080p（普通） | 4K |
+|---|---|---|
+| 状态字段 | `media.status` | `media.status4k` |
+| 外部服务 ID | `media.externalServiceId` | `media.externalServiceId4k` |
+| 服务跳转 slug | `media.externalServiceSlug` | `media.externalServiceSlug4k` |
+| 服务器配置 ID | `media.serviceId` | `media.serviceId4k` |
+| Plex/Jellyfin ID | `media.ratingKey` | `media.ratingKey4k` |
+| 请求字段 | `request.is4k = false` | `request.is4k = true` |
+| 默认服务器选择 | `isDefault && !is4k` | `isDefault && is4k` |
+
+#### "切换"的本质
+
+用户不能直接把一个 1080p 请求"切换"成 4K 请求。所谓的"切换"实际上是：
+
+1. **创建新请求**：用户为同一媒体提交一个 4K 请求（`is4k = true`）
+2. **各自独立**：1080p 请求和 4K 请求并行存在，各自有独立的状态机
+3. **分别同步**：两套状态分别与各自的 *arr 服务器同步
+4. **删除旧请求**：用户可以删除 1080p 请求（只删除请求，不删除媒体文件）
+
+#### 状态交互
+
+1080p 和 4K 之间的**唯一交互**发生在 `handleRemoveParentUpdate` 删除请求时的状态判断中 (`server/subscriber/MediaRequestSubscriber.ts:955-999`)：
+
+- 删除 1080p 请求 → 只检查 `hasActive`（非 4K 的活动请求） → 只修改 `media.status`
+- 删除 4K 请求 → 只检查 `hasActive4k`（4K 的活动请求） → 只修改 `media.status4k`
+
+两套状态完全独立，互不影响。
+
+#### 查询时的关联
+
+在请求列表 API 中，通过 SQL 条件将两套状态关联起来 (`server/routes/request.ts:134-138`)：
+
+```sql
+((request.is4k = false AND media.status IN (:...mediaStatus))
+  OR
+ (request.is4k = true AND media.status4k IN (:...mediaStatus)))
+```
+
+即：查询请求时，用 `request.is4k` 决定匹配 `media.status` 还是 `media.status4k`。
 
 ---
 
