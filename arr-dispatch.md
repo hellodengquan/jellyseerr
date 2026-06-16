@@ -890,6 +890,223 @@ DECLINED → APPROVED  ✅ 重新审批触发
 ```
 只要任一画质的 ratingKey 匹配 Tautulli 记录，即认为用户看过该媒体。
 
+### 5.5.10 ratingKey 双份在 Emby 与 Kodi 的兼容
+
+Jellyseerr 支持三种媒体服务器：PLEX / JELLYFIN / EMBY（`server/constants/server.ts:1-6`）：
+```typescript
+export enum MediaServerType {
+  PLEX = 1,
+  JELLYFIN,
+  EMBY,
+  NOT_CONFIGURED,
+}
+```
+
+**Emby 兼容性**：
+
+代码中 Emby 与 Jellyfin **共用同一套实现**（统一叫 jellyfin，但分支处理 Emby）：
+
+| 维度 | Emby | Jellyfin |
+|---|---|---|
+| 用户类型 | `UserType.EMBY` | `UserType.JELLYFIN` |
+| Media ID 字段 | `jellyfinMediaId` / `jellyfinMediaId4k`（**共用字段**） | `jellyfinMediaId` / `jellyfinMediaId4k` |
+| 扫描器 | `jellyfinFullScanner` / `jellyfinRecentScanner`（**共用扫描器**） | 同左 |
+| 登录入口 | `Jellyfin/Emby login is enabled` 判断 | 同左 |
+| 媒体详情 URL | 路径 `/item`（Emby） | 路径 `/details`（Jellyfin） |
+
+媒体详情 URL 的差异 (`server/entity/Media.ts:252-268`)：
+```typescript
+const pageName =
+  getSettings().main.mediaServerType == MediaServerType.EMBY
+    ? 'item'
+    : 'details';
+```
+
+**Kodi 兼容性**：
+
+代码中**没有任何 Kodi 相关实现**。Kodi 既不在 `MediaServerType` 枚举中，也没有对应的扫描器、API 封装或 ID 字段。
+
+如果要支持 Kodi，需要新增：
+1. `MediaServerType.KODI` 枚举值
+2. Kodi API 封装（类似 `server/api/jellyfin.ts`）
+3. Kodi 扫描器（类似 `server/lib/scanners/jellyfin/`）
+4. 新的 Media ID 字段（如 `kodiMediaId` / `kodiMediaId4k`）或复用现有字段
+5. 用户认证流程（Plex/Jellyfin/Emby 各自有登录体系）
+
+### 5.5.11 观看历史任一命中下的去重
+
+观看历史匹配逻辑 (`server/routes/user/index.ts:863-910`) 使用 `OR` 条件匹配两种画质的 ratingKey，这会产生**重复统计问题**：
+
+**SQL 查询结构**：
+```typescript
+where: [
+  { ratingKey: In(...) },      // 1080p 命中
+  { ratingKey4k: In(...) },    // 4K 命中
+  // ... TV 剧集的两组
+]
+// TypeORM 数组 where 语义是 OR
+```
+
+**去重方式**：代码中使用 `findIndex` 在内存中去重：
+```typescript
+const matchedIndex = findIndex(
+  watchHistory,
+  (record) =>
+    (!!media.ratingKey && parseInt(media.ratingKey) === record.rating_key) ||
+    (!!media.ratingKey4k && parseInt(media.ratingKey4k) === record.rating_key)
+);
+```
+
+`findIndex` 返回**第一个命中的索引**，保证同一条 watchHistory 记录不会被匹配到多个 media。但如果同一用户先看了 1080p 又看了 4K，Tautulli 中会有两条不同的 `rating_key` 记录，分别匹配到 media 的两个 ratingKey，此时这条 media 在最终 `resData` 中仍然只出现一次（因为是按 media id 聚合统计）。
+
+**实际去重效果**：
+- 同一条观看记录 → 只匹配一次（findIndex 取第一个）
+- 同一媒体的两次观看（1080p + 4K）→ 同一个 media 命中两次，但按 media id 聚合后只算一条
+- 媒体列表返回是按 media 去重的，playCount 统计的是观看次数而非画质版本数
+
+### 5.5.12 Tautulli 在 Jellyfin 的替代方案
+
+**Tautulli 是 Plex 专属的统计工具**，在 Jellyfin/Emby 下无对应集成：
+
+| 功能 | Plex + Tautulli | Jellyfin/Emby |
+|---|---|---|
+| 观看数据 API | `server/routes/media/:id/watch_data` 调用 Tautulli API | ❌ 无对应实现，API 返回空（tautulli 配置为空） |
+| 用户观看历史匹配 | `server/routes/user/:id/watchlist` 走 Tautulli 历史 | ❌ 无对应实现 |
+| 媒体详情页 Tautulli URL | `media.tautulliUrl` / `tautulliUrl4k` 生成 | ❌ 不生成（mediaServerType 非 PLEX 分支不执行） |
+
+代码中唯一使用 Tautulli 的位置：
+1. `server/entity/Media.ts:234-250` — 为 Plex 生成 `tautulliUrl` / `tautulliUrl4k`
+2. `server/routes/media.ts:300-356` — `/watch_data` 接口从 Tautulli 取观看统计
+3. `server/routes/user/index.ts:833-910` — `/watchlist` 接口从 Tautulli 取用户观看历史
+
+**Jellyfin 的替代方案现状**：Jellyfin 有自己的播放统计 API（`/PlaybackInfo`、`/Items/{Id}/PlaybackInfo`、`/Sessions`），但 Jellyseerr **没有集成**。如果要实现，需要新增 JellyfinPlaybackStats 类（类似 TautulliAPI），并在上述三个代码位置增加 Jellyfin 分支。
+
+### 5.5.13 Season 无 4K 的 episode 级处理
+
+`Season` 实体的 `status` 和 `status4k` 是**各自独立的状态机**（与 Media 类似），但 Season 实体**没有 episode 级别的字段**。
+
+**Season 状态更新逻辑** (`server/lib/scanners/baseScanner.ts:344-401`)：
+
+```
+Season.status（普通画质）判断依据：season.episodes（已下载的普通剧集数）
+  ├─ episodes === totalEpisodes 且 episodes > 0 → AVAILABLE
+  ├─ 已 AVAILABLE → 保持 AVAILABLE（强制不降级）
+  ├─ episodes > 0 → PARTIALLY_AVAILABLE
+  ├─ is4kOverride=false && processing && 非 DELETED → PROCESSING
+  ├─ is4kOverride=false && !processing && episodes=0 && 之前=PROCESSING → UNKNOWN
+  └─ 其他 → 保持原状态
+
+Season.status4k（4K画质）判断依据：season.episodes4k（已下载的4K剧集数）
+  └─ 逻辑同上，只是增加了 enable4kShow 开关判断
+```
+
+关键点：
+- `season.episodes` 是**聚合值**（某季已下载的普通画质总集数），不是逐集记录
+- `season.episodes4k` 同理，聚合的是 4K 画质集数
+- `is4kOverride` 用于区分这一次扫描是来自普通服务器还是 4K 服务器（当两个服务器独立时，各自只负责自己那份的状态更新）
+- Season 没有 episode 级子表，无法精确表达「第 3 集只有 4K 没有 1080p」这种情况
+- `availabilitySync` 有更细粒度的 episode 级判断（`jellyfinEpisodeExistsCache`），但只更新 Season 级聚合状态
+
+### 5.5.14 PROCESSING 残留的自动清理
+
+**没有专门的 PROCESSING 自动清理 Job**。PROCESSING 状态的清理/更正依赖以下三条路径：
+
+| 清理路径 | 触发时机 | 行为 |
+|---|---|---|
+| 扫描器 | 定时扫描（默认每天 Radarr/Sonarr 一次，Plex/Jellyfin 最近 5 分钟/每天全量） | 扫描 `processMovie` / `processShow` 时，根据 *arr 条目真实状态重算 status |
+| Availability Sync | 每天凌晨 5 点（默认 cron：`0 0 5 * * *`） | `availabilitySync.run()` 逐个检查每个 PROCESSING 状态的 media 在 *arr 中是否真的有活动下载，否则改回 UNKNOWN/DELETED |
+| Download Sync | 每分钟（默认 cron：`0 * * * * *`） | `downloadTracker.updateDownloads()` 追踪活动下载，没有的下载的 PROCESSING 媒体等待被 Availability Sync 清理 |
+| 手动重试 | 用户点击重试 | 重新走完整分流流程，若成功则进 COMPLETED，若失败则进 FAILED |
+
+**扫描器重算 PROCESSING 的逻辑** (`server/lib/scanners/baseScanner.ts:123-134`)：
+```typescript
+existing[statusField] =
+  !processing && hasFile
+    ? MediaStatus.AVAILABLE           // ✅ 有文件 → AVAILABLE
+    : !processing && !hasFile && previousStatus === MediaStatus.PROCESSING
+      ? MediaStatus.UNKNOWN             // ⚠️ 无文件+之前PROCESSING → UNKNOWN（即清理残留）
+      : processing
+        ? previousStatus === MediaStatus.DELETED
+          ? MediaStatus.DELETED
+          : MediaStatus.PROCESSING
+        : previousStatus;
+```
+即：当 *arr 显示 `processing=false`（无活动下载）且 `hasFile=false`（无文件），如果之前是 PROCESSING，则降级为 UNKNOWN。
+
+### 5.5.15 扫描器兜底周期
+
+所有扫描器和同步 Job 的默认 cron 表达式（`server/lib/settings/index.ts:569-603`）：
+
+| Job ID | 默认 cron | 实际周期 | 作用 |
+|---|---|---|---|
+| `plex-recently-added-scan` | `0 */5 * * * *` | 每 5 分钟 | Plex 最近新增扫描（快速兜底） |
+| `jellyfin-recently-added-scan` | `0 */5 * * * *` | 每 5 分钟 | Jellyfin/Emby 最近新增扫描 |
+| `download-sync` | `0 * * * * *` | 每 1 分钟 | 下载进度同步（最频繁） |
+| `plex-watchlist-sync` | `0 */3 * * * *` | 每 3 分钟 | Plex 监视列表同步 |
+| `plex-full-scan` | `0 0 3 * * *` | 每天凌晨 3 点 | Plex 全库扫描（慢速兜底） |
+| `radarr-scan` | `0 0 4 * * *` | 每天凌晨 4 点 | Radarr 全量扫描 |
+| `sonarr-scan` | `0 30 4 * * *` | 每天凌晨 4:30 | Sonarr 全量扫描 |
+| `availability-sync` | `0 0 5 * * *` | 每天凌晨 5 点 | 可用性同步（PROCESSING 残留终极兜底） |
+| `plex-refresh-token` | `0 0 5 * * *` | 每天凌晨 5 点 | Plex Token 刷新 |
+| `jellyfin-full-scan` | —（同 plex-full-scan） | 每天一次 | Jellyfin/Emby 全库扫描 |
+| `download-sync-reset` | `0 0 1 * * *` | 每天凌晨 1 点 | 下载追踪器重置 |
+| `image-cache-cleanup` | 每天 | 每天一次 | 图片缓存清理 |
+| `process-blocklisted-tags` | 每天 | 每天一次 | 黑名单标签处理 |
+
+**兜底时间线**（最坏情况下 PROCESSING 残留被清理的等待时间）：
+```
+01:00 下载追踪器重置
+03:00 Plex 全库扫描
+04:00 Radarr 全库扫描    ← 电影 PROCESSING 可能在这里被清理
+04:30 Sonarr 全库扫描    ← 剧集 PROCESSING 可能在这里被清理
+05:00 Availability Sync  ← 终极兜底：所有 PROCESSING 残留在这里被核实并清理
+```
+
+从凌晨 3 点到 5 点间有多层扫描重复执行，确保 PROCESSING 残留最多在 **24 小时 + 2 小时**内（即最坏等到下一天的 05:00）被清理。
+
+### 5.5.16 状态转换矩阵告警
+
+结合三层守卫的漏处理 case 和扫描器兜底周期，形成以下**需要告警的异常状态组合**：
+
+| 异常组合 | 持续时间 | 告警级别 | 建议监控 SQL |
+|---|---|---|---|
+| `MediaRequest.status=FAILED` + `Media.status=PROCESSING` | > 6 小时（用户未及时重试） | 🟡 中 | 关联查询 FAILED 请求且对应 Media 仍为 PROCESSING |
+| `MediaRequest.status=APPROVED` 且 `updatedAt` 超过 1 小时未变化 | > 1 小时 | 🟡 中 | 卡在 APPROVED（守卫静默退出或 fire-and-forget 仍在飞行） |
+| `Media.status=PROCESSING` 且无任何 `status=APPROVED/PROCESSING` 的子请求 | > 6 小时 | 🔴 高 | 孤儿 PROCESSING（所有请求被删但 afterRemove 未触发/漏处理） |
+| `MediaRequest.status=COMPLETED` + `Media.status=PROCESSING` | > 12 小时（未等到扫描器） | 🟠 中高 | 关联查询 COMPLETED 请求但对应 Media 仍为 PROCESSING |
+| `Media.status=PROCESSING` 且 `updatedAt` 超过 24 小时 | > 24 小时 | 🔴 高 | 扫描器兜底未生效（扫描器未运行或逻辑漏判） |
+| `Media.status=AVAILABLE` 但 `externalServiceId=NULL`（普通）或 `status4k=AVAILABLE` 但 `externalServiceId4k=NULL`（4K） | > 1 天 | 🟡 中 | AVAILABLE 但没有 *arr 关联，数据不完整 |
+
+### 5.5.17 COMPLETED 不修正的回看延迟
+
+当 `MediaRequest.status = COMPLETED` 时，三层守卫都不主动修正 `Media.status`：
+- **L1** `sendToRadarr/Sonarr` 只处理 APPROVED
+- **L2** `updateParentStatus` 只处理 APPROVED / DECLINED
+- **L3** `MediaSubscriber.updateRelatedMediaRequest` 只处理 APPROVED / FAILED
+
+**回看延迟窗口**：
+```
+事件时序：
+00:00  *arr 下载完成，文件到位
+00:01  downloadTracker（每分钟）更新下载状态（无直接状态写回）
+03:00  Plex 全库扫描 → 如果 Plex 已识别，标 AVAILABLE（此时 COMPLETED 无动作）
+04:00  Radarr 扫描 → processMovie → processing=false, hasFile=true → Media.status=AVAILABLE ✅
+05:00  Availability Sync → 双重验证确认 AVAILABLE
+
+→ 最快修正时机：04:00 Radarr/Sonarr 扫描（已处理 4 小时）
+→ 最晚修正时机：05:00 Availability Sync（5 小时）
+→ 极端情况（扫描器未运行）：永远不修正，一直 PROCESSING
+```
+
+**用户视角的不一致体验**：
+- 审批通过 → 请求显示「已完成」✓
+- 媒体详情页显示「处理中」⏳（因为 Media.status 还是 PROCESSING）
+- 实际文件已到位，Plex 里可以播放 ✓
+- 用户看到「处理中」但能播放 → 产生困惑
+- 这种不一致最长持续到下一次扫描（凌晨 4-5 点）
+
+**为什么不主动在 COMPLETED 时同步 Media 状态**：主要是避免反向写入冲突——COMPLETED 的来源有两个（MediaSubscriber 反向同步 + 审批通过时 media.status 已为 AVAILABLE 的快捷路径），如果再在 COMPLETED 时写 Media，可能覆盖扫描器刚写的真实状态。最终一致性靠扫描器保证。
+
 ### 5.6 可用通知触发
 
 在 `afterUpdate` 中检测到 `entity.status === COMPLETED` 时：
