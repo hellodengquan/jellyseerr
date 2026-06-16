@@ -428,6 +428,57 @@ if (!tvdbId) {
 
 **相关删除 API**：`DELETE /media/:mediaId` (`server/routes/media.ts:263-283`) 也会遇到同样的 TVDB ID 问题，但它是**真正的删除**（调用 `sonarr.removeSeries(tvdbId)` 从 Sonarr 中删除剧集），若 tvdbId 缺失则直接抛错不执行删除。
 
+### 4.3.3 DELETE 物理删除的异步清理超时
+
+`DELETE /media/:mediaId` 是同步 await *arr API 的 DELETE 调用，但 *arr 内部的文件清理是异步的。
+
+**调用链**：
+```
+DELETE /media/:mediaId
+  → radarr.removeMovie(tmdbId) / sonarr.removeSeries(tvdbId)
+    → this.axios.delete(`/movie/${id}`, { params: { deleteFiles: true, addImportExclusion: false } })
+```
+
+代码位于 `server/api/servarr/radarr.ts:270-285` 和 `server/api/servarr/sonarr.ts:413-428`。
+
+**超时配置**：
+
+| 层级 | 超时值 | 配置位置 |
+|---|---|---|
+| HTTP 代理 keepAliveTimeout | 5000ms | `server/utils/customProxyAgent.ts:18,74` |
+| HTTP 代理 socket timeout | 5000ms | `server/utils/customProxyAgent.ts:86` |
+| Plex API 调用超时 | 5000ms | `server/routes/settings/index.ts:203` |
+| axios 默认超时 | 未显式设置（Node.js 默认无超时） | — |
+
+**风险**：
+1. *arr DELETE API 本身是同步返回的，但它触发的磁盘文件删除是 *arr 内部的异步任务，Jellyseerr **不等待文件删除完成**
+2. HTTP 层面仅有 5 秒超时，若 *arr 无响应，`await` 会在 5 秒后抛错，但此时 *arr 可能已接收请求，文件删除仍在进行
+3. 删除 API 出错时，`server/routes/media.ts:286-292` 只打日志并返回 404，**不做任何回滚**，可能出现 "*arr 中已删但 Jellyseerr 还显示" 或 "Jellyseerr 认为删了但 *arr 中还在"
+
+### 4.3.4 状态守卫下 FAILED 重试退出
+
+重试将 `FAILED` 重置为 `APPROVED` 后，经过三层守卫可能会**静默退出**而不推进：
+
+```
+FAILED →(retry)→ APPROVED
+                    │
+                    ├─► 守卫 1: entity.type 是否正确？
+                    │     不是 movie/tv → 静默 return
+                    │
+                    ├─► 守卫 2: 是否能找到 *arr 服务器？
+                    │     isDefault 不匹配 / serverId 不存在 → 静默 return
+                    │
+                    └─► 守卫 3: Media 实体是否还存在？
+                          已被 TVDB 缺失清理 → 静默 return
+```
+
+**静默退出的共同特征**：
+- 不修改 `entity.status`（保持 APPROVED）
+- 只打 warn/info 日志
+- 不发送通知
+
+**结果**：用户点击重试后，请求会**卡在 APPROVED 状态但没有任何实际动作**，需要查看日志才能发现原因。这与「卡在 APPROVED 但类型错误」是同一种静默失败模式。
+
 ### 4.4 Radarr/Sonarr API 内部容错
 
 `server/api/servarr/radarr.ts:118-249` 的 `addMovie` 方法存在分级容错：
@@ -683,24 +734,161 @@ media[entity.is4k ? 'externalServiceId4k' : 'externalServiceId'] = radarrMovie.i
 #### 途径 2：扫描器同步（批量校正）
 `server/lib/scanners/baseScanner.ts:180-187`
 ```typescript
-if (externalServiceId !== undefined &&
-    existing[is4k ? 'externalServiceId4k' : 'externalServiceId'] !== externalServiceId) {
+if (
+  externalServiceId !== undefined &&
+  existing[is4k ? 'externalServiceId4k' : 'externalServiceId'] !== externalServiceId
+) {
   existing[is4k ? 'externalServiceId4k' : 'externalServiceId'] = externalServiceId;
   changedExisting = true;
 }
 ```
 扫描器每次运行时，用 *arr 返回的 ID 覆盖本地 ID。
 
-**迁移场景**：
+#### 5.5.4 externalServiceId 双写入冲突
 
-| 场景 | 行为 |
-|---|---|
-| 换了新的 *arr 服务器 | 扫描时检测到 `serviceId` 变化，同步更新 `externalServiceId` |
-| *arr 中条目被删除后重新添加 | ID 可能变化，扫描器会更新 |
-| 从 1080p 升级到 4K | 两套独立字段，互不影响 |
-| 手动修改 `externalServiceId` | 下次扫描会被覆盖（以 *arr 为数据源） |
+1080p 和 4K 可能**使用不同的 *arr 服务器，因此理论上 `externalServiceId` 和 `externalServiceId4k` 可能**可能相同（同一个 *arr 实例中的不同条目）或不同（两个独立服务器）。
 
-**以谁为准**：*arr 系统是唯一真相源（source of truth），Jellyseerr 的 `externalServiceId` 只是缓存，每次扫描都会被校正。
+**AsyncLock 仅扫描器内部用 tmdbId 为 key 串行化处理 (`server/lib/scanners/baseScanner.ts:113`)：
+
+```typescript
+await this.asyncLock.dispatch(tmdbId, async () => {
+  // getExisting → 条件判断 → save
+});
+```
+
+AsyncLock 实现位于 `server/utils/asyncLock.ts`，确保同一个 tmdbId 的代码不会并发执行。
+
+**冲突场景**：
+
+| 场景 | 是否有冲突 | 说明 |
+|---|---|---|
+| 同时审批普通和 4K 请求 | ✅ 无冲突 | 两者写不同的字段 (`externalServiceId` vs `externalServiceId4k`)，互不干扰 |
+| 扫描器同时扫描普通和 4K | ✅ 无冲突 | AsyncLock 按 tmdbId 串行化 |
+| 审批请求和扫描器同时写同一画质 | ✅ 无冲突 | AsyncLock 按 tmdbId 串行化 |
+| 审批请求和扫描器同时写不同画质 | ⚠️ 理论冲突 | 实际不冲突：字段独立 |
+| 两个审批请求同时写同一画质的同一字段 | ❌ 存在竞态 | 罕见场景：一个可能覆盖另一个，但值相同，最终一致 |
+
+**真实风险**：AsyncLock 仅扫描器内部使用，**MediaRequestSubscriber 分流时不使用 AsyncLock**。因此当两个管理员在毫秒级同时审批同一张电影的两个普通画质请求时，两个 `radarr.addMovie()` 是 fire-and-forget，它们的 `.then()` 回调可能同时写 `media.externalServiceId`。但由于 radarr.addMovie 本身是幂等的（查后更），两个请求拿到的是同一个 id，最终值一致，不构成实质冲突。
+
+### 5.5.5 1080p 与 4K 同源条目下载冲突
+
+1080p 和 4K 使用**独立的 *arr 服务器实例**（通过 `isDefault + is4k 选择），因此在 Jellyseerr 中互不干扰。但在 *arr 和媒体服务器层面可能冲突：
+
+**Jellyseerr 内部完全隔离**：
+- 两套独立字段：status/status4k、externalServiceId/externalServiceId4k、ratingKey/ratingKey4k
+- 独立服务器配置：`is4k=true 走独立的 `isDefault && is4k` 的服务器
+- AsyncLock 同一 tmdbId 串行化
+
+**外部系统可能的潜在冲突**：
+
+| 系统 | 冲突点 | Jellyseerr 防护 |
+|---|---|---|
+| Radarr/Sonarr | 1080p 和 4K 条目使用相同 tmdbId → *arr 是否认为是不同的条目 | 由 *arr 内部处理，Jellyseerr 不干预 |
+| Plex/Jellyfin | 同一媒体的 1080p 和 4K 可能是两个独立的库条目 | 各自有独立的 ratingKey |
+
+**配置约束**：Jellyseerr 的 `mediaAddedAt 只有一个字段，区分 1080p 和 4K 共用同一个 mediaAddedAt。
+
+### 5.5.6 扫描器同步校正的窗口期
+
+扫描器校正 `processMovie()` / `processShow()` 是 Jellyseerr 的**最终一致性保障机制**，但存在明显的校正窗口期。
+
+**扫描器的执行时机**：
+- Plex 扫描：定时任务，BUNDLE_SIZE = 20, UPDATE_RATE = 4000ms (`server/lib/scanners/baseScanner.ts:12-13`)
+- Radarr/Sonarr 扫描：同样定时任务
+- 手动点击「立即扫描」按钮
+
+**校正窗口期**（从状态不一致的持续时间）：
+
+| 不一致场景 | 持续时间 | 校正时机 |
+|---|---|---|
+| 请求审批通过 → 状态 PROCESSING → externalServiceId 已写回但 status 未变 | 毫秒级（fire-and-forget 回调内的两个字段分别保存） | .then() 回调 |
+| 请求 fire-and-forget API 失败 → PROCESSING + FAILED | 直到下次扫描或手动重试 | 扫描器检测到 *arr 条目不存在或有文件 |
+| *arr 下载完成 → 文件到位 | 到下次扫描运行时（分钟～小时级，取决于扫描间隔） | 扫描器运行时 |
+| 删除用户级联删除请求 → 父 Media 状态停在 PROCESSING | 永远不会自动修复（见 5.5.7） | 需要手动删除 Media |
+
+**扫描器状态机校正逻辑 (`server/lib/scanners/baseScanner.ts:119-134`：
+```typescript
+existing[statusField] =
+  !processing && hasFile
+    ? MediaStatus.AVAILABLE           // 有文件 → AVAILABLE
+    : !processing && !hasFile && previousStatus === MediaStatus.PROCESSING
+      ? MediaStatus.UNKNOWN             // 无文件且之前在处理中 → UNKNOWN
+      : processing
+        ? previousStatus === MediaStatus.DELETED
+          ? MediaStatus.DELETED       // 处理中且之前被删 → 保持 DELETED
+          : MediaStatus.PROCESSING    // 处理中 → PROCESSING
+        : previousStatus;                // 其他情况保持原状态
+```
+
+关键：已 AVAILABLE 一旦设置后不再修改（守卫 `existing[status] !== AVAILABLE`），即扫描器不会把 AVAILABLE 降级。
+
+### 5.5.8 三层守卫的异常 case 漏处理
+
+闭环抑制依赖三层守卫的状态判断，但存在若干漏处理的边缘 case：
+
+**三层守卫回顾**：
+
+| 守卫层 | 位置 | 检查条件 |
+|---|---|---|
+| L1 | `sendToRadarr/Sonarr` 入口 | `status === APPROVED` + `type === MOVIE/TV` |
+| L2 | `updateParentStatus` | `status === APPROVED \|\| DECLINED` 时才修改 Media |
+| L3 | `MediaSubscriber.updateRelatedMediaRequest` | 只处理 `APPROVED / FAILED` 状态的请求 |
+
+**已知漏处理 case**：
+
+| 异常场景 | 经过守卫结果 | 后果 |
+|---|---|---|
+| `MediaRequest.status = DECLINED` 但 `Media.status = PROCESSING` | L1 不进；L2 对 MOVIE 重置 UNKNOWN，TV 需判断其他 PENDING；L3 不处理 | TV 可能残留 PROCESSING（若同画质无其他 PENDING） |
+| `MediaRequest.status = COMPLETED` 但 `Media.status = PROCESSING` | L1 不进；L2 不处理 COMPLETED；L3 不处理 COMPLETED | 停留在 PROCESSING，直到扫描器校正 |
+| `MediaRequest.status = PENDING` 但 `Media.status = PROCESSING`（审批流程回退） | L1 不进；L2 不处理 PENDING；L3 不处理 PENDING | PROCESSING 残留 |
+| 批量删除请求时 `handleRemoveParentUpdate` 判断 `allRequests.some(req => req.status === COMPLETED)` | 可能误判曾有 COMPLETED 而写 DELETED | 审计语义失真（实际删除的请求未 COMPLETED 过） |
+| 审批通过后，用户立即删除请求（PROCESSING 时删除） | `afterRemove` 触发 → 若无其他活动请求，判断是否有 COMPLETED 过 → 写 UNKNOWN/DELETED | 一般正确 |
+
+**状态转换矩阵守卫缺口**：
+
+```
+PENDING  → APPROVED  ✅ L1 L2 都处理
+APPROVED → COMPLETED ✅ L2(L3反向同步) 都处理
+APPROVED → FAILED    ✅ L1 失败时标记 FAILED
+FAILED   → APPROVED  ✅ 重试触发
+APPROVED → DECLINED  ⚠️ L2 只对 MOVIE 重置 UNKNOWN，TV 需判断其他请求
+DECLINED → APPROVED  ✅ 重新审批触发
+任何     → COMPLETED ⚠️ L2 L3 都不主动修正 Media 状态，靠扫描器
+任何     → 被删除    ✅ afterRemove 处理
+```
+
+### 5.5.9 ratingKey 双份在 Plex 与 Jellyfin 的差异
+
+`ratingKey` 和 `jellyfinMediaId` 是两套独立的媒体服务器 ID 字段，各有 1080p / 4K 双份：
+
+```typescript
+// Media 实体字段（server/migration/sqlite 建表语句）
+"ratingKey" varchar, "ratingKey4k" varchar,
+"jellyfinMediaId" varchar, "jellyfinMediaId4k" varchar
+```
+
+**差异对比**：
+
+| 维度 | Plex (ratingKey) | Jellyfin (jellyfinMediaId) |
+|---|---|---|
+| ID 格式 | 数字字符串（如 `"12345"`） | GUID 字符串（如 `"a1b2c3d4..."`） |
+| 扫描器写入 | `server/lib/scanners/plex/index.ts:237,253` | `server/lib/scanners/jellyfin/`（对应 jellyfin scanner） |
+| Season 级写入 | 在 `processShow` 内按季写入：有剧集则更新 `media.ratingKey` (`baseScanner.ts:310-321`) | 同左，`jellyfinMediaId` 同理 (`baseScanner.ts:323-338`) |
+| Tautulli 查询 | 用 ratingKey 查询观看统计 (`server/routes/media.ts:351-356`) | — |
+| 用户观看历史匹配 | 用 ratingKey4k 同时匹配两种画质的观看记录 (`server/routes/user/index.ts:863-910`) | — |
+| 1080p / 4K 隔离 | 完全独立：`ratingKey` vs `ratingKey4k` | 完全独立：`jellyfinMediaId` vs `jellyfinMediaId4k` |
+| 季级双份字段 | 无（Season 实体没有 ratingKey4k） | 无（Season 实体也没有 jellyfinMediaId4k） |
+
+**Season 级别注意事项**：
+`Season` 实体只有 `ratingKey` 和 `jellyfinMediaId`（单份），没有 4K 版本。在 `baseScanner.ts:310-338` 的 `processShow` 中，判断是根据 `season.episodes > 0`（普通）或 `season.episodes4k > 0`（4K）来更新 `media.ratingKey` / `media.ratingKey4k` 的，即 ratingKey 的双份是**媒体级**而非季级。
+
+**观看历史查询**（`server/routes/user/index.ts:863-910`）：
+```typescript
+// 同时查询 ratingKey 和 ratingKey4k，任一命中就算看过
+(!!media.ratingKey && parseInt(media.ratingKey) === record.rating_key) ||
+(!!media.ratingKey4k && parseInt(media.ratingKey4k) === record.rating_key)
+```
+只要任一画质的 ratingKey 匹配 Tautulli 记录，即认为用户看过该媒体。
 
 ### 5.6 可用通知触发
 
