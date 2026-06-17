@@ -207,6 +207,74 @@ if (requestCount < maxRPS) {
 - `getRolling()` 方法的后台刷新策略分散请求峰值
 - 扫描器的 `updateRate` 间隔配置避免突发流量
 
+#### 3.2.2 Rate-Limit 多节点 Redis 同步改造方案
+
+**现状分析**:
+- TypeORM 的 peerDependencies 中声明了 `ioredis ^5.0.4` 和 `redis ^3.1.1`，但 Jellyseerr 核心代码**未实际使用 Redis**
+- `node-cache`（`server/lib/cache.ts`）和 `axios-rate-limit` 均为纯内存实现
+
+**Redis 分布式令牌桶改造架构**:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Node A      │     │  Node B      │     │  Node N      │
+│ (axios-     │     │ (axios-     │     │ (axios-     │
+│  rate-      │     │  rate-      │     │  rate-      │
+│  limit)     │     │  limit)     │     │  limit)     │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       └────────────────────┼────────────────────┘
+                            ▼
+                    ┌───────────────┐
+                    │    Redis      │
+                    │  ┌─────────┐  │
+                    │  │令牌桶键 │  │
+                    │  │ - radarr:│  │
+                    │  │  tokens  │  │
+                    │  │ - sonarr:│  │
+                    │  │  tokens  │  │
+                    │  │ - tmdb:  │  │
+                    │  │  tokens  │  │
+                    │  └─────────┘  │
+                    └───────────────┘
+```
+
+**Redis Lua 脚本实现原子令牌桶**:
+```typescript
+// 建议的分布式限流脚本（需改造 externalapi.ts）
+const acquireTokenScript = `
+  local key = KEYS[1]
+  local capacity = tonumber(ARGV[1])
+  local rate = tonumber(ARGV[2])
+  local now = tonumber(ARGV[3])
+
+  local state = redis.call('HMGET', key, 'tokens', 'timestamp')
+  local tokens = tonumber(state[1]) or capacity
+  local timestamp = tonumber(state[2]) or now
+
+  local elapsed = now - timestamp
+  local refilled = math.floor(elapsed * rate / 1000)
+  tokens = math.min(capacity, tokens + refilled)
+  timestamp = now
+
+  if tokens > 0 then
+    tokens = tokens - 1
+    redis.call('HMSET', key, 'tokens', tokens, 'timestamp', timestamp)
+    redis.call('PEXPIRE', key, 60000)  -- 1 分钟自动过期
+    return 1
+  end
+  return 0
+`;
+
+// 键命名空间：rate_limit:tmdb、rate_limit:radarr:server1
+// 每个 API Key 独立限流，避免互相影响
+```
+
+**多节点同步策略**:
+1. **读多写少场景**: 本地缓存 50ms，每 50ms 批量同步 Redis（减少网络开销）
+2. **写入失败降级**: Redis 不可用时自动 fallback 到内存限流，日志标记 `fallback=memory`
+3. **预热加载**: 节点启动时从 Redis 加载当前令牌数，避免冷启动过载
+
 ---
 
 ### 3.3 AsyncLock 死锁检测机制
@@ -286,6 +354,114 @@ asyncLock.dispatch(123, async () => {
 
 // ✅ 正确：避免嵌套，或使用不同的锁粒度
 ```
+
+#### 3.3.2 AsyncLock 跨进程死锁识别
+
+**现状分析**:
+当前 `AsyncLock` 基于进程内 `EventEmitter`，多实例部署时：
+- 实例 A 持有锁 key=123
+- 实例 B 无法感知，也会尝试获取锁
+- 导致两个实例同时操作同一 tmdbId，触发 SQLite `UNIQUE constraint failed` 错误
+
+**Redis Redlock 分布式锁 + 死锁识别改造方案**:
+
+```typescript
+// 建议的跨进程锁识别（需改造 asyncLock.ts）
+class DistributedAsyncLock {
+  private processLocks: Map<string, { pid: string; acquiredAt: number; stack: string }> = new Map();
+  private readonly REDIS_KEY_PREFIX = 'jellyseerr:lock:';
+  private readonly DEADLOCK_THRESHOLD = 30000;  // 30 秒超时
+
+  public dispatch = async (key: string | number, callback: () => Promise<void>) => {
+    const skey = String(key);
+    const lockValue = `${process.pid}:${this.instanceId}:${Date.now()}`;
+
+    // 1. 先检查跨进程死锁：查询 Redis 是否有长期未释放的锁
+    const existingLock = await this.redis.get(this.REDIS_KEY_PREFIX + skey);
+    if (existingLock) {
+      const [remotePid, remoteInstanceId, acquiredTimestamp] = existingLock.split(':');
+      const heldMs = Date.now() - Number(acquiredTimestamp);
+
+      if (heldMs > this.DEADLOCK_THRESHOLD) {
+        // 死锁检测：超过 30 秒未释放，强制解锁
+        const released = await this.redis.del(this.REDIS_KEY_PREFIX + skey);
+        logger.warn('Deadlock detected and force-released', {
+          label: 'AsyncLock',
+          lockKey: skey,
+          heldBy: { remotePid, remoteInstanceId, heldMs },
+          released: released > 0,
+          fingerprint: `deadlock:${skey}:${acquiredTimestamp}`,  // Sentry 幂等键
+        });
+      } else {
+        // 正常等待：订阅 Redis Pub/Sub 释放通知
+        await this.waitForRedisLock(skey);
+      }
+    }
+
+    // 2. 获取分布式锁（SET NX PX 原子操作）
+    const acquired = await this.redis.set(
+      this.REDIS_KEY_PREFIX + skey,
+      lockValue,
+      'PX',
+      this.DEADLOCK_THRESHOLD,  // 自动过期兜底
+      'NX'
+    );
+
+    if (!acquired) {
+      throw new Error(`Lock contention detected for key ${skey}`);
+    }
+
+    // 3. 记录进程内堆栈，用于本地死锁诊断
+    this.processLocks.set(skey, {
+      pid: process.pid.toString(),
+      acquiredAt: Date.now(),
+      stack: new Error().stack || '',  // 捕获获取锁时的调用栈
+    });
+
+    try {
+      await callback();
+    } finally {
+      // 4. 释放锁（先比对锁持有者，避免误删）
+      const currentHolder = await this.redis.get(this.REDIS_KEY_PREFIX + skey);
+      if (currentHolder === lockValue) {
+        await this.redis.del(this.REDIS_KEY_PREFIX + skey);
+      }
+      this.processLocks.delete(skey);
+
+      // 5. Pub/Sub 通知等待者
+      await this.redis.publish(`${this.REDIS_KEY_PREFIX}release:${skey}`, lockValue);
+    }
+  };
+
+  // 跨进程死锁诊断 API
+  public getDeadlockReport(): DeadlockReport[] {
+    const now = Date.now();
+    const reports: DeadlockReport[] = [];
+
+    for (const [key, info] of this.processLocks.entries()) {
+      const heldMs = now - info.acquiredAt;
+      if (heldMs > this.DEADLOCK_THRESHOLD * 0.8) {  // 80% 阈值时预警
+        reports.push({
+          key,
+          heldMs,
+          warning: heldMs > this.DEADLOCK_THRESHOLD ? 'DEADLOCK_SUSPECTED' : 'APPROACHING_TIMEOUT',
+          stackTrace: info.stack,
+          pid: info.pid,
+        });
+      }
+    }
+    return reports;
+  }
+}
+```
+
+**死锁识别键 (Sentry Fingerprint) 映射表**:
+| 场景 | Fingerprint 模板 | Sentry 级别 |
+|------|-----------------|-------------|
+| 本地持有超 80% 阈值 | `['asyncLock-warning', key, instanceId]` | warning |
+| Redis 锁超 30s 强制释放 | `['asyncLock-deadlock-force-release', key, acquiredTimestamp]` | error |
+| 获取锁竞争失败超过 5 次/分钟 | `['asyncLock-contention-high', key]` | warning |
+| Redlock 多节点不一致 | `['asyncLock-redlock-inconsistency', key]` | fatal |
 
 ### 3.4 异步锁 (AsyncLock) 使用场景
 
@@ -654,6 +830,167 @@ export const hasNotificationType = (type: Notification, types: number): boolean 
 - `types = 2 | 4 | 8` 只接收 PENDING、APPROVED、AVAILABLE
 - `types = 0` 接收所有类型（默认）
 
+#### 5.5.6 通知 Agent 插件热加载机制
+
+**现状分析** (`server/index.ts:131-143` + `server/lib/notifications/index.ts:95-97`):
+当前为**启动时静态注册**，修改 Agent 配置需重启服务：
+```typescript
+// ❌ 静态注册：启动后无法动态增删
+notificationManager.registerAgents([
+  new DiscordAgent(),    // 硬编码在 index.ts
+  new EmailAgent(),
+  // ...
+]);
+```
+
+**热加载改造架构**:
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  热加载管理器                          │
+│                                                      │
+│  ┌────────────┐     fs.watch()    ┌───────────────┐  │
+│  │ plugins/   │────────────────▶ │ 配置变更检测   │  │
+│  │  discord.ts│                   └──────┬────────┘  │
+│  │  webhook.ts│                          │           │
+│  │  custom*.ts│                          ▼           │
+│  └────────────┘              ┌──────────────────┐    │
+│                              │ 模块 HMR 卸载/加载 │    │
+│                              │ - clear require   │    │
+│                              │ - 重新 import()  │    │
+│                              └──────┬───────────┘    │
+│                                     ▼                │
+│                              ┌──────────────────┐    │
+│                              │ Agent 注册表更新 │    │
+│                              │ - 旧实例 dispose │    │
+│                              │ - 新实例注册     │    │
+│                              │ - 发送测试消息   │    │
+│                              └──────────────────┘    │
+└──────────────────────────────────────────────────────┘
+```
+
+**热加载核心实现（建议改造）**:
+```typescript
+// server/lib/notifications/pluginLoader.ts
+import chokidar from 'chokidar';
+import { NotificationAgent, NotificationAgentKey } from './agents/agent';
+
+class NotificationPluginManager {
+  private agentInstances = new Map<NotificationAgentKey, NotificationAgent & { dispose?: () => void }>();
+  private watcher: chokidar.FSWatcher;
+
+  // 启动热加载监听
+  public async startHotReload() {
+    const pluginDir = path.resolve(__dirname, '../../plugins/notifications');
+
+    this.watcher = chokidar.watch(`${pluginDir}/**/*.ts`, {
+      ignoreInitial: false,
+      awaitWriteFinish: { stabilityThreshold: 500 },  // 等待文件写入完成
+    });
+
+    this.watcher
+      .on('add', (filePath) => this.loadPlugin(filePath, 'add'))
+      .on('change', (filePath) => this.loadPlugin(filePath, 'change'))
+      .on('unlink', (filePath) => this.unloadPlugin(filePath));
+  }
+
+  // 动态加载插件
+  private async loadPlugin(filePath: string, event: 'add' | 'change') {
+    try {
+      // 1. 清除 Node 模块缓存（关键）
+      delete require.cache[require.resolve(filePath)];
+
+      // 2. 动态导入（支持 ESM 和 CJS）
+      const pluginModule = await import(filePath);
+      const PluginClass = pluginModule.default || pluginModule.PluginClass;
+
+      // 3. 验证接口契约
+      if (!this.validateAgentInterface(PluginClass)) {
+        logger.error('Plugin invalid: missing required methods', {
+          label: 'Notifications',
+          filePath,
+          fingerprint: `plugin-validation:${path.basename(filePath)}`,  // Sentry 告警键
+        });
+        return;
+      }
+
+      // 4. 先销毁旧实例（如果存在）
+      const agentKey = PluginClass.agentKey as NotificationAgentKey;
+      if (event === 'change' && this.agentInstances.has(agentKey)) {
+        const oldInstance = this.agentInstances.get(agentKey);
+        if (oldInstance?.dispose) {
+          await oldInstance.dispose();  // 清理资源（连接、定时器等）
+        }
+        notificationManager.unregisterAgent(agentKey);
+      }
+
+      // 5. 创建新实例并注册
+      const settings = getSettings().notifications[agentKey];
+      const newInstance = new PluginClass(settings);
+
+      notificationManager.registerAgents([newInstance]);
+      this.agentInstances.set(agentKey, newInstance);
+
+      logger.info('Notification plugin loaded', {
+        label: 'Notifications',
+        agentKey,
+        event,
+        filePath,
+      });
+    } catch (e) {
+      logger.error('Failed to load notification plugin', {
+        label: 'Notifications',
+        filePath,
+        errorMessage: e.message,
+        fingerprint: `plugin-load-fail:${path.basename(filePath)}:${e.code || 'unknown'}`,
+      });
+    }
+  }
+
+  // 插件接口校验（类型守卫）
+  private validateAgentInterface(cls: unknown): cls is new (...args: any[]) => NotificationAgent {
+    return typeof cls === 'function' &&
+      typeof cls.prototype.shouldSend === 'function' &&
+      typeof cls.prototype.send === 'function' &&
+      NotificationAgentKey[cls.agentKey] !== undefined;
+  }
+
+  // 安全停止
+  public async stop() {
+    await this.watcher?.close();
+    for (const instance of this.agentInstances.values()) {
+      await instance.dispose?.();
+    }
+  }
+}
+
+// 插件需要导出的约定接口
+export interface NotificationPlugin {
+  agentKey: NotificationAgentKey;  // 静态属性，标识唯一键
+  version: string;                 // 版本号，用于兼容性检查
+  new (settings?: NotificationAgentConfig): NotificationAgent & {
+    dispose?: () => Promise<void> | void;  // 可选的资源清理方法
+  };
+}
+```
+
+**插件目录结构约定**:
+```
+server/plugins/notifications/
+├── custom-slack/
+│   ├── index.ts          # 导出 CustomSlackAgent 类
+│   ├── manifest.json     # name, version, author, dependencies
+│   └── README.md
+├── custom-wechat.ts      # 单文件插件也支持
+└── _template.ts          # 插件开发模板
+```
+
+**热加载安全机制**:
+1. **版本兼容性检查**: `manifest.json` 中声明 `compatibleApiVersion >= 1.0.0`
+2. **沙箱隔离**: 使用 `vm.Module` 或 `isolated-vm` 隔离第三方插件（可选）
+3. **回滚机制**: 新版本加载失败时，自动恢复上一个可用版本
+4. **发送测试消息**: 加载成功后立即触发 `TEST_NOTIFICATION` 验证可用性
+
 ---
 
 ## 六、回执处理与状态回写
@@ -811,6 +1148,100 @@ public async down(queryRunner: QueryRunner): Promise<void> {
 }
 ```
 
+#### 6.4.2 4K 降回 1080p 中间态字段为空场景
+
+**场景分析**:
+用户先请求 4K 版本，系统写入 `status4k=PROCESSING, serviceId4k=<值>, externalServiceId4k=<值>`，但下载失败或被删除后，用户再请求 1080p 版本。此时 `status4k` 相关字段可能残留或被清空，导致状态不一致。
+
+**源码中的保护逻辑** (`server/subscriber/MediaRequestSubscriber.ts:838-856`):
+
+```typescript
+public async updateParentStatus(entity: MediaRequest): Promise<void> {
+  const statusKey = entity.is4k ? 'status4k' : 'status';
+
+  // 🔒 三重状态保护：只有在特定状态下才允许升级到 PROCESSING
+  if (
+    entity.status === MediaRequestStatus.APPROVED &&
+    media[statusKey] !== MediaStatus.AVAILABLE &&           // 排除：已经可用
+    media[statusKey] !== MediaStatus.PARTIALLY_AVAILABLE && // 排除：部分可用
+    media[statusKey] !== MediaStatus.PROCESSING             // 排除：正在处理（可能是另一个请求的）
+  ) {
+    media[statusKey] = MediaStatus.PROCESSING;
+    await mediaRepository.save(media);
+  }
+
+  // 🚫 拒绝时状态保护：电影拒绝只回退到 UNKNOWN
+  if (
+    media.mediaType === MediaType.MOVIE &&
+    entity.status === MediaRequestStatus.DECLINED &&
+    media[statusKey] !== MediaStatus.DELETED  // 不覆盖 DELETED（已被删除的媒体保持标记）
+  ) {
+    media[statusKey] = MediaStatus.UNKNOWN;
+    await mediaRepository.save(media);
+  }
+```
+
+**AvailabilitySync 中的中间态保护** (`server/lib/availabilitySync.ts:536-560`):
+
+```typescript
+private async mediaUpdater(media: Media, is4k: boolean, mediaServerType: MediaServerType) {
+  // ... 先检测 isMediaProcessing ...
+
+  // 🎯 核心：三元表达式保护 —— 处理中时保留原值，否则清空
+  media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+  media[is4k ? 'serviceId4k' : 'serviceId'] = isMediaProcessing
+    ? media[is4k ? 'serviceId4k' : 'serviceId']  // 处理中：保留原有服务 ID（可能是 4K 也可能是 1080p）
+    : null;                                        // 未处理：清空，避免残留脏数据
+
+  media[is4k ? 'externalServiceId4k' : 'externalServiceId'] =
+    isMediaProcessing
+      ? media[is4k ? 'externalServiceId4k' : 'externalServiceId']  // 保留
+      : null;                                                       // 清空
+
+  media[is4k ? 'ratingKey4k' : 'ratingKey'] = isMediaProcessing
+    ? media[is4k ? 'ratingKey4k' : 'ratingKey']  // 保留 Plex ratingKey
+    : null;
+}
+```
+
+**Scanner 中状态降级保护** (`server/lib/scanners/baseScanner.ts:119-134`):
+
+```typescript
+// 多条件状态判定矩阵，避免异常覆盖
+existing[statusField] =
+  !processing && hasFile
+    ? MediaStatus.AVAILABLE                              // ✅ 下载完成且有文件 → AVAILABLE
+    : !processing && !hasFile && previousStatus === MediaStatus.PROCESSING
+      ? MediaStatus.UNKNOWN                              // ⚠️ 4K 降回 1080p 场景：处理中但找不到文件 → 重置 UNKNOWN
+      : processing
+        ? previousStatus === MediaStatus.DELETED
+          ? MediaStatus.DELETED                          // 🔒 已删除的不重新激活
+          : MediaStatus.PROCESSING                       // ✅ 正常标记处理中
+        : previousStatus;                                // 🛡️ 其他情况保持不变（关键兜底）
+```
+
+**典型中间态场景与行为矩阵**:
+
+| 当前 `status4k` | 当前 `serviceId4k` | `is4k` 请求 | 操作 | 结果 `status4k` | 结果 `serviceId4k` |
+|----------------|-------------------|------------|------|----------------|-------------------|
+| PROCESSING | 非空（有值） | false（请求 1080p） | 审批通过 | PROCESSING（**不变**） | 非空（**保留**，避免 4K 正在下载时被误清） |
+| PROCESSING | 非空 | false | AvailabilitySync 检测到媒体缺失 | DELETED | 非空（**保留**，isMediaProcessing=true） |
+| UNKNOWN | null | true（请求 4K） | 审批通过 | PROCESSING | 填入新值 |
+| DELETED | null | true | 审批通过 | PROCESSING（从 DELETED 恢复） | 填入新值 |
+| PARTIALLY_AVAILABLE | 非空 | false | 审批通过 | PARTIALLY_AVAILABLE（**不变**，避免覆盖部分可用） | 非空（保留） |
+
+**状态机转移图**:
+```
+UNKNOWN ──请求批准──▶ PROCESSING ──*arr 下载完成──▶ AVAILABLE
+   ▲                         │                          │
+   │                         │ 找不到文件              │ AvailabilitySync
+   │                         ▼                          ▼
+   └────拒绝/撤销──────── UNKNOWN                    DELETED
+                               ▲                         │
+                               │ 有新请求/下载中保留元数据 │
+                               └─────────────────────────┘
+```
+
 ---
 
 ### 6.5 异步非阻塞背压控制
@@ -903,6 +1334,151 @@ private async *loadAvailableMediaPaginated(pageSize: number) {
 - 内存占用稳定（O(pageSize) 而非 O(total)）
 - 数据库查询压力可控
 - 可随时中断，重启时无需重头开始
+
+#### 6.5.3 背压熔断水位线设计
+
+**源码中的监控指标** (`server/lib/scanners/baseScanner.ts:15-19, 59-66, 646-681`):
+
+```typescript
+// 状态输出接口
+export type StatusBase = {
+  running: boolean;   // 熔断开关：false 时直接触发熔断
+  progress: number;   // 已处理数量
+  total: number;      // 总数量
+};
+
+// 扫描器状态
+protected progress = 0;
+protected items: T[] = [];
+protected totalSize?: number = 0;
+protected sessionId: string;    // 会话 ID：用于检测会话过期
+protected running = false;      // 全局熔断标志
+```
+
+**四级熔断水位线（建议补充实现）**:
+
+```
+│               │  Level 4: FATAL          │  > 50% 超时 │  终止所有批次 + 报警 + 全局降级（跳过本次扫描）
+│               │──────────────────────────│────────────│
+│               │  Level 3: CRITICAL       │  > 30% 超时 │  updateRate × 3（降速到 12 秒）
+│     慢批次   │──────────────────────────│────────────│
+│     超时率   │  Level 2: WARNING        │  > 10% 超时 │  updateRate × 1.5（降速到 6 秒）
+│               │──────────────────────────│────────────│
+│               │  Level 1: INFO           │  < 10% 超时 │  正常速率 4 秒/批
+│               │──────────────────────────│────────────│
+│               │  Level 0: IDLE           │  running=false │  完全停止，等待 cancel() 释放
+```
+
+**熔断机制实现（建议改造 baseScanner.ts）**:
+```typescript
+abstract class BaseScanner<T> {
+  // 水位线配置
+  private readonly WATERMARK = {
+    WARN_SLOW_BATCH_RATIO: 0.10,     // 10% 批次超过 2 倍平均耗时 → 警告
+    CRITICAL_SLOW_BATCH_RATIO: 0.30, // 30% 批次超 2 倍 → 严重
+    FATAL_SLOW_BATCH_RATIO: 0.50,    // 50% 批次超 3 倍 → 致命
+    BATCH_TIMEOUT_BASELINE: 8000,    // 批次 8 秒基线超时
+    DB_ERROR_THRESHOLD: 5,           // 单批次 DB 错误超过 5 次 → 熔断
+    API_429_THRESHOLD: 3,            // 单批次 429 超过 3 次 → 降速
+  } as const;
+
+  // 运行时统计
+  private batchStats = {
+    totalBatches: 0,
+    slowBatches: 0,
+    dbErrors: 0,
+    api429Errors: 0,
+    avgBatchDurationMs: 0,
+    sessionStartAt: 0,
+  };
+
+  protected async loop(processFn, { sessionId }) {
+    // 会话级熔断：如果 sessionId 过期，直接终止
+    if (this.sessionId !== sessionId) {
+      throw new Error('New session was started. Old session aborted.');
+    }
+
+    // 全局熔断标志检查
+    if (!this.running) {
+      throw new Error('Sync was aborted.');
+    }
+
+    // 处理前计算当前水位
+    const currentWatermark = this.calculateWatermark();
+
+    // 动态调整 updateRate（自适应降速）
+    const adaptiveDelay = this.updateRate * this.getBackoffMultiplier(currentWatermark);
+
+    // Level 4 致命熔断
+    if (currentWatermark === 'FATAL') {
+      this.running = false;
+      logger.error('Scan FATAL watermark exceeded, triggering global circuit breaker', {
+        label: this.scannerName,
+        sessionId,
+        fingerprint: ['circuit-breaker-fatal', this.scannerName, sessionId],
+        stats: { ...this.batchStats },
+      });
+      throw new Error('Circuit breaker: FATAL watermark exceeded');
+    }
+
+    // Level 2/3 降速（通过增大 setTimeout 延时实现）
+    await new Promise<void>((resolve) =>
+      setTimeout(() => this.loop(...).then(resolve), adaptiveDelay)
+    );
+  }
+
+  // 计算当前水位
+  private calculateWatermark(): 'IDLE' | 'NORMAL' | 'WARN' | 'CRITICAL' | 'FATAL' {
+    if (!this.running) return 'IDLE';
+    const { totalBatches, slowBatches, dbErrors, api429Errors } = this.batchStats;
+    if (totalBatches === 0) return 'NORMAL';
+
+    const slowRatio = slowBatches / totalBatches;
+
+    // 任一硬阈值命中直接升级
+    if (dbErrors >= this.WATERMARK.DB_ERROR_THRESHOLD ||
+        api429Errors >= this.WATERMARK.API_429_THRESHOLD * 5) {
+      return 'FATAL';
+    }
+    if (slowRatio >= this.WATERMARK.FATAL_SLOW_BATCH_RATIO) return 'FATAL';
+    if (slowRatio >= this.WATERMARK.CRITICAL_SLOW_BATCH_RATIO) return 'CRITICAL';
+    if (slowRatio >= this.WATERMARK.WARN_SLOW_BATCH_RATIO) return 'WARN';
+    return 'NORMAL';
+  }
+
+  // 退避乘数
+  private getBackoffMultiplier(level: string): number {
+    switch (level) {
+      case 'CRITICAL': return 3.0;
+      case 'WARN': return 1.5;
+      default: return 1.0;
+    }
+  }
+}
+```
+
+**熔断状态外部暴露（健康检查 API）**:
+```typescript
+// GET /api/v1/settings/status/jobs
+// Response:
+{
+  "plex-full-scan": {
+    "running": true,
+    "progress": 1540,
+    "total": 8500,
+    "watermark": "WARN",
+    "backoffMultiplier": 1.5,
+    "currentAdaptiveDelayMs": 6000,
+    "stats": {
+      "slowBatchRatio": 0.12,
+      "avgBatchDurationMs": 2300,
+      "dbErrors": 0,
+      "api429Errors": 1
+    },
+    "estimatedRemainingTimeSec": 14800
+  }
+}
+```
 
 ---
 
@@ -1007,6 +1583,223 @@ if (tvShow) {
 }
 ```
 
+#### 6.6.5 漂移超 24h 兜底降级策略
+
+**漂移问题背景**:
+AvailabilitySync 定期（`availability-sync` 任务，默认每小时一次）检查媒体是否仍然存在。但以下场景可能导致**状态漂移**超过 24 小时未被纠正：
+1. Radarr/Sonarr 实例离线超过 24 小时，恢复后数据库状态丢失
+2. Plex/Jellyfin 媒体库迁移，文件被重新扫描但元数据变化
+3. 数据库备份恢复后，Media 表与实际磁盘状态不一致
+4. 扫描任务挂起（进程阻塞、Session ID 过期未清理）
+
+**源码中的时间戳字段** (`server/lib/scanners/baseScanner.ts:644, availabilitySync.ts:644`):
+
+```typescript
+// Season 状态变更时更新 lastSeasonChange
+media.lastSeasonChange = new Date();
+await mediaRepository.save(media);
+
+// Media 实体：updatedAt、createdAt、lastSeasonChange、mediaAddedAt
+```
+
+**超 24h 兜底降级策略（建议补充实现）**:
+
+```typescript
+// server/lib/availabilitySync.ts
+class AvailabilitySync {
+  private readonly DRIFT_THRESHOLD_MS = 24 * 60 * 60 * 1000;  // 24 小时
+  private readonly DRIFT_FALLBACK_ENABLED = true;
+
+  async run() {
+    this.running = true;
+    try {
+      // 正常的可用性同步逻辑...
+
+      // 兜底：扫描 PROCESSING/PENDING 状态超 24h 的媒体
+      if (this.DRIFT_FALLBACK_ENABLED) {
+        await this.runDriftFallback();
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async runDriftFallback() {
+    const driftThreshold = new Date(Date.now() - this.DRIFT_THRESHOLD_MS);
+
+    // 场景 1：电影 PROCESSING 超 24h → 降级为 UNKNOWN + 告警
+    const stuckProcessingMovies = await mediaRepository
+      .createQueryBuilder('media')
+      .where('media.mediaType = :movieType', { movieType: MediaType.MOVIE })
+      .andWhere('(media.status = :processing OR media.status4k = :processing)', {
+        processing: MediaStatus.PROCESSING,
+      })
+      .andWhere('media.updatedAt < :threshold', { threshold: driftThreshold })
+      .getMany();
+
+    for (const media of stuckProcessingMovies) {
+      await this.handleDriftedMedia(media, 'PROCESSING_TIMEOUT');
+    }
+
+    // 场景 2：剧集 PARTIALLY_AVAILABLE 超 24h → 检查每一季
+    const stuckPartialShows = await mediaRepository
+      .createQueryBuilder('media')
+      .leftJoinAndSelect('media.seasons', 'season')
+      .where('media.mediaType = :tvType', { tvType: MediaType.TV })
+      .andWhere('(media.status = :partial OR media.status4k = :partial)', {
+        partial: MediaStatus.PARTIALLY_AVAILABLE,
+      })
+      .andWhere('media.lastSeasonChange < :threshold', { threshold: driftThreshold })
+      .getMany();
+
+    for (const media of stuckPartialShows) {
+      await this.handleDriftedShow(media);
+    }
+
+    // 场景 3：DELETED 超 24h 且有新请求 → 清理脏字段
+    const deletedWithPending = await mediaRepository
+      .createQueryBuilder('media')
+      .innerJoinAndSelect('media.requests', 'request')
+      .where('(media.status = :deleted OR media.status4k = :deleted)', {
+        deleted: MediaStatus.DELETED,
+      })
+      .andWhere('request.status = :pending', { pending: MediaRequestStatus.PENDING })
+      .andWhere('media.updatedAt < :threshold', { threshold: driftThreshold })
+      .getMany();
+
+    for (const media of deletedWithPending) {
+      await this.cleanupDriftedDeletedMedia(media);
+    }
+  }
+
+  private async handleDriftedMedia(media: Media, reason: string) {
+    const mediaRepository = getRepository(Media);
+
+    // 记录漂移告警
+    logger.warn('Media status drift detected, applying fallback', {
+      label: 'AvailabilitySync',
+      tmdbId: media.tmdbId,
+      mediaType: media.mediaType,
+      status: media.status,
+      status4k: media.status4k,
+      updatedAgoMs: Date.now() - (media.updatedAt?.getTime() || 0),
+      driftReason: reason,
+      fingerprint: [
+        'availability-drift',
+        reason,
+        `tmdb:${media.tmdbId}`,
+        `type:${media.mediaType}`,
+      ],
+    });
+
+    // 降级策略：
+    // PROCESSING → UNKNOWN（等待下次扫描重新确认）
+    // 但保留外部服务元数据，避免用户手动配置丢失
+    if (media.status === MediaStatus.PROCESSING) {
+      media.status = MediaStatus.UNKNOWN;
+    }
+    if (media.status4k === MediaStatus.PROCESSING) {
+      media.status4k = MediaStatus.UNKNOWN;
+    }
+
+    await mediaRepository.save(media);
+  }
+
+  private async handleDriftedShow(media: Media) {
+    const seasonRepository = getRepository(Season);
+    const driftThreshold = new Date(Date.now() - this.DRIFT_THRESHOLD_MS);
+
+    for (const season of media.seasons) {
+      // 只有 24h 内未变更的季才触发兜底
+      if (season.updatedAt && season.updatedAt > driftThreshold) continue;
+
+      // 检查该季是否有处理中的请求
+      const activeRequest = await getRepository(SeasonRequest)
+        .createQueryBuilder('sr')
+        .innerJoin('sr.request', 'request')
+        .where('sr.seasonId = :seasonId', { seasonId: season.id })
+        .andWhere('request.status IN (:...statuses)', {
+          statuses: [MediaRequestStatus.APPROVED, MediaRequestStatus.PENDING],
+        })
+        .getExists();
+
+      if (!activeRequest) {
+        // 无活跃请求的漂移季：从 PARTIALLY_AVAILABLE 降级
+        if (season.status === MediaStatus.PARTIALLY_AVAILABLE) {
+          season.status = MediaStatus.UNKNOWN;
+          await seasonRepository.save(season);
+        }
+        if (season.status4k === MediaStatus.PARTIALLY_AVAILABLE) {
+          season.status4k = MediaStatus.UNKNOWN;
+          await seasonRepository.save(season);
+        }
+      }
+    }
+  }
+
+  private async cleanupDriftedDeletedMedia(media: Media) {
+    const mediaRepository = getRepository(Media);
+
+    // DELETED 状态但有待处理请求 → 可能是误标删除
+    // 策略：降级为 UNKNOWN，清空外部 ID，触发下次扫描重新拉取
+    if (media.status === MediaStatus.DELETED) {
+      media.status = MediaStatus.UNKNOWN;
+      media.serviceId = null;
+      media.externalServiceId = null;
+    }
+    if (media.status4k === MediaStatus.DELETED) {
+      media.status4k = MediaStatus.UNKNOWN;
+      media.serviceId4k = null;
+      media.externalServiceId4k = null;
+    }
+
+    logger.warn('Cleaned up drifted DELETED media with pending requests', {
+      label: 'AvailabilitySync',
+      tmdbId: media.tmdbId,
+      fingerprint: ['availability-drift-deleted-with-pending', `tmdb:${media.tmdbId}`],
+    });
+
+    await mediaRepository.save(media);
+  }
+}
+```
+
+**漂移状态降级决策表**:
+
+| 当前状态 | 持续时间 | 活跃请求 | 降级后状态 | 清理外部 ID | 告警级别 |
+|---------|---------|---------|-----------|------------|---------|
+| PROCESSING | > 24h | ❌ 无 | UNKNOWN | ❌ 保留 | warning |
+| PROCESSING | > 24h | ✅ 有 | PROCESSING（不变） | ❌ 保留 | warning（仅告警） |
+| PARTIALLY_AVAILABLE | > 24h | ❌ 无 | AVAILABLE / UNKNOWN（根据 *arr 确认） | ❌ 保留 | warning |
+| PARTIALLY_AVAILABLE | > 24h | ✅ 有 | 不变 | ❌ 保留 | info |
+| DELETED | > 24h | ✅ 有 | UNKNOWN | ✅ 清空 | warning |
+| DELETED | > 24h | ❌ 无 | DELETED（不变） | ❌ 保留 | 不告警 |
+| UNKNOWN | > 72h | ❌ 无 | UNKNOWN（不变） | ✅ 清理空字段 | info |
+
+**扫描器任务挂起兜底 (Task Heartbeat)**:
+```typescript
+// server/job/schedule.ts - 任务心跳检查
+const HEARTBEAT_TIMEOUT = 30 * 60 * 1000;  // 30 分钟无心跳
+
+setInterval(() => {
+  for (const [jobName, scanner] of runningScanners) {
+    if (scanner.running && 
+        (Date.now() - scanner.lastHeartbeatAt) > HEARTBEAT_TIMEOUT) {
+      // 强制取消超时任务
+      scanner.cancel();
+      logger.error('Scanner stuck, force canceled', {
+        label: 'Scheduler',
+        jobName,
+        stuckDurationMs: Date.now() - scanner.lastHeartbeatAt,
+        fingerprint: ['scanner-heartbeat-timeout', jobName],
+      });
+      // 触发重新调度
+      rescheduleJob(jobName);
+    }
+  }
+}, 60000);  // 每分钟检查一次
+```
+
 ---
 
 ## 七、错误回滚机制
@@ -1046,6 +1839,80 @@ if (media.mediaType === MOVIE && entity.status === DECLINED) {
 if (entity.status !== FAILED) {  // 防止重复标记
   entity.status = FAILED;
 }
+```
+
+### 7.0.1 回滚优先级与 Sentry 告警键关联
+
+**现状分析**:
+当前项目未集成 Sentry（全项目 grep 无 `@sentry/node` 引用），但 `logger.error/warn` 的结构化日志参数天然适合映射为 Sentry `fingerprint` 和 `tags`。
+
+**Sentry 告警键 (Fingerprint) 设计映射表**:
+
+| 优先级 | 回滚场景 | Sentry Fingerprint 模板 | Sentry Level | 触发位置 |
+|-------|---------|------------------------|--------------|---------|
+| 🔴 P0 | **请求删除回滚** | `['rollback-p0-delete', 'media:'+mediaId, 'tmdb:'+tmdbId, 'request:'+requestId]` | error | `handleRemoveParentUpdate` (Subscriber.ts:946) |
+| 🟠 P1 | **请求拒绝回滚** | `['rollback-p1-decline', 'media:'+mediaId, 'operator:'+modifiedById]` | warning | `updateParentStatus` (Subscriber.ts:849) |
+| 🟡 P2 | **API 业务失败回滚** | `['rollback-p2-api-failed', 'radarr:'+serverName, 'error:'+errorCode]` | error | `sendToRadarr` .catch() (Subscriber.ts:398) |
+| 🟢 P3 | **连接/配置错误回滚** | `['rollback-p3-connect-fail', hostname, 'error:'+e.code]` | warning | `sendToRadarr` 外层 catch (Subscriber.ts:789) |
+| 🔵 P4 | **重试机制** | `['rollback-p4-retry', 'request:'+requestId, 'retry-count:'+count]` | info | `POST /request/:requestId/retry` (request.ts:633) |
+
+**Sentry 集成示例（建议改造）**:
+```typescript
+// 在 logger 封装层增加 Sentry 桥接
+const sentryError = (message: string, context: {
+  label: string;
+  fingerprint?: string[];
+  tags?: Record<string, string>;
+  user?: { id: number; email: string };
+  extra?: Record<string, unknown>;
+}) => {
+  logger.error(message, context);
+
+  // 自动根据回滚优先级映射 Sentry 级别
+  const level = context.fingerprint?.[0]?.includes('p0') ? 'error'
+              : context.fingerprint?.[0]?.includes('p1') ? 'warning'
+              : context.fingerprint?.[0]?.includes('p2') ? 'error'
+              : context.fingerprint?.[0]?.includes('p3') ? 'warning'
+              : 'info';
+
+  Sentry.withScope((scope) => {
+    if (context.fingerprint) scope.setFingerprint(context.fingerprint);
+    if (context.tags) Object.entries(context.tags).forEach(([k, v]) => scope.setTag(k, v));
+    if (context.user) scope.setUser(context.user);
+    if (context.extra) scope.setExtras(context.extra);
+    scope.setLevel(level as any);
+    scope.setTag('component', context.label);  // 用 label 作为组件分类
+    Sentry.captureException(new Error(message));
+  });
+};
+
+// 实际调用示例（P2 失败回滚）
+sentryError('Failed to send to Radarr', {
+  label: 'Media Request',
+  fingerprint: ['rollback-p2-api-failed', `radarr:${radarrSettings.name}`, `error:${e.code}`],
+  tags: {
+    media_type: entity.type === MediaType.MOVIE ? 'movie' : 'tv',
+    is_4k: String(entity.is4k),
+    server_id: String(radarrSettings.id),
+  },
+  user: { id: entity.modifiedBy?.id, email: entity.modifiedBy?.email },
+  extra: { requestId: entity.id, mediaId: entity.media.id },
+});
+```
+
+**Sentry 告警分组策略（Rules）**:
+```yaml
+# Sentry Issue Alert Rule
+conditions:
+  - type: event.frequency
+    value: 10  # 10 分钟内超过 10 次
+    window: 600
+
+# P0/P2 级 issue 直接 PagerDuty 呼叫 oncall
+fingerprint_pattern:
+  contains:
+    - "rollback-p0"
+    - "rollback-p2"
 ```
 
 ---
@@ -1328,6 +2195,116 @@ public async handleRemoveParentUpdate(
 }
 ```
 
+#### 7.6.5 事件回放幂等键设计
+
+**问题背景**:
+TypeORM 的 `AfterInsert` / `AfterUpdate` 事件可能因重试机制、Promise 不等待、或数据库集群主从延迟导致**重复触发**。如果幂等保护不足，同一事件可能被处理多次，造成重复通知、重复发送到 *arr、重复状态更新等问题。
+
+**源码中的隐式幂等保护**:
+
+| 幂等场景 | 现有保护键 | 保护位置 |
+|---------|-----------|---------|
+| 请求审批重复发送到 Radarr | `entity.status === APPROVED` + `media.status !== PROCESSING` | `sendToRadarr():185` + `updateParentStatus():838` |
+| 重复通知 | `media[statusKey] !== AVAILABLE && !== PARTIALLY_AVAILABLE` | `updateParentStatus():841` |
+| 重复创建 Media 记录 | AsyncLock(tmdbId) + DB UNIQUE 约束 | `processMovie():113` |
+| 重复保存失败状态 | `entity.status !== FAILED` | `sendToRadarr().catch():398` |
+
+**显式幂等键设计（建议补充）**:
+
+```typescript
+// server/subscriber/MediaRequestSubscriber.ts
+class MediaRequestSubscriber {
+  // Redis 或内存去重表
+  private idempotencyKeys = new Map<string, number>();  // key -> 过期时间戳
+  private readonly IDEMPOTENCY_TTL = 60000;  // 60 秒内事件去重
+
+  // 计算幂等键（基于事件唯一标识）
+  private getIdempotencyKey(
+    eventType: 'afterInsert' | 'afterUpdate' | 'beforeRemove',
+    entity: MediaRequest,
+    databaseEntity?: MediaRequest
+  ): string {
+    // 幂等键 = 事件类型 + 实体 ID + 更新时间戳 + 变更状态哈希
+    const statusHash = databaseEntity
+      ? `${databaseEntity.status}->${entity.status}`
+      : 'INSERT';
+
+    return `event:${eventType}:${entity.id}:${entity.updatedAt?.getTime() || 'now'}:${statusHash}`;
+  }
+
+  // 去重检查
+  private isDuplicateEvent(
+    eventType: 'afterInsert' | 'afterUpdate' | 'beforeRemove',
+    entity: MediaRequest,
+    databaseEntity?: MediaRequest
+  ): boolean {
+    const key = this.getIdempotencyKey(eventType, entity, databaseEntity);
+    const now = Date.now();
+
+    // 清理过期键（惰性删除）
+    for (const [k, exp] of this.idempotencyKeys) {
+      if (exp < now) this.idempotencyKeys.delete(k);
+    }
+
+    if (this.idempotencyKeys.has(key)) {
+      logger.debug('Duplicate event skipped by idempotency key', {
+        label: 'Media Request',
+        eventType,
+        requestId: entity.id,
+        idempotencyKey: key,
+        fingerprint: ['event-deduplicated', eventType, String(entity.id)],
+      });
+      return true;
+    }
+
+    this.idempotencyKeys.set(key, now + this.IDEMPOTENCY_TTL);
+    return false;
+  }
+
+  // 应用示例：在 afterUpdate 中使用
+  public async afterUpdate(event: UpdateEvent<MediaRequest>): Promise<void> {
+    if (!event.entity) return;
+
+    // 幂等检查：同一事件 60 秒内只处理一次
+    if (this.isDuplicateEvent('afterUpdate', event.entity, event.databaseEntity)) {
+      return;
+    }
+
+    // 原逻辑继续...
+    await this.sendToRadarr(event.entity);
+  }
+}
+```
+
+**幂等键分层设计（多实例部署需 Redis 实现）**:
+
+```
+幂等键层级:
+┌─────────────────────────────────────────────────────┐
+│  Global Level (跨实例共享) - Redis SETNX            │
+│  key: jseer:idem:global:<eventIdempotencyHash>      │
+│  TTL: 300s（覆盖扫描周期的 5 倍）                    │
+├─────────────────────────────────────────────────────┤
+│  Instance Level (实例内) - 内存 Map                  │
+│  key: <eventType>:<entityId>:<updatedAtHash>         │
+│  TTL: 60s（覆盖同一会话内的重试）                     │
+├─────────────────────────────────────────────────────┤
+│  DB Level (持久化) - 数据库列约束                    │
+│  UNIQUE(tmdbId, mediaType, is4k)                     │
+│  + 状态变更前检查 entity.status !== targetStatus      │
+└─────────────────────────────────────────────────────┘
+```
+
+**状态变更幂等矩阵**:
+| databaseEntity.status | entity.status | 允许处理？ | 说明 |
+|----------------------|---------------|-----------|------|
+| PENDING | APPROVED | ✅ | 正常审批流程 |
+| APPROVED | APPROVED | ❌ | 重复事件，跳过 |
+| APPROVED | COMPLETED | ✅ | 媒体已下载完成 |
+| PENDING | DECLINED | ✅ | 正常拒绝 |
+| PENDING | PENDING | ❌ | 无状态变更，跳过 |
+| APPROVED | FAILED | ✅ | 处理失败，标记失败状态 |
+
 ---
 
 ## 八、关键设计模式总结
@@ -1342,38 +2319,54 @@ public async handleRemoveParentUpdate(
 - `EventSubscriber` 监听实体变化，触发后续流程
 - **事件回放**: 利用 `event.databaseEntity` 与 `event.entity` 对比检测状态变更
 - **事务边界**: 删除操作在 `beforeRemove` 中使用传入的 `manager` 保证原子性
+- **回放幂等键**: 事件类型 + 实体 ID + updatedAt 时间戳 + 状态变更哈希，三层去重（Global Redis → Instance Map → DB Constraints）
 
 ### 8.3 幂等性设计
 - 重复请求检查 (`DuplicateMediaRequestError`)
 - 状态变更前检查当前状态，避免重复标记
 - AsyncLock 防止同一媒体并发操作
 - **防循环调用**: afterUpdate 中先校验状态再处理，避免级联更新触发死循环
+- **事件回放幂等**: `getIdempotencyKey()` + `isDuplicateEvent()` 60 秒去重窗口
+- **状态变更幂等矩阵**: 6 种典型状态转移的允许/拒绝决策表
 
 ### 8.4 容错机制
 - 多级错误捕获 (API 调用层 + 实体保存层)
 - 失败状态标记 + 通知 + 重试机制
 - 缓存失效时返回旧数据 (`getRolling` 策略)
 - **5 级回滚优先级**: P0 删除 → P1 拒绝 → P2 API 失败 → P3 连接错误 → P4 重试
+- **Sentry 告警键关联**: 每级回滚绑定唯一 fingerprint 模板 + Level 自动映射 + PagerDuty 升级策略
+- **4K 降回中间态保护**: 三元表达式条件赋值，处理中保留外部服务 ID 不被误清
 
 ### 8.5 扩展性设计
 - 通知 Agent 接口抽象，易于新增通知渠道
 - 扫描器基类 `BaseScanner` 可扩展新的扫描源
 - 媒体服务器类型通过枚举支持 (Plex/Jellyfin/Emby)
 - **10 种通知 Agent 标准化扩展**: BaseAgent 抽象 + NotificationAgent 接口 + 位掩码类型过滤
+- **Agent 插件热加载**: chokidar 文件监听 + require.cache 清除 + dispose 生命周期 + 接口校验 + 版本兼容性检查
 
 ### 8.6 背压与流控
 - 扫描器三层背压: Session ID 隔离 → 分批节流 → 可取消标志
 - AvailabilitySync 异步生成器分页，内存占用稳定
 - axios-rate-limit 控制外部 API 调用频率
 - **AsyncLock 死锁预防**: setImmediate 异步释放 + 无界监听器 + 非递归设计
+- **四级熔断水位线**: IDLE → NORMAL → WARN(10% 超时, ×1.5) → CRITICAL(30% 超时, ×3) → FATAL(50% 超时, 全局终止)
+- **硬阈值快速熔断**: DB 错误 ≥5 次、API 429 ≥15 次直接升级 FATAL
+- **健康检查 API**: 暴露 watermark、backoffMultiplier、stats 等实时监控指标
 
 ### 8.7 数据一致性
 - **4K 双轨迁移**: 临时表重建 + 历史数据无缝迁移 + 回滚方案
 - **AvailabilitySync 漂移补偿**: 双重校验 (*arr + 媒体服务器) + 处理中保护 + 季级粒度 + TMDB 兜底
 - **状态保护**: 处理中请求保留外部服务元数据，不盲目清空
+- **4K→1080p 中间态矩阵**: 5 种典型场景 × 6 种状态机转移路径，全覆盖无盲区
+- **漂移超 24h 兜底降级**: 3 类漂移场景（PROCESSING 超时 / PARTIALLY_AVAILABLE 卡壳 / DELETED 误标）+ 7 级状态降级决策表
+- **扫描器心跳检查**: 30 分钟无 heartbeat 自动 cancel + 重启调度
 
 ### 8.8 分布式考量
 - Rate-Limit 当前为内存实现，分布式部署需 Redis 集中限流
 - AsyncLock 为进程内锁，多实例部署需分布式锁 (Redis Redlock)
 - 通知发送无重复投递保证，需消费方幂等处理
 - 扫描任务无分布式协调，多实例部署可能重复执行
+- **Redis 令牌桶改造**: Lua 脚本原子令牌获取 + SET NX PX 自动过期 + 本地 50ms 批量同步
+- **Redlock 死锁识别**: 30s 锁超时 + 强制释放日志 + Sentry fingerprint 聚合
+- **全局幂等键同步**: Redis SETNX 300s TTL 覆盖多实例事件去重
+- **跨实例锁诊断 API**: getDeadlockReport() 输出持锁堆栈、预警级别、PID 等信息
