@@ -367,6 +367,125 @@ const redis = new Redis({
 | 单点故障风险 | 无（每个实例独立） | 有（Sentinel 集群需≥3节点） |
 | 适用场景 | 单实例部署 | 多实例高可用部署 |
 
+#### 3.2.4 Sentinel quorum 多机房 5 票配置
+
+**现状分析**:
+- Jellyseerr 代码未集成 Redis，配置文件也无 Sentinel 相关配置
+- `ioredis` 仅在 `TypeORM` 的 `peerDependencies` 中声明，为可选依赖
+- **所有限流、锁、幂等操作均为纯内存实现**
+
+**多机房 Sentinel 5 票部署架构（建议）**:
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                       机房 A (cn-sh-1)                             │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐   │
+│  │ Sentinel #1  │   │ Sentinel #2  │   │  Redis Master        │   │
+│  │ quorum vote  │   │ quorum vote  │   │  (读写主节点)         │   │
+│  │              │   │              │   │  rate_limit:tmdb     │   │
+│  └──────────────┘   └──────────────┘   │  lock:async:12345    │   │
+│                                         │  idem:event:xxx      │   │
+│                                         └──────────────────────┘   │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │ 复制同步
+┌────────────────────────────────┼──────────────────────────────────┐
+│                       机房 B (cn-sh-2)       │                    │
+│  ┌──────────────┐   ┌──────────────┐        ▼                    │
+│  │ Sentinel #3  │   │ Sentinel #4  │   ┌──────────────────────┐   │
+│  │ quorum vote  │   │ quorum vote  │   │  Redis Replica #1    │   │
+│  │              │   │              │   │  (只读副本)           │   │
+│  └──────────────┘   └──────────────┘   └──────────────────────┘   │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │
+┌────────────────────────────────┼──────────────────────────────────┐
+│                       机房 C (cn-bj-1)       │                    │
+│  ┌──────────────┐                       ▼                         │
+│  │ Sentinel #5  │              ┌──────────────────────┐          │
+│  │ quorum vote  │ (仲裁节点)    │  Redis Replica #2    │          │
+│  │              │ 不存数据       │  (只读副本)           │          │
+│  └──────────────┘              └──────────────────────┘          │
+└───────────────────────────────────────────────────────────────────┘
+
+   ★ 5 Sentinel 节点，quorum = 3 (多数派)
+   ★ 任意 2 个机房故障，剩余 3 节点仍可选举新 Master
+```
+
+**配置位置（建议新增 server/config/redis.ts）**:
+```typescript
+// server/config/redis.ts
+export interface RedisSentinelConfig {
+  sentinels: Array<{ host: string; port: number }>;
+  name: string;           // Master 名称
+  quorum: number;         // 选举法定票数（建议 5 节点时 = 3）
+  password?: string;
+  db?: number;            // 默认 db=0
+
+  // 键前缀隔离（多环境共用一个 Redis 时使用）
+  keyPrefix?: 'jellyseerr:prod:' | 'jellyseerr:staging:' | 'jellyseerr:dev:';
+}
+
+export const DEFAULT_REDIS_CONFIG: RedisSentinelConfig = {
+  sentinels: [
+    // 机房 A
+    { host: process.env.REDIS_SENTINEL_1 || 'redis-sentinel-1.local', port: 26379 },
+    { host: process.env.REDIS_SENTINEL_2 || 'redis-sentinel-2.local', port: 26379 },
+    // 机房 B
+    { host: process.env.REDIS_SENTINEL_3 || 'redis-sentinel-3.local', port: 26379 },
+    { host: process.env.REDIS_SENTINEL_4 || 'redis-sentinel-4.local', port: 26379 },
+    // 机房 C（仲裁节点）
+    { host: process.env.REDIS_SENTINEL_5 || 'redis-sentinel-5.local', port: 26379 },
+  ],
+  name: process.env.REDIS_MASTER_NAME || 'jellyseerr-master',
+  quorum: 3,  // ⚠️ 5 节点集群必须 ≥3，避免脑裂
+  db: Number(process.env.REDIS_DB || 0),
+  keyPrefix: (process.env.NODE_ENV === 'production'
+    ? 'jellyseerr:prod:'
+    : process.env.NODE_ENV === 'staging'
+      ? 'jellyseerr:staging:'
+      : 'jellyseerr:dev:') as any,
+};
+
+// ioredis Sentinel 连接
+export function createRedisClient(config: RedisSentinelConfig): Redis {
+  return new Redis({
+    sentinels: config.sentinels,
+    name: config.name,
+    password: config.password,
+    db: config.db,
+    keyPrefix: config.keyPrefix,
+
+    // Sentinel 故障转移期间自动重试
+    enableReadyCheck: true,
+    maxRetriesPerRequest: 3,
+    retryDelayOnFailover: 100,     // 故障转移期间 100ms 延迟重试
+    sentinelRetryStrategy: (times) => Math.min(times * 10, 1000),
+    reconnectOnError: (err) => {
+      // 仅在 READONLY 错误时自动重连到新 Master
+      return err.message.includes('READONLY');
+    },
+  });
+}
+```
+
+**quorum 法定票数配置原则**:
+```
+Sentinel 节点数 | 推荐 quorum | 可容忍故障节点
+----------------|------------|----------------
+       1        |     1      |      0 （不可用于生产）
+       3        |     2      |      1
+       5        |     3      |      2  ⭐ Jellyseerr 多机房推荐
+       7        |     4      |      3
+```
+
+**键命名空间（多环境共享 Redis）**:
+```
+jellyseerr:prod:rate_limit:tmdb          # 生产限流令牌桶
+jellyseerr:prod:lock:async:12345          # 生产分布式锁
+jellyseerr:prod:idem:event:media:888      # 生产幂等键
+jellyseerr:staging:rate_limit:tmdb        # 预发限流令牌桶
+jellyseerr:dev:lock:async:12345           # 开发锁
+```
+
 ---
 
 ### 3.3 AsyncLock 死锁检测机制
@@ -705,6 +824,264 @@ Response:
 2. 配置本地 NTP 服务器（`ntpd -qg` 启动时强制校时）
 3. 监控 `ntpq -p` offset 值，超过 5s 告警
 4. Redis 服务器与应用实例使用同一 NTP 源
+
+#### 3.3.4 漂移超 5min 后 Lease-Based Lock 降级路径
+
+**问题背景**:
+分布式锁的典型 TTL 为 30s，但是以下场景会导致锁**持有时间远超 TTL**：
+- 请求处理函数内部调用同步阻塞 API（如 Plex 慢查询，耗时 60s+）
+- Node.js GC STW 停顿（大内存实例可达 5s-10s）
+- 网络分区导致 Redis 不可达，`tryLock` 超时但业务逻辑仍在执行
+- 事件循环阻塞（密集计算阻塞 I/O）
+
+如果处理函数还在执行但锁已经被其他实例抢占，就会出现**两个实例同时操作同一份数据**的严重冲突。
+
+**源码现状** (`server/utils/asyncLock.ts:1-54`):
+```typescript
+// ❌ 当前实现无锁续约机制：TTL 30s 到了自动过期
+const acquired = await this.redis.set(
+  this.REDIS_KEY_PREFIX + skey,
+  lockValue,
+  'PX',
+  this.DEADLOCK_THRESHOLD,  // 固定 30s TTL，无法续约
+  'NX'
+);
+```
+
+**Lease-Based 锁续约 + 降级路径（建议改造）**:
+
+```typescript
+// server/utils/asyncLock.ts - 扩展实现
+
+interface LeaseLockOptions {
+  ttlMs: number;                    // 初始租约 TTL（默认 30s）
+  renewIntervalMs: number;          // 续约间隔（默认 ttlMs / 3 = 10s）
+  maxRenewals: number;              // 最大续约次数（默认 12 次 = 最大持有 6 分钟）
+  driftGraceMs: number;             // 漂移宽限期（5 分钟）
+  onMaxRenewalsReached?: () => void;  // 续约耗尽回调
+}
+
+class LeaseBasedAsyncLock {
+  private readonly DEFAULT_OPTIONS: LeaseLockOptions = {
+    ttlMs: 30000,           // 30s 初始租约
+    renewIntervalMs: 10000, // 每 10s 续约一次
+    maxRenewals: 12,        // 最多续约 12 次 = 最大 6 分钟
+    driftGraceMs: 5 * 60 * 1000,  // 5 分钟漂移宽限
+  };
+
+  // 活跃锁续约定时器
+  private activeLocks = new Map<string, {
+    leaseValue: string;
+    renewalTimer: NodeJS.Timeout;
+    renewalCount: number;
+    startedAt: number;
+    key: string;
+  }>();
+
+  public async dispatchWithLease<T>(
+    key: string,
+    callback: () => Promise<T>,
+    options?: Partial<LeaseLockOptions>
+  ): Promise<T> {
+    const opts = { ...this.DEFAULT_OPTIONS, ...options };
+    const skey = String(key);
+    const leaseValue = `${process.pid}:${this.instanceId}:${Date.now()}:${Math.random()}`;
+
+    // 1. 获取初始租约
+    const acquired = await this.redis.set(
+      this.REDIS_KEY_PREFIX + skey,
+      leaseValue,
+      'PX',
+      opts.ttlMs,
+      'NX'
+    );
+
+    if (acquired !== 'OK') {
+      // 锁被他人持有，检查是否漂移超 5 分钟
+      const existing = await this.redis.get(this.REDIS_KEY_PREFIX + skey);
+      if (existing) {
+        const [, , startedAtStr] = existing.split(':');
+        const heldMs = Date.now() - Number(startedAtStr);
+
+        if (heldMs > opts.driftGraceMs) {
+          // ⚠️ 漂移超 5 分钟：进入降级路径
+          return this.handleLockDrift(key, existing, heldMs, callback, opts);
+        }
+      }
+
+      throw new Error(`Lock contention: ${key}`);
+    }
+
+    // 2. 启动续约定时器（看门狗模式）
+    const renewalTimer = setInterval(async () => {
+      try {
+        const lockInfo = this.activeLocks.get(skey);
+        if (!lockInfo) return;
+
+        // 续约上限检查
+        if (lockInfo.renewalCount >= opts.maxRenewals) {
+          logger.warn('Lock max renewals reached, forcing release', {
+            label: 'AsyncLock',
+            key: skey,
+            heldMs: Date.now() - lockInfo.startedAt,
+            fingerprint: ['lease-lock-max-renewals', skey],
+          });
+
+          opts.onMaxRenewalsReached?.();
+          this.internalRelease(skey, leaseValue);
+          return;
+        }
+
+        // 原子续约：只有持有者才能续约
+        const script = `
+          if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+          else
+            return 0
+          end
+        `;
+        const renewed = await this.redis.eval(
+          script,
+          1,
+          this.REDIS_KEY_PREFIX + skey,
+          leaseValue,
+          String(opts.ttlMs)
+        );
+
+        if (renewed === 1) {
+          lockInfo.renewalCount++;
+          logger.debug('Lock lease renewed', {
+            label: 'AsyncLock',
+            key: skey,
+            renewalCount: lockInfo.renewalCount,
+          });
+        } else {
+          // 续约失败：锁可能已被他人抢占
+          clearInterval(lockInfo.renewalTimer);
+          this.activeLocks.delete(skey);
+          logger.warn('Lock lease renewal failed, lock may be lost', {
+            label: 'AsyncLock',
+            key: skey,
+            fingerprint: ['lease-lock-renewal-failed', skey],
+          });
+        }
+      } catch (e) {
+        logger.error('Lock renewal error', {
+          label: 'AsyncLock',
+          key: skey,
+          errorMessage: e.message,
+          fingerprint: ['lease-lock-renewal-error', skey, e.code || 'unknown'],
+        });
+      }
+    }, opts.renewIntervalMs);
+
+    // 记录活跃锁信息
+    this.activeLocks.set(skey, {
+      leaseValue,
+      renewalTimer,
+      renewalCount: 0,
+      startedAt: Date.now(),
+      key: skey,
+    });
+
+    try {
+      return await callback();
+    } finally {
+      await this.internalRelease(skey, leaseValue);
+    }
+  }
+
+  // 漂移超 5 分钟降级路径
+  private async handleLockDrift<T>(
+    key: string,
+    existingLockValue: string,
+    heldMs: number,
+    callback: () => Promise<T>,
+    opts: LeaseLockOptions
+  ): Promise<T> {
+    const [remotePid, remoteInstanceId, startedAtStr] = existingLockValue.split(':');
+
+    logger.warn('Lock drift detected (>5min), entering fallback', {
+      label: 'AsyncLock',
+      key,
+      heldMs,
+      remotePid,
+      remoteInstanceId,
+      fingerprint: ['lease-lock-drift', key, `held:${Math.floor(heldMs / 1000)}s`],
+    });
+
+    // 降级策略选择
+    const strategy = this.selectDriftFallbackStrategy(heldMs);
+
+    switch (strategy) {
+      case 'FORCE_OVERRIDE':
+        // P0 紧急：强制抢占锁（风险最高）
+        logger.warn('Drift strategy: FORCE_OVERRIDE', { label: 'AsyncLock', key });
+        await this.redis.del(this.REDIS_KEY_PREFIX + key);
+        return this.dispatchWithLease(key, callback, opts);
+
+      case 'WAIT_AND_RETRY':
+        // P1 等待：最多再等 30s，看锁是否自动释放
+        logger.warn('Drift strategy: WAIT_AND_RETRY', { label: 'AsyncLock', key });
+        for (let i = 0; i < 6; i++) {
+          await this.delay(5000);
+          const stillExists = await this.redis.exists(this.REDIS_KEY_PREFIX + key);
+          if (!stillExists) {
+            return this.dispatchWithLease(key, callback, opts);
+          }
+        }
+        throw new Error(`Lock drift: lock ${key} still held after additional 30s wait`);
+
+      case 'MEMORY_FALLBACK':
+        // P2 降级：改用进程内锁 + 告警（仅单实例有效）
+        logger.warn('Drift strategy: MEMORY_FALLBACK', { label: 'AsyncLock', key });
+        return this.dispatchLocal(key, callback);  // 回退到最初的 EventEmitter 实现
+
+      case 'BLOCK_AND_ALERT':
+      default:
+        // P3 最安全：拒绝执行，仅告警（避免数据损坏）
+        logger.error('Drift strategy: BLOCK_AND_ALERT', {
+          label: 'AsyncLock',
+          key,
+          fingerprint: ['lease-lock-blocked', key],
+        });
+        throw new Error(`Lock drift blocked for safety: ${key} held ${heldMs}ms`);
+    }
+  }
+
+  // 漂移持续时间 → 降级策略映射
+  private selectDriftFallbackStrategy(heldMs: number):
+    | 'FORCE_OVERRIDE'
+    | 'WAIT_AND_RETRY'
+    | 'MEMORY_FALLBACK'
+    | 'BLOCK_AND_ALERT' {
+    if (heldMs > 30 * 60 * 1000) return 'FORCE_OVERRIDE';   // > 30 分钟：强制覆盖
+    if (heldMs > 15 * 60 * 1000) return 'WAIT_AND_RETRY';     // 15-30 分钟：等待+重试
+    if (heldMs > 5 * 60 * 1000)  return 'MEMORY_FALLBACK';   // 5-15 分钟：降级内存锁
+    return 'BLOCK_AND_ALERT';                                 // 刚刚超过 5 分钟：最保守
+  }
+}
+```
+
+**漂移降级状态机**:
+```
+正常获取锁 (30s TTL)
+    │
+    ├─ ✅ 每 10s 续约成功 → 最多续约 12 次（6 分钟）
+    │   │
+    │   └─ 6 分钟后仍未完成 → onMaxRenewalsReached → 强制释放 + 告警
+    │
+    └─ ❌ 续约失败（网络/Redis 故障）
+        │
+        ├─ 锁 TTL 内恢复 → 继续执行，数据安全
+        │
+        └─ 锁 TTL 过期（30s）但业务仍在执行
+            │
+            ├─ < 5min → BLOCK_AND_ALERT（安全拒绝）
+            ├─ 5-15min → MEMORY_FALLBACK（降级进程内锁）
+            ├─ 15-30min → WAIT_AND_RETRY（等待 30s 重试）
+            └─ > 30min → FORCE_OVERRIDE（强制抢占锁）
+```
 
 ### 3.4 异步锁 (AsyncLock) 使用场景
 
@@ -1443,6 +1820,189 @@ await queryRunner.query(`
 `);
 ```
 
+#### 5.5.8 v0 老插件迁移指引
+
+**v0 插件特征识别**（Settings Migrator 中自动检测）:
+
+```typescript
+// server/lib/settings/migrations/015-migrate-v0-plugins.ts
+
+interface V0PluginLegacyConfig {
+  // v0 时代特征：无 agentKey，只有一个通用的 enabled + url
+  enabled: boolean;
+  webhookUrl?: string;        // v0 webhook 通用字段
+  discordWebhookUrl?: string; // v0 discord 直接在根级别
+  slackWebhookUrl?: string;   // v0 slack 单独字段
+  telegramBotToken?: string;  // v0 telegram 分散字段
+  emailHost?: string;         // v0 email SMTP 配置分散
+  apiKey?: string;            // v0 pushbullet/pushover 在根级
+}
+
+export default async function migrateV0Plugins(
+  settings: AllSettings
+): Promise<AllSettings> {
+  const migrated = { ...settings };
+
+  // 检测是否为 v0 配置（无 notifications.agents 结构）
+  const isV0 = !migrated.notifications ||
+    Object.keys(migrated.notifications).length === 0 ||
+    !migrated.notifications.agents;
+
+  if (!isV0) return settings;  // 已是 v1+ 配置
+
+  logger.info('Detected v0 notification config, migrating...', {
+    label: 'Settings Migrator',
+  });
+
+  // 迁移 1: v0 discordWebhookUrl → notifications.discord
+  if (migrated['discordWebhookUrl'] && migrated['discordEnabled']) {
+    migrated.notifications[NotificationAgentKey.DISCORD] = {
+      enabled: true,
+      types: 0,  // 全部通知
+      embedPoster: true,
+      options: {
+        webhookUrl: migrated['discordWebhookUrl'],
+        botUsername: 'Jellyseerr',
+        locale: 'en',
+      },
+    };
+    delete migrated['discordWebhookUrl'];
+    delete migrated['discordEnabled'];
+    logger.info('Migrated v0 Discord plugin → v1', {
+      label: 'Settings Migrator',
+    });
+  }
+
+  // 迁移 2: v0 slack → notifications.slack
+  if (migrated['slackWebhookUrl'] && migrated['slackEnabled']) {
+    migrated.notifications[NotificationAgentKey.SLACK] = {
+      enabled: true,
+      types: 0,
+      embedPoster: true,
+      options: {
+        webhookUrl: migrated['slackWebhookUrl'],
+        username: 'Jellyseerr',
+        locale: 'en',
+      },
+    };
+    delete migrated['slackWebhookUrl'];
+    delete migrated['slackEnabled'];
+  }
+
+  // 迁移 3: v0 email SMTP → notifications.email
+  if (migrated['emailHost']) {
+    migrated.notifications[NotificationAgentKey.EMAIL] = {
+      enabled: migrated['emailEnabled'] ?? true,
+      types: 0,
+      embedPoster: false,
+      options: {
+        smtpHost: migrated['emailHost'],
+        smtpPort: migrated['emailPort'] ?? 587,
+        smtpSecure: migrated['emailSecure'] ?? true,
+        smtpUser: migrated['emailUser'] ?? '',
+        smtpFrom: migrated['emailFrom'] ?? 'jellyseerr@localhost',
+        recipientEmail: migrated['emailRecipient'] ?? '',
+        locale: 'en',
+      },
+    };
+    ['emailHost', 'emailPort', 'emailSecure', 'emailUser', 'emailFrom', 'emailRecipient', 'emailEnabled']
+      .forEach(k => delete migrated[k]);
+  }
+
+  // 迁移 4: v0 pushover/pushbullet/telegram 等单字段 Agent
+  const singleFieldMigrations = [
+    { legacyKey: 'pushoverUserKey', agentKey: NotificationAgentKey.PUSHOVER, optionField: 'userToken' },
+    { legacyKey: 'pushbulletAccessToken', agentKey: NotificationAgentKey.PUSHBULLET, optionField: 'accessToken' },
+    { legacyKey: 'telegramBotToken', agentKey: NotificationAgentKey.TELEGRAM, optionField: 'botToken' },
+    { legacyKey: 'gotifyUrl', agentKey: NotificationAgentKey.GOTIFY, optionField: 'serverUrl' },
+    { legacyKey: 'ntfyUrl', agentKey: NotificationAgentKey.NTFY, optionField: 'url' },
+  ];
+
+  for (const { legacyKey, agentKey, optionField } of singleFieldMigrations) {
+    if (migrated[legacyKey]) {
+      migrated.notifications[agentKey] = {
+        enabled: migrated[`${legacyKey.replace(/[A-Z].*/, '')}Enabled`] ?? true,
+        types: 0,
+        embedPoster: true,
+        options: {
+          [optionField]: migrated[legacyKey],
+          locale: migrated['locale'] ?? 'en',
+          ...(agentKey === NotificationAgentKey.NTFY && { topic: migrated['ntfyTopic'] ?? '' }),
+          ...(agentKey === NotificationAgentKey.TELEGRAM && { chatId: migrated['telegramChatId'] ?? '' }),
+        },
+      };
+      delete migrated[legacyKey];
+      delete migrated[`${legacyKey.replace(/[A-Z].*/, '')}Enabled`];
+      logger.info(`Migrated v0 ${agentKey} plugin → v1`, {
+        label: 'Settings Migrator',
+      });
+    }
+  }
+
+  // 迁移 5: v0 自定义 webhook → notifications.webhook
+  if (migrated['webhookUrl']) {
+    migrated.notifications[NotificationAgentKey.WEBHOOK] = {
+      enabled: migrated['webhookEnabled'] ?? true,
+      types: 0,
+      embedPoster: false,
+      options: {
+        webhookUrl: migrated['webhookUrl'],
+        method: migrated['webhookMethod'] ?? 'POST',
+        jsonPayload: migrated['webhookPayload'] ?? '{"text":"{{message}}"}',
+        customHeaders: [],
+        authHeader: '',
+        locale: 'en',
+      },
+    };
+    ['webhookUrl', 'webhookEnabled', 'webhookMethod', 'webhookPayload']
+      .forEach(k => delete migrated[k]);
+  }
+
+  // 记录迁移版本（幂等标记）
+  migrated._migrationFlags = {
+    ...(migrated._migrationFlags || {}),
+    v0PluginsMigrated: true,
+    migratedAt: new Date().toISOString(),
+  };
+
+  logger.info('v0 plugin migration complete', {
+    label: 'Settings Migrator',
+    migratedCount: Object.keys(migrated.notifications).filter(
+      k => migrated.notifications[k]?.enabled
+    ).length,
+    fingerprint: ['settings-migration-v0-plugins'],
+  });
+
+  return migrated;
+}
+```
+
+**v0 插件迁移决策表**:
+| v0 配置形态 | 检测方式 | 迁移到 v1 位置 | 失败回退 |
+|------------|---------|----------------|---------|
+| `discordWebhookUrl` 根级字段 | `settings['discordWebhookUrl'] !== undefined` | `notifications.discord.options.webhookUrl` | 保留旧字段，日志告警 |
+| `slackWebhookUrl` 根级字段 | `settings['slackWebhookUrl'] !== undefined` | `notifications.slack.options.webhookUrl` | 同上 |
+| `emailHost` + `emailPort` 分散 | `settings['emailHost'] !== undefined` | `notifications.email.options.smtpHost` | 同上 |
+| `pushoverUserKey` 单字段 | `settings['pushoverUserKey'] !== undefined` | `notifications.pushover.options.userToken` | 同上 |
+| `webhookUrl` + JSON Payload | `settings['webhookUrl'] !== undefined` | `notifications.webhook.options.*` | 同上 |
+| 未知插件/自定义脚本 | 不在上述列表内 | `plugins/notifications/` 手动迁移 | 生成迁移报告 |
+
+**迁移验证脚本（生产发布前 dry-run）**:
+```bash
+# 先备份
+cp /config/settings.json /config/settings.json.bak
+
+# dry-run 模式验证迁移
+node -e "
+const { runMigrations } = require('./server/lib/settings/migrator');
+const settings = require('/config/settings.json');
+const result = runMigrations(settings, '/tmp/settings-test.json');
+console.log(JSON.stringify(result._migrationFlags, null, 2));
+"
+# 验证迁移后所有 v0 根级字段已清理
+grep -c '"discordWebhookUrl"' /tmp/settings-test.json  # 应为 0
+```
+
 ---
 
 ## 六、回执处理与状态回写
@@ -1952,6 +2512,196 @@ await systemSettingsRepository.save({
 });
 ```
 
+#### 6.4.4 4K Batch Backfill 重试间隔策略
+
+**问题背景**:
+回填过程中 *arr 服务可能暂时不可用（重启、限流、网络抖动），如果简单粗暴地立即重试会：
+1. 触发 *arr 的 429 限流保护
+2. 打满数据库连接池
+3. 长时间阻塞回填作业
+
+**源码中的指数退避依赖**:
+- `pnpm-lock.yaml` 中 `exponential-backoff@3.1.3` 是 `node-gyp` 的传递依赖，但 Jellyseerr 核心代码**未直接使用**
+- 当前重试逻辑仅在 `customProxyAgent.ts:104-121` 中通过 catch + fallback 隐式处理
+
+**Backfill 重试间隔算法（建议基于 exponential-backoff 改造）**:
+
+```typescript
+// server/jobs/backfill4kFields.ts - 重试策略
+import { backOff } from 'exponential-backoff';
+
+class Backfill4kFieldsJob {
+  private readonly BATCH_SIZE = 100;
+  private readonly INTER_BATCH_DELAY_MS = 1000;  // 批次间基础间隔 1s
+
+  // 单媒体重试配置
+  private readonly RETRY_CONFIG = {
+    numOfAttempts: 5,           // 最多重试 5 次
+    startingDelay: 2000,        // 首次等待 2s
+    timeMultiple: 2,            // 指数倍数：2s → 4s → 8s → 16s → 32s
+    maxDelay: 30000,            // 最大等待 30s
+    jitter: 'full' as const,    // 全抖动，避免惊群效应
+    retry: (e: any, attemptNumber: number) => {
+      // 只对特定错误重试
+      const retryable = [
+        'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED',  // 网络错误
+        '429', '500', '502', '503', '504',          // HTTP 可重试错误
+        'EPIPE', 'ENOTFOUND',
+      ];
+      const shouldRetry = retryable.some(code =>
+        e.message?.includes(code) || e.code === code
+      );
+
+      logger.debug('Backfill retry decision', {
+        label: 'Backfill4k',
+        attemptNumber,
+        shouldRetry,
+        errorCode: e.code,
+      });
+
+      return shouldRetry;
+    },
+  };
+
+  // 批次级重试配置
+  private readonly BATCH_RETRY_CONFIG = {
+    numOfAttempts: 3,
+    startingDelay: 5000,    // 批次重试首次等 5s
+    timeMultiple: 2.5,     // 5s → 12.5s → 31.25s
+    maxDelay: 60000,       // 最大 60s
+  };
+
+  public async run(): Promise<BackfillReport> {
+    // ...
+
+    let offset = 0;
+    let mediaBatch: Media[];
+    let consecutiveFailures = 0;
+    const CIRCUIT_BREAKER_THRESHOLD = 5;  // 连续 5 批失败触发熔断
+
+    do {
+      try {
+        // 批次级重试：整批失败时退避重试
+        mediaBatch = await backOff(async () => {
+          return await mediaRepository
+            .createQueryBuilder('media')
+            // ... 查询逻辑
+            .skip(offset)
+            .take(this.BATCH_SIZE)
+            .getMany();
+        }, this.BATCH_RETRY_CONFIG);
+
+        report.totalMedia += mediaBatch.length;
+
+        // 媒体级重试：单个媒体失败不影响整批
+        for (const media of mediaBatch) {
+          try {
+            await backOff(
+              () => this.backfillMedia4kStatus(media, radarrServers, sonarrServers, report),
+              this.RETRY_CONFIG
+            );
+            report.processedMedia++;
+          } catch (e) {
+            // 单媒体最终失败：记录但不中断
+            report.errors.push({
+              tmdbId: media.tmdbId,
+              error: e.message,
+              attempts: this.RETRY_CONFIG.numOfAttempts,
+            });
+            logger.error('Media backfill permanently failed after retries', {
+              label: 'Backfill4k',
+              tmdbId: media.tmdbId,
+              errorMessage: e.message,
+              fingerprint: ['backfill-4k-media-failed', String(media.tmdbId)],
+            });
+          }
+        }
+
+        // 批次成功：重置熔断计数器
+        consecutiveFailures = 0;
+
+        // 动态批次间隔（根据最近失败率调整）
+        const adaptiveDelay = this.getAdaptiveInterBatchDelay(report);
+        await this.delay(adaptiveDelay);
+
+      } catch (e) {
+        // 批次级最终失败
+        consecutiveFailures++;
+        logger.error('Batch backfill permanently failed', {
+          label: 'Backfill4k',
+          offset,
+          consecutiveFailures,
+          errorMessage: e.message,
+          fingerprint: ['backfill-4k-batch-failed', String(offset)],
+        });
+
+        // 熔断：连续 5 批失败则停止回填
+        if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+          logger.fatal('Backfill circuit breaker triggered, aborting', {
+            label: 'Backfill4k',
+            failedBatches: consecutiveFailures,
+            fingerprint: ['backfill-4k-circuit-breaker'],
+          });
+          throw new Error('Backfill aborted: too many consecutive batch failures');
+        }
+      }
+
+      offset += this.BATCH_SIZE;
+    } while (mediaBatch.length > 0);
+
+    return report;
+  }
+
+  // 动态批次间延迟：最近批次失败率越高，延迟越长
+  private getAdaptiveInterBatchDelay(report: BackfillReport): number {
+    const totalProcessed = report.processedMedia + report.errors.length;
+    if (totalProcessed === 0) return this.INTER_BATCH_DELAY_MS;
+
+    const failureRate = report.errors.length / totalProcessed;
+
+    if (failureRate > 0.3) return this.INTER_BATCH_DELAY_MS * 10;  // 30%+ 失败：10s
+    if (failureRate > 0.15) return this.INTER_BATCH_DELAY_MS * 5;  // 15%+ 失败：5s
+    if (failureRate > 0.05) return this.INTER_BATCH_DELAY_MS * 2;  // 5%+ 失败：2s
+    return this.INTER_BATCH_DELAY_MS;                                 // 正常：1s
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+```
+
+**重试退避时间序列示例**:
+```
+单媒体 5 次重试（指数 + 全抖动）:
+  第 1 次重试: 2s ± 1s = 1-3s
+  第 2 次重试: 4s ± 2s = 2-6s
+  第 3 次重试: 8s ± 4s = 4-12s
+  第 4 次重试: 16s ± 8s = 8-24s
+  第 5 次重试: 30s (封顶) ± 15s = 15-45s
+  累计最大等待: ~90s
+
+批次 3 次重试（指数 2.5×）:
+  第 1 次重试: 5s
+  第 2 次重试: 12.5s
+  第 3 次重试: 31.25s (约 31s)
+  累计最大等待: ~49s
+
+熔断触发路径:
+  批次1失败 → consecutiveFailures=1
+  批次2失败 → consecutiveFailures=2
+  批次3失败 → consecutiveFailures=3
+  批次4失败 → consecutiveFailures=4
+  批次5失败 → consecutiveFailures=5 ≥ CIRCUIT_BREAKER_THRESHOLD=5 → 触发熔断，终止回填
+```
+
+**回退优先级**（从低风险到高风险）:
+1. ✅ **指数退避 + 抖动**（默认）：对瞬时故障最友好
+2. ✅ **动态批次延迟**：根据失败率自适应
+3. ⚠️ **批次级重试**：整批查询失败时使用
+4. ⚠️ **媒体级重试**：单个媒体失败不阻塞全局
+5. ❌ **熔断终止**：连续 5 批失败才触发，避免无限重试
+
 ---
 
 ### 6.5 异步非阻塞背压控制
@@ -2366,6 +3116,217 @@ abstract class BaseScanner<T> {
 - 系统空闲时：水位上移，减少不必要的降速
 - 系统繁忙时：水位下移，提前触发降速保护
 - 长期稳定后：水位收敛到适合当前负载的最优值
+
+#### 6.5.5 动态水位 EMA 系数 0.3 是否暴露配置
+
+**EMA α=0.3 的含义**:
+```
+EWMA_new = α × current_value + (1 - α) × EWMA_old
+        = 0.3 × current + 0.7 × old
+
+含义：当前批次权重 = 30%，历史值权重 = 70%
+等效窗口 ≈ 2/α - 1 = 2/0.3 - 1 ≈ 5.7 批（约 6 批的移动平均）
+```
+
+**不同 α 值的响应灵敏度对比**:
+
+| α 值 | 当前批次权重 | 历史权重 | 等效窗口（批次数） | 响应速度 | 平滑度 | 适用场景 |
+|-----|------------|---------|----------------|---------|-------|---------|
+| 0.1 | 10% | 90% | 19 批 | 慢 | 非常平滑 | 稳定生产环境，避免频繁调整 |
+| 0.2 | 20% | 80% | 9 批 | 较慢 | 平滑 | 默认保守配置 |
+| **0.3** | **30%** | **70%** | **~6 批** | **适中** | **适中** | **⭐ Jellyseerr 默认** |
+| 0.5 | 50% | 50% | 3 批 | 快 | 一般 | 测试环境，快速响应变化 |
+| 0.8 | 80% | 20% | 1.5 批 | 非常快 | 不平滑 | 实验场景，极端灵敏度 |
+
+**现状分析**:
+- 代码中 `EWMA_ALPHA = 0.3` 为硬编码常量，**未暴露给用户配置**
+- `server/lib/settings/index.ts` 中无扫描器参数配置项
+- `server/routes/settings/index.ts` 的 Jobs API 只支持配置 cron schedule，不支持高级参数
+
+**配置暴露设计（建议新增）**:
+
+```typescript
+// server/lib/settings/index.ts - 扩展 ScannerTuningConfig
+export interface ScannerTuningConfig {
+  // EMA 平滑系数：0.1（慢）~ 0.8（快），默认 0.3
+  ewmaAlpha: number;
+
+  // 建立基准线需要的批次数：5 ~ 50，默认 10
+  baselineWindowBatches: number;
+
+  // 批次大小：10 ~ 500，默认 100
+  batchSize: number;
+
+  // 批次间基础延迟（ms）：0 ~ 10000，默认 4000
+  baseInterBatchDelayMs: number;
+
+  // 慢批次判定倍数（EWMA 的 N 倍）：1.5 ~ 5.0，默认 2.0
+  slowBatchMultiplier: number;
+
+  // 动态水位调整开关
+  dynamicWatermarkEnabled: boolean;
+}
+
+// 默认值
+export const DEFAULT_SCANNER_TUNING: ScannerTuningConfig = {
+  ewmaAlpha: 0.3,
+  baselineWindowBatches: 10,
+  batchSize: 100,
+  baseInterBatchDelayMs: 4000,
+  slowBatchMultiplier: 2.0,
+  dynamicWatermarkEnabled: true,
+};
+
+// 配置校验（防止非法值）
+export function validateScannerTuning(config: Partial<ScannerTuningConfig>):
+  { valid: boolean; errors?: string[] } {
+  const errors: string[] = [];
+
+  if (config.ewmaAlpha !== undefined) {
+    if (config.ewmaAlpha < 0.05 || config.ewmaAlpha > 0.95) {
+      errors.push(`ewmaAlpha must be between 0.05 and 0.95, got ${config.ewmaAlpha}`);
+    }
+  }
+  if (config.baselineWindowBatches !== undefined) {
+    if (!Number.isInteger(config.baselineWindowBatches) ||
+        config.baselineWindowBatches < 5 || config.baselineWindowBatches > 50) {
+      errors.push(`baselineWindowBatches must be integer 5-50`);
+    }
+  }
+  // ... 其他字段校验
+
+  return { valid: errors.length === 0, errors };
+}
+```
+
+**BaseScanner 中应用配置**:
+```typescript
+// server/lib/scanners/baseScanner.ts
+abstract class BaseScanner<T> {
+  protected readonly config: ScannerTuningConfig;
+
+  constructor() {
+    this.config = {
+      ...DEFAULT_SCANNER_TUNING,
+      ...(getSettings().scannerTuning || {}),
+    };
+
+    // 应用配置值
+    this.EWMA_ALPHA = this.config.ewmaAlpha;
+    this.BASELINE_WINDOW = this.config.baselineWindowBatches;
+    this.bundleSize = this.config.batchSize;
+    this.updateRate = this.config.baseInterBatchDelayMs;
+  }
+}
+```
+
+**API 暴露** (`server/routes/settings/index.ts` 新增路由):
+```typescript
+// GET /api/v1/settings/jobs/tuning
+// 获取所有扫描器调优参数
+
+// PUT /api/v1/settings/jobs/tuning
+// 修改调优参数（需 admin 权限）
+settingsRoutes.put('/jobs/tuning', authMiddleware({ admin: true }), async (req, res) => {
+  const validation = validateScannerTuning(req.body);
+  if (!validation.valid) {
+    return res.status(400).json({ errors: validation.errors });
+  }
+
+  const settings = getSettings();
+  settings.scannerTuning = { ...settings.scannerTuning, ...req.body };
+  await settings.save();
+
+  // 热更新正在运行的扫描器（无需重启）
+  runningScanners.forEach(scanner => scanner.applyTuning(settings.scannerTuning));
+
+  return res.json(settings.scannerTuning);
+});
+```
+
+**配置 UI 建议提示文案**（i18n locale）:
+```json
+{
+  "settings.jobs.tuning.ewmaAlpha.label": "EMA 平滑系数 (α)",
+  "settings.jobs.tuning.ewmaAlpha.help": "值越小响应越慢但越平滑，值越大响应越快但易抖动。生产推荐 0.2-0.4，默认 0.3",
+  "settings.jobs.tuning.ewmaAlpha.warning": "低于 0.1 可能导致水位调整严重滞后，高于 0.6 可能引起频繁抖动"
+}
+```
+
+#### 6.5.6 Lease 超时 30s 与回放周期 60s 的关系
+
+**源码中的相关时间参数**:
+
+| 参数 | 值 | 位置 | 说明 |
+|-----|---|------|------|
+| Lease TTL (锁超时) | 30,000 ms | `asyncLock.ts:866` | Redis 锁自动过期时间 |
+| Lease 续约间隔 | 10,000 ms (TTL/3) | `asyncLock.ts:867` | `setInterval` 续约频率 |
+| 幂等键回放窗口 | 60,000 ms | `asyncLock.ts` / `MediaRequestSubscriber.ts` | `isDuplicateEvent` 去重窗口 |
+| AvailabilitySync 任务周期 | 3,600,000 ms (1h) | `settings/index.ts:589` | `'0 0 5 * * *'` 每日 5:00 |
+| Download Sync 周期 | 60,000 ms (1min) | `settings/index.ts:592` | `'0 * * * * *'` 每分钟 |
+| 扫描器心跳检查 | 1,800,000 ms (30min) | `schedule.ts:2668` | `setInterval` 每分钟检查 |
+| 4K 回填幂等窗口 | 86,400,000 ms (24h) | `backfill4kFields.ts:2500` | 每日只运行一次 |
+
+**Lease 30s vs 回放 60s 的安全关系**:
+
+```
+时间轴 (ms):
+0          10,000     20,000     30,000     40,000     50,000     60,000
+│            │           │           │           │           │           │
+│            │           │           │           │           │           │
+├─ 获取锁     ├─ 续约#1    ├─ 续约#2    ├─ TTL 过期  │           │           │
+│ (SET NX)    │ (PEXPIRE) │ (PEXPIRE) │ (若续约失败)│           │           │
+│            │           │           │           │           │           │
+│            ├────────── 3 次续约覆盖完整 30s TTL ──────────┤           │
+│                        (10s/次 × 3 次续约 ≈ 30s)                     │
+│                                                                      │
+└───────────────────── 幂等回放 60s 窗口 ──────────────────────────────┘
+                          (覆盖 2 个完整 TTL 周期，防止极端竞态)
+```
+
+**安全系数分析**:
+```
+回放窗口 / Lease TTL = 60s / 30s = 2× 安全系数
+
+即使发生以下极端情况，幂等键仍在有效期内：
+1. 第 29.9s 续约成功 → TTL 重置为 30s → 第 59.9s 才真正过期
+2. 期间发生 GC STW 8s → 续约延迟到 18s → 仍在 60s 窗口内
+3. Redis 主从切换 5s → 丢了一次续约 → 下次续约补上
+4. 网络抖动丢包 → 重试 3 次 → 累计 12s → 仍在 60s 内
+```
+
+**续约间隔 = TTL/3 的数学原理**:
+```
+设置续约间隔为 TTL/3 的目的：
+- 预留 2 次重试机会：即使丢失 1 次续约，下一次还有机会
+- 最坏情况下有 TTL/3 的时间用于重试和恢复
+- 续约不会过于频繁（减少 Redis 压力）
+- 也不会过于稀疏（降低锁过期风险）
+
+公式推导：
+  续约成功率 = p
+  N 次续约全部失败概率 = (1-p)³
+  当 p=0.9 时，全部失败概率 = 0.001 = 0.1%
+  当 p=0.8 时，全部失败概率 = 0.008 = 0.8%
+  当 p=0.7 时，全部失败概率 = 0.027 = 2.7%
+
+60s 回放窗口确保即使在 p=0.7 的恶劣网络下：
+  N=3 次续约全部失败 → 锁在 30s 过期
+  但回放窗口还剩 30s → 足以检测到冲突并告警
+```
+
+**如果回放窗口 < 2×TTL 的风险**:
+```
+如果回放窗口 = 25s，TTL = 30s：
+
+0s         10s         20s         30s
+│           │           │           │
+├─ 获取锁    ├─ 续约     ├─ 续约失败  ├─ 锁过期 + 回放键也过期！
+│                                               │
+│                                    新实例获取锁 → 无回放键保护 → 数据冲突！
+
+结论：回放窗口必须 ≥ 2×Lease TTL，建议 2-3 倍安全系数
+```
 
 ---
 
@@ -2926,6 +3887,355 @@ private async recordRollbackAudit(
 3. **DELETED 状态永不自动回滚**（需用户手动干预）
 4. **有活跃请求时 PROCESSING 降级不回滚**（保持降级状态，仅告警）
 
+#### 6.6.7 漂移降级每步成功判定指标
+
+**问题背景**:
+漂移降级是一个**多步骤、可观察**的流程。每一步执行完成后，需要有明确的指标来判定"是否真的成功"，而不是盲目执行下一步。如果某一步失败，需要停止后续步骤并保留当前状态，避免错误叠加。
+
+**降级执行流程与判定指标**:
+
+```
+Step 1: 候选媒体筛选
+    │
+    ├─ 成功判定指标：
+    │   ✓ 查询 SQL 成功执行无异常
+    │   ✓ 返回结果集非空（有漂移媒体需要处理）
+    │   ✓ 结果集大小在预期范围内（< 总媒体数的 10%）
+    │
+    └─ 失败判定：
+        ✗ SQL 超时或连接错误
+        ✗ 结果集 > 总媒体数 50%（可能是 SQL 条件错误，防止误降级大量媒体）
+
+Step 2: 单媒体状态判定（PROCESSING / PARTIALLY_AVAILABLE / DELETED）
+    │
+    ├─ 成功判定指标：
+    │   ✓ 能从 *arr API 查询到该媒体（无论状态）
+    │   ✓ 能从 Plex/Jellyfin API 查询到该媒体
+    │   ✓ 双源数据一致，或符合降级条件（PROCESSING 超时等）
+    │
+    └─ 失败判定：
+        ✗ *arr 和媒体服务器均查询失败（降级依据不足，跳过该媒体）
+        ✗ 双源数据矛盾（*arr 显示已下载但 Plex 无文件）→ 标记为可疑，不降级
+
+Step 3: 状态写入（UPDATE media SET status = ?）
+    │
+    ├─ 成功判定指标：
+    │   ✓ TypeORM save() 无异常抛出
+    │   ✓ 返回实体的 updatedAt 时间戳已更新
+    │   ✓ 状态字段确实被修改（从 PROCESSING → UNKNOWN）
+    │   ✓ 外部 serviceId 字段按规则保留或清空
+    │
+    └─ 失败判定：
+        ✗ 数据库唯一约束冲突
+        ✗ 保存超时
+        ✗ 乐观锁版本冲突（如果使用 version 字段）
+
+Step 4: 季级状态更新（仅 TV SHOW）
+    │
+    ├─ 成功判定指标：
+    │   ✓ 所有相关季的 status4k/status 均已更新
+    │   ✓ Season 表 updatedAt 与 Media 表 updatedAt 在 1s 内
+    │   ✓ lastSeasonChange 时间戳已刷新
+    │
+    └─ 失败判定：
+        ✗ 某些季更新失败（事务回滚整批）
+        ✗ 季状态与父级媒体状态不一致
+
+Step 5: 审计日志写入
+    │
+    ├─ 成功判定指标：
+    │   ✓ drift_rollback_log 表成功插入记录
+    │   ✓ Redis 幂等键已写入（24h TTL）
+    │   ✓ 告警事件已提交到告警总线
+    │
+    └─ 失败判定：
+        ✗ 日志写入失败（但状态已变更，只告警不回滚）
+        ✗ Redis 写入失败（降级为内存幂等）
+
+Step 6: 通知发送（可选，视严重程度）
+    │
+    ├─ 成功判定指标：
+    │   ✓ MEDIA_FAILED 通知（仅告警级）
+    │   ✓ 管理员通知成功发送
+    │
+    └─ 失败判定：
+        ✗ 通知发送失败（不影响降级结果，仅记录）
+```
+
+**每步成功判定代码实现**:
+
+```typescript
+// server/lib/availabilitySync.ts - 扩展实现
+
+interface DriftDegradationStepResult {
+  stepName: string;
+  success: boolean;
+  metrics: Record<string, number | boolean>;
+  durationMs: number;
+  errorMessage?: string;
+}
+
+interface DriftDegradationReport {
+  mediaId: number;
+  tmdbId: number;
+  startedAt: number;
+  endedAt?: number;
+  steps: DriftDegradationStepResult[];
+  overallSuccess: boolean;
+  finalStatus: MediaStatus | null;
+  finalStatus4k: MediaStatus | null;
+}
+
+private async executeDriftDegradationWithVerification(
+  media: Media,
+  is4k: boolean
+): Promise<DriftDegradationReport> {
+  const report: DriftDegradationReport = {
+    mediaId: media.id,
+    tmdbId: media.tmdbId,
+    startedAt: Date.now(),
+    steps: [],
+    overallSuccess: false,
+    finalStatus: null,
+    finalStatus4k: null,
+  };
+
+  const statusField = is4k ? 'status4k' : 'status';
+  const originalStatus = media[statusField];
+
+  // === Step 1: 验证降级条件 ===
+  const step1Start = Date.now();
+  try {
+    const { existsInArr, isDownloading, hasActiveRequest } =
+      await this.verifyDriftConditions(media, is4k);
+
+    const step1Success =
+      existsInArr === false ||               // *arr 中不存在
+      (isDownloading === false && hasActiveRequest === false);  // 没在下载且没活跃请求
+
+    report.steps.push({
+      stepName: 'verify_conditions',
+      success: step1Success,
+      metrics: { existsInArr, isDownloading, hasActiveRequest },
+      durationMs: Date.now() - step1Start,
+    });
+
+    if (!step1Success) {
+      logger.debug('Drift degradation aborted: conditions not met', {
+        label: 'AvailabilitySync',
+        tmdbId: media.tmdbId,
+        metrics: report.steps[0].metrics,
+      });
+      return report;  // 条件不满足，不降级
+    }
+  } catch (e) {
+    report.steps.push({
+      stepName: 'verify_conditions',
+      success: false,
+      metrics: {},
+      durationMs: Date.now() - step1Start,
+      errorMessage: e.message,
+    });
+    return report;
+  }
+
+  // === Step 2: 执行状态降级 ===
+  const step2Start = Date.now();
+  const preUpdateUpdatedAt = media.updatedAt?.getTime() || 0;
+
+  try {
+    // 降级：PROCESSING / PARTIALLY_AVAILABLE → UNKNOWN
+    const targetStatus = MediaStatus.UNKNOWN;
+    media[statusField] = targetStatus;
+
+    // 保留或清空外部 ID（根据 §6.4.2 规则）
+    const isMediaProcessing = await this.hasActiveApprovedRequest(media, is4k);
+    const idFields = is4k
+      ? ['serviceId4k', 'externalServiceId4k', 'ratingKey4k']
+      : ['serviceId', 'externalServiceId', 'ratingKey'];
+
+    for (const field of idFields) {
+      if (!isMediaProcessing) {
+        (media as any)[field] = null;
+      }
+      // else: 处理中保留原值（不做修改）
+    }
+
+    const saved = await mediaRepository.save(media);
+    const postUpdateUpdatedAt = saved.updatedAt?.getTime() || 0;
+
+    const step2Success =
+      saved[statusField] === targetStatus &&                      // 状态确实变更
+      postUpdateUpdatedAt > preUpdateUpdatedAt;                  // updatedAt 确实刷新
+
+    report.steps.push({
+      stepName: 'update_status',
+      success: step2Success,
+      metrics: {
+        originalStatus,
+        targetStatus,
+        savedStatus: saved[statusField],
+        updatedAtRefreshed: postUpdateUpdatedAt > preUpdateUpdatedAt,
+        serviceIdCleared: isMediaProcessing ? null : (saved as any)[idFields[0]] === null,
+      },
+      durationMs: Date.now() - step2Start,
+    });
+
+    if (!step2Success) {
+      logger.warn('Drift degradation: status update verification failed', {
+        label: 'AvailabilitySync',
+        tmdbId: media.tmdbId,
+        expectedStatus: targetStatus,
+        actualStatus: saved[statusField],
+        fingerprint: ['drift-degrade-step2-failed', String(media.tmdbId)],
+      });
+      return report;
+    }
+
+    report.finalStatus = !is4k ? targetStatus : report.finalStatus;
+    report.finalStatus4k = is4k ? targetStatus : report.finalStatus4k;
+
+  } catch (e) {
+    report.steps.push({
+      stepName: 'update_status',
+      success: false,
+      metrics: { originalStatus, targetStatus: MediaStatus.UNKNOWN },
+      durationMs: Date.now() - step2Start,
+      errorMessage: e.message,
+    });
+    return report;
+  }
+
+  // === Step 3: 季级状态同步（仅 TV SHOW）===
+  if (media.mediaType === MediaType.TV && media.seasons && media.seasons.length > 0) {
+    const step3Start = Date.now();
+    try {
+      let allSeasonsUpdated = true;
+      let seasonCount = 0;
+
+      for (const season of media.seasons) {
+        const seasonStatusField = is4k ? 'status4k' : 'status';
+        if (season[seasonStatusField] === MediaStatus.PROCESSING ||
+            season[seasonStatusField] === MediaStatus.PARTIALLY_AVAILABLE) {
+          season[seasonStatusField] = MediaStatus.UNKNOWN;
+          const savedSeason = await seasonRepository.save(season);
+          if (savedSeason[seasonStatusField] !== MediaStatus.UNKNOWN) {
+            allSeasonsUpdated = false;
+          }
+          seasonCount++;
+        }
+      }
+
+      // 刷新父级 lastSeasonChange
+      media.lastSeasonChange = new Date();
+      await mediaRepository.save(media);
+
+      report.steps.push({
+        stepName: 'sync_seasons',
+        success: allSeasonsUpdated,
+        metrics: { seasonsChecked: media.seasons.length, seasonsUpdated: seasonCount },
+        durationMs: Date.now() - step3Start,
+      });
+
+      if (!allSeasonsUpdated) {
+        logger.warn('Drift degradation: some seasons failed to update', {
+          label: 'AvailabilitySync',
+          tmdbId: media.tmdbId,
+          fingerprint: ['drift-degrade-step3-failed', String(media.tmdbId)],
+        });
+      }
+    } catch (e) {
+      report.steps.push({
+        stepName: 'sync_seasons',
+        success: false,
+        metrics: { seasonCount: media.seasons?.length || 0 },
+        durationMs: Date.now() - step3Start,
+        errorMessage: e.message,
+      });
+    }
+  }
+
+  // === Step 4: 审计日志 + 幂等键 ===
+  const step4Start = Date.now();
+  try {
+    const auditSaved = await this.recordDriftAudit({
+      mediaId: media.id,
+      is4k,
+      fromStatus: originalStatus,
+      toStatus: MediaStatus.UNKNOWN,
+      reason: `DRIFT_DEGRADATION:${originalStatus}→UNKNOWN`,
+    });
+
+    // 幂等键：24h 内不重复处理同一媒体
+    const idempotencyKey = `drift:degrade:${media.id}:${is4k}:${Math.floor(Date.now() / 86400000)}`;
+    const redisSet = await this.redis?.set(idempotencyKey, '1', 'EX', 86400, 'NX');
+
+    report.steps.push({
+      stepName: 'audit_and_idempotency',
+      success: auditSaved,
+      metrics: { auditSaved, redisIdempotencySet: redisSet === 'OK' },
+      durationMs: Date.now() - step4Start,
+    });
+  } catch (e) {
+    report.steps.push({
+      stepName: 'audit_and_idempotency',
+      success: false,
+      metrics: {},
+      durationMs: Date.now() - step4Start,
+      errorMessage: e.message,
+    });
+  }
+
+  // === 汇总 ===
+  report.overallSuccess = report.steps.every(s => s.success);
+  report.endedAt = Date.now();
+
+  // 所有步骤成功才发送通知，部分成功只记日志
+  if (report.overallSuccess) {
+    logger.info('Drift degradation completed successfully', {
+      label: 'AvailabilitySync',
+      tmdbId: media.tmdbId,
+      is4k,
+      fromStatus: originalStatus,
+      toStatus: MediaStatus.UNKNOWN,
+      totalSteps: report.steps.length,
+      durationMs: report.endedAt - report.startedAt,
+      fingerprint: ['drift-degrade-success', String(media.tmdbId)],
+    });
+  } else {
+    const failedSteps = report.steps.filter(s => !s.success).map(s => s.stepName);
+    logger.warn('Drift degradation completed with partial failures', {
+      label: 'AvailabilitySync',
+      tmdbId: media.tmdbId,
+      failedSteps,
+      totalSteps: report.steps.length,
+      fingerprint: ['drift-degrade-partial', String(media.tmdbId), failedSteps.join(',')],
+    });
+  }
+
+  return report;
+}
+```
+
+**成功判定指标汇总表**:
+
+| 步骤 | 指标 | 成功阈值 | 失败处理 | 权重 |
+|-----|------|---------|---------|-----|
+| Step 1 条件验证 | existsInArr, isDownloading, hasActiveRequest | 符合降级条件 | 跳过该媒体，不产生副作用 | ⭐⭐⭐⭐⭐ 必须成功 |
+| Step 2 状态写入 | saved[statusField] === target, updatedAt 刷新 | 两个条件均满足 | 停止后续步骤，保留数据库原值 | ⭐⭐⭐⭐⭐ 必须成功 |
+| Step 3 季级同步 | allSeasonsUpdated=true, lastSeasonChange 刷新 | 所有季同步成功 | 记录告警，不回滚 Step 2 结果 | ⭐⭐⭐ 尽量成功 |
+| Step 4 审计幂等 | auditSaved=true, Redis 幂等键写入 | 至少 DB 审计成功 | Redis 失败降级内存幂等 | ⭐⭐ 辅助指标 |
+
+**健康度监控指标**（Prometheus 格式建议暴露）:
+```
+jellyseerr_drift_degradations_total{result="success"} 1234
+jellyseerr_drift_degradations_total{result="partial"} 56
+jellyseerr_drift_degradations_total{result="failed"} 12
+jellyseerr_drift_degradation_step_duration_seconds{step="verify_conditions",quantile="0.95"} 0.05
+jellyseerr_drift_degradation_step_duration_seconds{step="update_status",quantile="0.95"} 0.02
+jellyseerr_drift_degradation_step_duration_seconds{step="sync_seasons",quantile="0.95"} 0.15
+```
+
 ---
 
 ## 七、错误回滚机制
@@ -3169,6 +4479,264 @@ alert_rules:
     rate_limit:
       count: 1
       window: 300  # 5 分钟内最多 1 次告警
+```
+
+### 7.0.3 跨告警通道 PagerDuty / Slack 去重协调
+
+**问题背景**:
+同一个故障可能同时触发多条告警路径，造成告警风暴：
+1. Sentry → PagerDuty（电话呼叫 oncall）
+2. Sentry → Slack（#alerts 频道消息）
+3. Jellyseerr 内部 Email/Slack/Webhook Agent（用户通知）
+4. 管理员可能同时收到 3 个渠道的同一故障告警，造成干扰
+
+**现状分析** (`server/lib/notifications/index.ts:95-97` + `server/lib/settings/index.ts:220-567`):
+```typescript
+// ❌ 当前 10 个通知 Agent 完全独立工作，无跨通道去重
+for (const agent of this.agents) {
+  if (!agent.shouldSend(payload)) continue;
+  try {
+    // 每个 Agent 独立发送，互不感知
+    await agent.send(payload);
+  } catch (e) {
+    // 单个失败不影响其他
+  }
+}
+```
+
+**跨通道去重协调架构（建议改造）**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    告警去重协调器 (AlertCoordinator)              │
+│                                                                   │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  全局告警事件总线 (Redis Pub/Sub + Stream)                  │  │
+│  │                                                            │  │
+│  │  事件格式:                                                  │  │
+│  │  {                                                         │  │
+│  │    id: "alert:20260617:rollback-p0:tmdb:12345:abc123",     │  │
+│  │    fingerprint: ["rollback-p0","tmdb:12345"],             │  │
+│  │    severity: "critical",                                   │  │
+│  │    channels: ["pagerduty","slack","email"],               │  │
+│  │    timestamp: 1718601600000,                               │  │
+│  │    ttl: 1800  // 30 分钟去重窗口                           │  │
+│  │  }                                                         │  │
+│  └───────────────────────────────┬────────────────────────────┘  │
+│                                  │                               │
+│             ┌────────────────────┼────────────────────┐          │
+│             ▼                    ▼                    ▼          │
+│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐ │
+│   │ Channel Policy  │  │ Channel Policy  │  │ Channel Policy  │ │
+│   │ PagerDuty       │  │ Slack           │  │ Email           │ │
+│   │                 │  │                 │  │                 │ │
+│   │ severity:       │  │ severity:       │  │ severity:       │ │
+│   │  critical→send  │  │  warning→send   │  │  error→send     │ │
+│   │  error→suppress │  │  critical→send  │  │  critical→send  │ │
+│   │ dedupeWindow:   │  │ dedupeWindow:   │  │ dedupeWindow:   │ │
+│   │  300s (5min)    │  │  600s (10min)   │  │  3600s (1h)     │ │
+│   │ maxPerHour: 10  │  │ maxPerHour: 60  │  │ maxPerHour: 20  │ │
+│   └─────────────────┘  └─────────────────┘  └─────────────────┘ │
+│             │                    │                    │          │
+│             └────────────────────┼────────────────────┘          │
+│                                  ▼                               │
+│                   ┌──────────────────────────┐                   │
+│                   │  发送优先级与抑制矩阵      │                   │
+│                   └──────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**去重协调器实现**:
+```typescript
+// server/lib/notifications/alertCoordinator.ts
+
+import { NotificationAgentKey } from './agents/agent';
+
+interface AlertEvent {
+  id: string;
+  fingerprint: string[];
+  severity: 'critical' | 'error' | 'warning' | 'info';
+  message: string;
+  channels: NotificationAgentKey[];
+  timestamp: number;
+  metadata?: Record<string, unknown>;
+}
+
+interface ChannelPolicy {
+  channel: NotificationAgentKey;
+  minSeverity: 'critical' | 'error' | 'warning' | 'info';
+  dedupeWindowMs: number;
+  maxPerHour: number;
+  suppressIfSentTo: NotificationAgentKey[];  // 如果某通道已发送，则本通道抑制
+}
+
+class AlertCoordinator {
+  // 默认通道策略
+  private readonly DEFAULT_POLICIES: ChannelPolicy[] = [
+    {
+      channel: NotificationAgentKey.PUSHOVER,  // 映射到 PagerDuty
+      minSeverity: 'critical',
+      dedupeWindowMs: 5 * 60 * 1000,            // 5 分钟去重
+      maxPerHour: 10,
+      suppressIfSentTo: [],                      // 关键通道永不抑制
+    },
+    {
+      channel: NotificationAgentKey.SLACK,
+      minSeverity: 'warning',
+      dedupeWindowMs: 10 * 60 * 1000,           // 10 分钟去重
+      maxPerHour: 60,
+      suppressIfSentTo: [NotificationAgentKey.PUSHOVER],  // PagerDuty 已呼叫则 Slack 发摘要
+    },
+    {
+      channel: NotificationAgentKey.EMAIL,
+      minSeverity: 'error',
+      dedupeWindowMs: 60 * 60 * 1000,           // 1 小时去重
+      maxPerHour: 20,
+      suppressIfSentTo: [NotificationAgentKey.PUSHOVER],  // PagerDuty 已呼叫则邮件可延后
+    },
+    {
+      channel: NotificationAgentKey.DISCORD,
+      minSeverity: 'warning',
+      dedupeWindowMs: 15 * 60 * 1000,           // 15 分钟去重
+      maxPerHour: 30,
+      suppressIfSentTo: [],
+    },
+    {
+      channel: NotificationAgentKey.WEBHOOK,
+      minSeverity: 'info',
+      dedupeWindowMs: 60 * 1000,                 // 1 分钟去重（外部系统自己去重）
+      maxPerHour: 600,
+      suppressIfSentTo: [],
+    },
+  ];
+
+  private readonly SENT_EVENTS_KEY = 'jellyseerr:alerts:sent:';
+  private readonly HOURLY_COUNT_KEY = 'jellyseerr:alerts:hourly:';
+
+  // 判断某通道是否应该发送（综合去重+频控+抑制策略）
+  public async shouldSend(
+    event: AlertEvent,
+    channel: NotificationAgentKey
+  ): Promise<{ send: boolean; reason?: string }> {
+    const policy = this.DEFAULT_POLICIES.find(p => p.channel === channel);
+    if (!policy) {
+      return { send: true };  // 无策略的通道默认放行
+    }
+
+    // 1. 严重级别过滤
+    if (this.severityRank(event.severity) < this.severityRank(policy.minSeverity)) {
+      return { send: false, reason: `severity_below_min: ${event.severity} < ${policy.minSeverity}` };
+    }
+
+    // 2. 基于 fingerprint 的通道级去重
+    const dedupeKey = this.SENT_EVENTS_KEY +
+      channel + ':' + event.fingerprint.join(':');
+    const alreadySent = await this.redis?.set(
+      dedupeKey,
+      '1',
+      'PX',
+      policy.dedupeWindowMs,
+      'NX'
+    );
+
+    if (alreadySent !== 'OK') {
+      return { send: false, reason: `dedupe_window: ${policy.dedupeWindowMs}ms` };
+    }
+
+    // 3. 每小时频控
+    const hourlyKey = this.HOURLY_COUNT_KEY +
+      channel + ':' + new Date().getUTCHours();
+    const hourlyCount = await this.redis?.incr(hourlyKey);
+    if (hourlyCount === 1) {
+      await this.redis?.expire(hourlyKey, 3600);  // 每小时归零
+    }
+
+    if (hourlyCount && hourlyCount > policy.maxPerHour) {
+      return { send: false, reason: `hourly_rate_limit: ${hourlyCount}/${policy.maxPerHour}` };
+    }
+
+    // 4. 跨通道抑制：如果高优先级通道已发送，则抑制本通道
+    for (const suppressChannel of policy.suppressIfSentTo) {
+      const suppressKey = this.SENT_EVENTS_KEY +
+        suppressChannel + ':' + event.fingerprint.join(':');
+      const wasSent = await this.redis?.exists(suppressKey);
+
+      if (wasSent) {
+        return {
+          send: false,
+          reason: `suppressed_by: ${suppressChannel}`,
+        };
+      }
+    }
+
+    return { send: true };
+  }
+
+  // 发送决策流程
+  public async processAlert(event: AlertEvent): Promise<Map<NotificationAgentKey, boolean>> {
+    const results = new Map<NotificationAgentKey, boolean>();
+
+    // 按严重程度排序：先处理 PagerDuty（critical），再处理 Slack，最后处理 Email
+    const sortedChannels = [...event.channels].sort((a, b) => {
+      const pa = this.DEFAULT_POLICIES.find(p => p.channel === a);
+      const pb = this.DEFAULT_POLICIES.find(p => p.channel === b);
+      return this.severityRank(pa?.minSeverity || 'info')
+        - this.severityRank(pb?.minSeverity || 'info');
+    });
+
+    for (const channel of sortedChannels) {
+      const decision = await this.shouldSend(event, channel);
+      results.set(channel, decision.send);
+
+      if (!decision.send) {
+        logger.debug('Alert suppressed for channel', {
+          label: 'AlertCoordinator',
+          channel,
+          reason: decision.reason,
+          fingerprint: event.fingerprint,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  private severityRank(severity: string): number {
+    const ranks: Record<string, number> = {
+      critical: 4, error: 3, warning: 2, info: 1,
+    };
+    return ranks[severity] || 0;
+  }
+}
+```
+
+**跨通道抑制决策矩阵**:
+
+| 事件严重度 | PagerDuty (Pushover) | Slack | Email | Discord | 说明 |
+|-----------|---------------------|-------|-------|---------|------|
+| critical | ✅ 发送（5min 去重） | ⚠️ 仅当 PD 未发送或摘要模式 | ⚠️ 仅当 PD 未发送 | ✅ 发送（15min 去重） | PD 优先，其他通道去重 |
+| error | ❌ 低于最小级别 | ✅ 发送（10min 去重） | ✅ 发送（1h 去重） | ✅ 发送 | 不触发 PD，避免夜间骚扰 |
+| warning | ❌ 低于最小级别 | ✅ 发送 | ⚠️ 仅当 24h 未发送过 | ✅ 发送 | 常规告警 |
+| info | ❌ 低于最小级别 | ❌ 级别过滤 | ❌ 级别过滤 | ⚠️ 仅 Webhook/自定义 | 调试信息 |
+
+**告警风暴抑制场景示例**:
+```
+场景：MediaRequest #12345 发送到 Radarr 连续失败
+
+T=00:00  错误发生
+  → PagerDuty: ✅ 发送（首次，创建 Incident #999）
+  → Slack:     ✅ 发送（#alerts 频道推送）
+  → Email:     ✅ 发送（给管理员）
+  → Discord:   ✅ 发送
+
+T=00:02  同样错误再次触发（幂等键相同）
+  → PagerDuty: ❌ 5min 去重窗口内
+  → Slack:     ❌ 10min 去重窗口内（或 PagerDuty 抑制）
+  → Email:     ❌ 1h 去重窗口内
+  → Discord:   ❌ 15min 去重窗口内
+
+T=05:01  PagerDuty 去重窗口过期
+  → PagerDuty: ⚠️ 但 Incident #999 仍处于 acknowledged 状态 → 静默升级，不重复呼叫
 ```
 
 ---
