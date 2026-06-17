@@ -275,6 +275,98 @@ const acquireTokenScript = `
 2. **写入失败降级**: Redis 不可用时自动 fallback 到内存限流，日志标记 `fallback=memory`
 3. **预热加载**: 节点启动时从 Redis 加载当前令牌数，避免冷启动过载
 
+#### 3.2.3 Rate-Limit 故障切换：Sentinel 还是 Client 重试？
+
+**源码现状分析**:
+- **无 Redis Sentinel**：Jellyseerr 核心代码未集成任何 Redis 客户端，`TypeORM` 的 `peerDependencies` 声明 `ioredis` 但**从未实际调用**
+- **无 `axios-retry` 插件**：全项目 grep 无 `axios-retry` 或 `retry-axios` 引用
+- **故障切换完全由 Client 侧错误捕获驱动**
+
+**代理层故障切换示例** (`server/utils/customProxyAgent.ts:104-121`):
+```typescript
+} catch (e) {
+  logger.error('Failed to connect to the proxy: ' + e.message, {
+    label: 'Proxy',
+  });
+  setGlobalDispatcher(defaultAgent);  // 🔴 故障切换：fallback 到默认 dispatcher
+  return;
+}
+
+try {
+  await axios.head('https://www.google.com');  // 连通性探测
+  logger.debug('HTTP(S) proxy connected successfully', { label: 'Proxy' });
+} catch (e) {
+  logger.error('Failed to connect to the proxy: ' + e.message + ': ' + e.cause, {
+    label: 'Proxy',
+  });
+  setGlobalDispatcher(defaultAgent);  // 🔴 故障切换：探测失败也 fallback
+}
+```
+
+**外部 API 调用错误处理示例** (`server/api/externalapi.ts` + `server/subscriber/MediaRequestSubscriber.ts:789`):
+```typescript
+// sendToRadarr 外层 catch（P3 连接错误回滚）
+} catch (e) {
+  logger.error('Something went wrong while adding movie to Radarr.', {
+    label: 'Media Request',
+    errorMessage: e.message,
+    fingerprint: ['rollback-p3-connect-fail', hostname, `error:${e.code}`],
+  });
+  // 纯内存降级：标记 FAILED 状态，不做 Redis 故障转移
+  if (entity.status !== MediaRequestStatus.FAILED) {
+    entity.status = MediaRequestStatus.FAILED;
+    await requestRepository.save(entity);
+  }
+}
+```
+
+**故障切换决策树**：
+```
+请求失败 → 检查错误类型
+    │
+    ├─ 429 Too Many Requests → axios-rate-limit 队列化等待（内存内）
+    │                          → 不切换，仅延时重试
+    │
+    ├─ ECONNREFUSED / ETIMEDOUT → 标记 FAILED + fallback 到内存限流
+    │                          → 5 分钟后后台任务自动重试（P4）
+    │                          → ❌ 不做实例级故障转移
+    │
+    ├─ 4xx 业务错误（无效参数）→ 标记 FAILED + 通知用户
+    │                          → 不重试
+    │
+    └─ 5xx 服务端错误 → 指数退避重试 3 次（由调用方显式实现，非全局）
+                    → 全部失败后标记 FAILED
+```
+
+**Redis Sentinel 改造建议**（如需多节点高可用）:
+```typescript
+// 建议的 Sentinel 配置
+const redis = new Redis({
+  sentinels: [
+    { host: 'sentinel-1', port: 26379 },
+    { host: 'sentinel-2', port: 26379 },
+    { host: 'sentinel-3', port: 26379 },
+  ],
+  name: 'jellyseerr-master',
+  enableReadyCheck: true,
+  maxRetriesPerRequest: 3,
+  retryDelayOnFailover: 100,  // Sentinel 故障转移期间延迟 100ms 重试
+});
+
+// 令牌桶 Redis key 失效策略
+// 主节点宕机 → Sentinel 选举新主（~10s）→ 客户端自动重连
+// 期间请求 fallback 到内存限流，日志标记 `redisRole: ${redis.status}`
+```
+
+**Client 重试 vs Sentinel 对比表**:
+| 维度 | Client 重试（现状） | Redis Sentinel（改造） |
+|------|-------------------|---------------------|
+| 故障转移时间 | 取决于重试策略（~30s） | Sentinel 选举 + DNS 更新（~10s） |
+| 数据一致性 | 内存计数，多实例不一致 | 强一致，全实例共享 |
+| 实现复杂度 | 低（已有 catch 逻辑） | 中高（Sentinel 集群运维） |
+| 单点故障风险 | 无（每个实例独立） | 有（Sentinel 集群需≥3节点） |
+| 适用场景 | 单实例部署 | 多实例高可用部署 |
+
 ---
 
 ### 3.3 AsyncLock 死锁检测机制
@@ -462,6 +554,157 @@ class DistributedAsyncLock {
 | Redis 锁超 30s 强制释放 | `['asyncLock-deadlock-force-release', key, acquiredTimestamp]` | error |
 | 获取锁竞争失败超过 5 次/分钟 | `['asyncLock-contention-high', key]` | warning |
 | Redlock 多节点不一致 | `['asyncLock-redlock-inconsistency', key]` | fatal |
+
+#### 3.3.3 AsyncLock 跨时区时钟漂移识别
+
+**问题背景**：
+多实例部署在不同时区或 NTP 同步不佳的服务器上时，`Date.now()` 的时钟差异会导致分布式锁 TTL 计算错误：
+
+- 实例 A（时区 UTC+8）获取锁，设置 `acquiredAt = 1717200000000`（北京时间 08:00）
+- 实例 B（时区 UTC-5）的系统时间可能是 `1717174800000`（纽约时间 19:00，比实际慢 7 小时）
+- 实例 B 计算 `heldMs = 1717174800000 - 1717200000000 = -25200000`（负数！）
+- 结果：**实例 B 误认为锁已过期 25200 秒，强制释放还在使用的锁**，导致数据冲突
+
+**源码中的隐式保护** (`server/utils/asyncLock.ts` + `server/routes/discover.ts:359-361`):
+```typescript
+// 代码中仅使用 Date.now()，未做任何时区校正
+const heldMs = Date.now() - Number(acquiredTimestamp);
+
+// discover.ts 中有使用 getTimezoneOffset() 校正日期
+const offset = now.getTimezoneOffset();
+const date = new Date(now.getTime() - offset * 60 * 1000)
+  .toISOString()
+  .split('T')[0];  // 仅用于日期显示，不影响锁逻辑
+```
+
+**跨时区时钟漂移检测算法（建议补充）**:
+```typescript
+class ClockDriftDetector {
+  private readonly DRIFT_THRESHOLD_MS = 5000;  // 可容忍 5 秒时钟漂移
+  private readonly NTP_SERVERS = [
+    'pool.ntp.org', 'time.nist.gov', 'time.google.com'
+  ];
+
+  // 启动时校准本地时钟偏差
+  public async calibrateClockOffset(): Promise<number> {
+    const offsets: number[] = [];
+
+    for (const ntpServer of this.NTP_SERVERS) {
+      try {
+        const t0 = Date.now();
+        const ntpTime = await this.queryNtpTime(ntpServer);
+        const t1 = Date.now();
+        const networkLatency = (t1 - t0) / 2;
+        const offset = ntpTime - (t0 + networkLatency);
+        offsets.push(offset);
+      } catch (e) {
+        // 跳过失败的 NTP 服务器
+      }
+    }
+
+    if (offsets.length === 0) {
+      logger.warn('NTP calibration failed, using local clock', {
+        label: 'AsyncLock',
+        fingerprint: ['clock-drift-ntp-failed'],
+      });
+      return 0;
+    }
+
+    // 取中位数作为最终偏移
+    offsets.sort((a, b) => a - b);
+    const medianOffset = offsets[Math.floor(offsets.length / 2)];
+
+    if (Math.abs(medianOffset) > this.DRIFT_THRESHOLD_MS) {
+      logger.warn('Clock drift detected', {
+        label: 'AsyncLock',
+        driftMs: medianOffset,
+        action: Math.abs(medianOffset) > 30000 ? 'BLOCK_STARTUP' : 'WARNING_ONLY',
+        fingerprint: ['clock-drift-detected', String(medianOffset)],
+      });
+
+      // 漂移超过 30 秒，阻塞启动（防止数据损坏）
+      if (Math.abs(medianOffset) > 30000) {
+        throw new Error(`Clock drift ${medianOffset}ms exceeds safety threshold 30000ms`);
+      }
+    }
+
+    this.clockOffset = medianOffset;
+    return medianOffset;
+  }
+
+  // 使用校正后的时间计算锁持有时间
+  private getCorrectedNow(): number {
+    return Date.now() + (this.clockOffset || 0);
+  }
+
+  // 时钟漂移检测：每次获取锁时检查
+  private detectDrift(key: string, remoteTimestamp: number): DriftStatus {
+    const correctedNow = this.getCorrectedNow();
+    const drift = correctedNow - remoteTimestamp;
+
+    if (drift < -this.DRIFT_THRESHOLD_MS) {
+      // 本地时钟比 Redis 慢 → 可能误判锁已过期
+      return { status: 'NEGATIVE_DRIFT', driftMs: drift, safe: false };
+    }
+    if (drift > this.DRIFT_THRESHOLD_MS * 2) {
+      // 本地时钟比 Redis 快 → 可能导致锁提前释放
+      return { status: 'POSITIVE_DRIFT', driftMs: drift, safe: false };
+    }
+    return { status: 'OK', driftMs: drift, safe: true };
+  }
+
+  // 漂移保护的锁获取逻辑
+  public async acquireDistributedLock(key: string): Promise<boolean> {
+    const lockValue = `${this.instanceId}:${this.getCorrectedNow()}`;
+    const driftCheck = this.detectDrift(key, Number(lockValue.split(':')[1]));
+
+    if (!driftCheck.safe) {
+      logger.warn('Clock drift detected, refusing to acquire lock', {
+        label: 'AsyncLock',
+        lockKey: key,
+        driftMs: driftCheck.driftMs,
+        driftStatus: driftCheck.status,
+        fingerprint: ['clock-drift-lock-refused', key, driftCheck.status],
+      });
+      return false;  // 时钟漂移时拒绝获取锁，避免数据损坏
+    }
+
+    // 正常获取锁...
+    return true;
+  }
+}
+```
+
+**锁 TTL 自适应调整（基于检测到的漂移）**:
+```typescript
+// 根据时钟漂移动态调整锁超时阈值
+private getAdaptiveDeadlockThreshold(baseThreshold: number): number {
+  const driftAbs = Math.abs(this.clockOffset || 0);
+  // 漂移越大，锁超时阈值越大（防止误释放）
+  // 但最大不超过 baseThreshold 的 3 倍（避免死锁长时间不释放）
+  return Math.min(baseThreshold + driftAbs * 2, baseThreshold * 3);
+}
+```
+
+**NTP 时钟同步健康监控 API**:
+```
+GET /api/v1/settings/status/clock-drift
+Response:
+{
+  "localClockOffsetMs": -1234,
+  "driftStatus": "OK",
+  "thresholdMs": 5000,
+  "adaptiveLockThresholdMs": 32468,
+  "lastCalibrationAt": "2026-06-17T08:00:00.000Z",
+  "calibrationSource": "pool.ntp.org"
+}
+```
+
+**跨时区部署配置建议**:
+1. 所有实例强制配置 UTC 时区，避免夏令时切换
+2. 配置本地 NTP 服务器（`ntpd -qg` 启动时强制校时）
+3. 监控 `ntpq -p` offset 值，超过 5s 告警
+4. Redis 服务器与应用实例使用同一 NTP 源
 
 ### 3.4 异步锁 (AsyncLock) 使用场景
 
@@ -991,6 +1234,215 @@ server/plugins/notifications/
 3. **回滚机制**: 新版本加载失败时，自动恢复上一个可用版本
 4. **发送测试消息**: 加载成功后立即触发 `TEST_NOTIFICATION` 验证可用性
 
+#### 5.5.7 通知 Agent 旧 ABI 升级兼容矩阵
+
+**源码中的配置接口演变** (`server/lib/settings/index.ts:220-347`):
+
+通过分析 10 个 Agent 的配置字段，可以推导出 ABI 版本历史和兼容性策略：
+
+```typescript
+// ABI v1.0 (初始版本)
+export interface NotificationAgentConfig {
+  enabled: boolean;
+  embedPoster: boolean;
+  types?: number;
+  options: Record<string, unknown>;  // ❌ 弱类型，无结构约束
+}
+
+// ABI v1.1 (强类型化)
+export interface NotificationAgentDiscord extends NotificationAgentConfig {
+  options: {  // ✅ 强类型 options
+    webhookUrl: string;
+    botUsername?: string;
+    botAvatarUrl?: string;
+    locale: AvailableLocale;
+    // 新增字段不破坏旧插件
+  };
+}
+
+// ABI v1.2 (高级功能)
+export interface NotificationAgentWebhook extends NotificationAgentConfig {
+  options: {
+    webhookUrl: string;
+    jsonPayload: string;      // 新增：自定义 JSON 模板
+    authHeader?: string;       // 新增：自定义认证头
+    customHeaders?: { key: string; value: string }[];  // 新增：自定义 Headers
+    method: 'POST' | 'PUT' | 'PATCH';  // 新增：HTTP 方法
+  };
+}
+
+// ABI v1.3 (本地化)
+export interface NotificationAgentNtfy extends NotificationAgentConfig {
+  options: {
+    url: string;
+    topic: string;
+    authMethodUsernamePassword?: boolean;  // 新增：多认证方式
+    authMethodToken?: boolean;
+    priority?: number;
+    locale: AvailableLocale;  // ✅ 规范的 locale 字段
+  };
+}
+```
+
+**ABI 版本兼容矩阵**:
+
+| 插件 ABI 版本 | 核心 API v1.0 | v1.1 | v1.2 | v1.3 | 说明 |
+|--------------|--------------|------|------|------|------|
+| v1.0 | ✅ 兼容 | ⚠️ 部分兼容 | ❌ 不兼容 | ❌ 不兼容 | 缺少强类型 options 和 locale |
+| v1.1 | ✅ 兼容 | ✅ 兼容 | ⚠️ 部分兼容 | ⚠️ 部分兼容 | 缺少 webhook 高级字段和新认证方式 |
+| v1.2 | ✅ 兼容 | ✅ 兼容 | ✅ 兼容 | ⚠️ 部分兼容 | 缺少 locale 规范字段 |
+| v1.3 | ✅ 兼容 | ✅ 兼容 | ✅ 兼容 | ✅ 兼容 | 完整支持所有字段 |
+
+**向后兼容策略（Adapter 模式）**:
+```typescript
+// server/lib/notifications/abiCompatibility.ts
+
+// 配置适配器：旧 ABI → 新 ABI
+class NotificationAgentAdapter {
+  public static adaptToV13(
+    agentKey: NotificationAgentKey,
+    config: any,
+    pluginVersion: string
+  ): NotificationAgentConfig {
+    const semver = require('semver');
+
+    // v1.0 → v1.1：补充默认 locale
+    if (semver.satisfies(pluginVersion, '>=1.0.0 <1.1.0')) {
+      return {
+        ...config,
+        options: {
+          ...config.options,
+          locale: config.options.locale || 'en',  // 补充默认值
+          useUserLocale: false,
+        },
+      };
+    }
+
+    // v1.1 → v1.2：补充 webhook 高级字段默认值
+    if (semver.satisfies(pluginVersion, '>=1.1.0 <1.2.0')
+        && agentKey === NotificationAgentKey.WEBHOOK) {
+      return {
+        ...config,
+        options: {
+          ...config.options,
+          jsonPayload: config.options.jsonPayload || JSON.stringify({ text: '{{message}}' }),
+          method: config.options.method || 'POST',
+          customHeaders: config.options.customHeaders || [],
+        },
+      };
+    }
+
+    // v1.2 → v1.3：补充认证方式字段
+    if (semver.satisfies(pluginVersion, '>=1.2.0 <1.3.0')) {
+      return this.adaptAuthFields(agentKey, config);
+    }
+
+    return config;
+  }
+
+  private static adaptAuthFields(agentKey: string, config: any) {
+    switch (agentKey) {
+      case NotificationAgentKey.NTFY:
+        return {
+          ...config,
+          options: {
+            ...config.options,
+            authMethodUsernamePassword: config.options.username ? true : false,
+            authMethodToken: config.options.token ? true : false,
+          },
+        };
+      default:
+        return config;
+    }
+  }
+}
+
+// 插件加载时的兼容性检查
+function validateAgentCompat(
+  agentClass: any,
+  manifestVersion: string
+): { compatible: boolean; reason?: string } {
+  const coreApiVersion = require('../../../package.json').apiVersion;
+  const semver = require('semver');
+
+  // 插件声明的兼容版本范围
+  const pluginCompatibleRange = agentClass.compatibleApiVersion || '>=1.0.0';
+
+  if (!semver.satisfies(coreApiVersion, pluginCompatibleRange)) {
+    return {
+      compatible: false,
+      reason: `Plugin requires core API ${pluginCompatibleRange}, but running ${coreApiVersion}`,
+    };
+  }
+
+  // 检查必需方法
+  const requiredMethods = ['shouldSend', 'send', 'getSettings'];
+  const missingMethods = requiredMethods.filter(
+    m => typeof agentClass.prototype[m] !== 'function'
+  );
+
+  if (missingMethods.length > 0) {
+    return {
+      compatible: false,
+      reason: `Missing required methods: ${missingMethods.join(', ')}`,
+    };
+  }
+
+  return { compatible: true };
+}
+```
+
+**插件 Manifest 规范（建议）**:
+```json
+{
+  "name": "custom-discord",
+  "version": "1.2.3",
+  "author": "username",
+  "compatibleApiVersion": ">=1.1.0 <1.4.0",
+  "agentKey": "discord",
+  "dependencies": {
+    "discord.js": "^14.0.0"
+  },
+  "changelog": [
+    {
+      "version": "1.2.0",
+      "changes": "适配核心 API v1.2，增加 webhookThreadId 支持"
+    }
+  ]
+}
+```
+
+**不兼容升级的处理流程**:
+```
+检测到不兼容插件
+    │
+    ├─ 插件版本过旧 → 提示用户升级插件到兼容版本
+    │                → 保留旧配置，不自动删除
+    │
+    ├─ 插件版本过新 → 提示用户升级核心 Jellyseerr
+    │                → 插件被禁用，但配置保留
+    │
+    ├─ 缺少必需方法 → 插件加载失败，输出详细日志
+    │                → fingerprint: ['plugin-incompatible', agentKey, 'missing-methods']
+    │
+    └─ 核心 ABI 破坏性变更 → 批量转换所有旧插件配置
+                            → 执行 SQL 迁移脚本更新配置字段
+```
+
+**旧版本配置数据库迁移示例**（参考 `1610370640747-Add4kStatusFields.ts` 的思路）:
+```typescript
+// 迁移：将 v1.0 webhook 配置升级到 v1.2
+await queryRunner.query(`
+  UPDATE "settings" 
+  SET "value" = json_set("value", '$.notifications.webhook.options.jsonPayload', 
+    COALESCE(json_extract("value", '$.notifications.webhook.options.jsonPayload'), 
+             '{"text":"{{message}}"}'),
+    '$.notifications.webhook.options.method',
+    COALESCE(json_extract("value", '$.notifications.webhook.options.method'), '"POST"'))
+  WHERE json_extract("value", '$.notifications.webhook.enabled') = 1
+`);
+```
+
 ---
 
 ## 六、回执处理与状态回写
@@ -1242,6 +1694,264 @@ UNKNOWN ──请求批准──▶ PROCESSING ──*arr 下载完成──▶ 
                                └─────────────────────────┘
 ```
 
+#### 6.4.3 4K 中间态数据库回填策略
+
+**问题背景**:
+`1610370640747-Add4kStatusFields.ts` 迁移脚本使用 `DEFAULT (1)` 给新字段赋默认值，但存在以下问题：
+
+1. 迁移后 `status4k=1 (UNKNOWN)`，`serviceId4k=null`，`externalServiceId4k=null`
+2. 但实际上部分媒体**在迁移前就有 4K 版本存在**于 Radarr/Sonarr 中
+3. 如果不回填，下次扫描时这些媒体会被错误地再次发送到 *arr，导致重复下载
+4. 对于 `status=AVAILABLE` 且媒体服务器上有 4K 版本的媒体，`status4k` 应该直接回填为 `AVAILABLE`
+
+**迁移脚本现状分析** (`server/migration/sqlite/1610370640747-Add4kStatusFields.ts:6-47`):
+```typescript
+// 迁移时仅迁移了非 4K 字段
+await queryRunner.query(
+  `INSERT INTO "temporary_media"("id", "mediaType", "tmdbId", ..., "status") 
+   SELECT "id", "mediaType", "tmdbId", ..., "status" FROM "media"`
+  // ❌ 没有回填 status4k、serviceId4k、externalServiceId4k
+);
+```
+
+**4K 中间态回填算法（建议补充的迁移脚本或启动后作业）**:
+
+```typescript
+// server/jobs/backfill4kFields.ts
+
+class Backfill4kFieldsJob {
+  private readonly BATCH_SIZE = 100;
+  private readonly DRY_RUN = false;  // 首次运行建议 dry-run
+
+  public async run(): Promise<BackfillReport> {
+    const report: BackfillReport = {
+      totalMedia: 0,
+      processedMedia: 0,
+      backfilled4kAvailable: 0,
+      backfilled4kProcessing: 0,
+      skippedNoRadarr: 0,
+      skippedNoSonarr: 0,
+      errors: [],
+    };
+
+    // 获取所有已配置的 Radarr/Sonarr 实例
+    const settings = getSettings();
+    const radarrServers = settings.radarr.filter(s => s.is4k);  // 仅 4K 实例
+    const sonarrServers = settings.sonarr.filter(s => s.is4k);
+
+    if (radarrServers.length === 0 && sonarrServers.length === 0) {
+      logger.info('No 4K *arr servers configured, skipping backfill', {
+        label: 'Backfill4k',
+      });
+      return report;
+    }
+
+    // 分批处理媒体，避免内存溢出
+    let offset = 0;
+    let mediaBatch: Media[];
+
+    do {
+      mediaBatch = await mediaRepository
+        .createQueryBuilder('media')
+        .leftJoinAndSelect('media.requests', 'request')
+        .where('media.status = :available', { available: MediaStatus.AVAILABLE })
+        .andWhere('media.status4k = :unknown', { unknown: MediaStatus.UNKNOWN })
+        .andWhere(qb => {
+          // 只处理可能有 4K 版本的媒体
+          const subQb = qb.subQuery()
+            .select('1')
+            .from('media_request', 'req')
+            .where('req."mediaId" = media.id')
+            .andWhere('req."is4k" = 1');
+          return `EXISTS (${subQb.getQuery()}) OR media.mediaType = :movieType`;
+        }, { movieType: MediaType.MOVIE })
+        .skip(offset)
+        .take(this.BATCH_SIZE)
+        .getMany();
+
+      report.totalMedia += mediaBatch.length;
+
+      for (const media of mediaBatch) {
+        try {
+          await this.backfillMedia4kStatus(media, radarrServers, sonarrServers, report);
+          report.processedMedia++;
+        } catch (e) {
+          report.errors.push({
+            tmdbId: media.tmdbId,
+            error: e.message,
+          });
+          logger.error('Failed to backfill 4K status', {
+            label: 'Backfill4k',
+            tmdbId: media.tmdbId,
+            errorMessage: e.message,
+            fingerprint: ['backfill-4k-error', String(media.tmdbId)],
+          });
+        }
+      }
+
+      offset += this.BATCH_SIZE;
+      await this.delay(1000);  // 每批间隔 1 秒，避免压垮 *arr
+
+    } while (mediaBatch.length > 0);
+
+    logger.info('4K fields backfill completed', {
+      label: 'Backfill4k',
+      ...report,
+      fingerprint: ['backfill-4k-completed', String(report.processedMedia)],
+    });
+
+    return report;
+  }
+
+  private async backfillMedia4kStatus(
+    media: Media,
+    radarrServers: RadarrSettings[],
+    sonarrServers: SonarrSettings[],
+    report: BackfillReport
+  ): Promise<void> {
+    // 电影：检查 Radarr 4K 实例
+    if (media.mediaType === MediaType.MOVIE) {
+      for (const radarr of radarrServers) {
+        const radarrApi = new RadarrAPI(radarr);
+        const movie = await radarrApi.getMovie(media.tmdbId);
+
+        if (movie) {
+          if (!this.DRY_RUN) {
+            // ✅ 回填 4K 状态
+            media.status4k = movie.hasFile
+              ? MediaStatus.AVAILABLE
+              : this.isMovieDownloading(movie)
+                ? MediaStatus.PROCESSING
+                : MediaStatus.UNKNOWN;
+
+            media.serviceId4k = radarr.id;
+            media.externalServiceId4k = movie.id;
+            await mediaRepository.save(media);
+          }
+
+          movie.hasFile ? report.backfilled4kAvailable++ : report.backfilled4kProcessing++;
+          return;  // 找到一个 4K 实例就足够
+        }
+      }
+    }
+
+    // 剧集：检查 Sonarr 4K 实例
+    if (media.mediaType === MediaType.TV) {
+      for (const sonarr of sonarrServers) {
+        const sonarrApi = new SonarrAPI(sonarr);
+        const series = media.tvdbId
+          ? await sonarrApi.getSeriesByTvdbId(media.tvdbId)
+          : await sonarrApi.getSeries({ tmdbId: media.tmdbId });
+
+        if (series) {
+          if (!this.DRY_RUN) {
+            // ✅ 回填 4K 状态（按季粒度）
+            const seasonStatuses = this.calculateSeasonStatuses(series);
+            const overallStatus = this.getOverallStatus(seasonStatuses);
+
+            media.status4k = overallStatus;
+            media.serviceId4k = sonarr.id;
+            media.externalServiceId4k = series.id;
+            await mediaRepository.save(media);
+
+            // 回填 Season 表的 status4k
+            for (const season of media.seasons || []) {
+              season.status4k = seasonStatuses.get(season.seasonNumber) || MediaStatus.UNKNOWN;
+              await seasonRepository.save(season);
+            }
+          }
+
+          (overallStatus === MediaStatus.AVAILABLE
+            ? report.backfilled4kAvailable
+            : report.backfilled4kProcessing)++;
+          return;
+        }
+      }
+    }
+  }
+
+  // 判断电影是否在下载中
+  private isMovieDownloading(movie: RadarrMovie): boolean {
+    return movie.queueState?.downloading ||
+           movie.movieFile === null && movie.monitored;
+  }
+
+  // 计算剧集每一季的 4K 状态
+  private calculateSeasonStatuses(series: SonarrSeries): Map<number, MediaStatus> {
+    const statuses = new Map<number, MediaStatus>();
+
+    for (const season of series.seasons) {
+      const totalEpisodes = season.statistics?.episodeCount || 0;
+      const availableEpisodes = season.statistics?.episodeFileCount || 0;
+
+      if (totalEpisodes === 0) {
+        statuses.set(season.seasonNumber, MediaStatus.UNKNOWN);
+      } else if (availableEpisodes === totalEpisodes) {
+        statuses.set(season.seasonNumber, MediaStatus.AVAILABLE);
+      } else if (availableEpisodes > 0) {
+        statuses.set(season.seasonNumber, MediaStatus.PARTIALLY_AVAILABLE);
+      } else if (season.monitored) {
+        statuses.set(season.seasonNumber, MediaStatus.PROCESSING);
+      } else {
+        statuses.set(season.seasonNumber, MediaStatus.UNKNOWN);
+      }
+    }
+
+    return statuses;
+  }
+}
+```
+
+**回填优先级策略**:
+```typescript
+// 按媒体类型和请求状态确定回填优先级
+const BACKFILL_PRIORITY = [
+  // P0: 有 APPROVED 的 4K 请求（正在下载）
+  {
+    condition: 'request.is4k = 1 AND request.status = 2',  // APPROVED = 2
+    priority: 0,
+    action: '立即回填，避免重复发送到 *arr',
+  },
+  // P1: 有 PENDING 的 4K 请求
+  {
+    condition: 'request.is4k = 1 AND request.status = 1',  // PENDING = 1
+    priority: 1,
+    action: '高优先级回填，审批通过时需要正确状态',
+  },
+  // P2: 非 4K 状态为 AVAILABLE 的电影
+  {
+    condition: 'media.mediaType = 0 AND media.status = 5',  // MOVIE + AVAILABLE
+    priority: 2,
+    action: '可能有 4K 版本存在',
+  },
+  // P3: 非 4K 状态为 AVAILABLE 的剧集
+  {
+    condition: 'media.mediaType = 1 AND media.status = 5',  // TV + AVAILABLE
+    priority: 3,
+    action: '低优先级，按季检查成本高',
+  },
+];
+```
+
+**幂等性保证（防止重复回填）**:
+```typescript
+// 回填作业启动时检查标记
+const lastBackfillTime = await systemSettingsRepository.findOne({ key: 'last4kBackfillAt' });
+if (lastBackfillTime && Date.now() - Number(lastBackfillTime.value) < 24 * 60 * 60 * 1000) {
+  logger.info('4K backfill already ran within 24h, skipping', {
+    label: 'Backfill4k',
+    lastRunAt: lastBackfillTime.value,
+  });
+  return;
+}
+
+// 回填完成后更新标记
+await systemSettingsRepository.save({
+  key: 'last4kBackfillAt',
+  value: String(Date.now()),
+});
+```
+
 ---
 
 ### 6.5 异步非阻塞背压控制
@@ -1479,6 +2189,183 @@ abstract class BaseScanner<T> {
   }
 }
 ```
+
+#### 6.5.4 背压基于消费速率的动态水位调整
+
+**问题背景**:
+静态水位线（10%/30%/50% 超时率）在不同负载下表现不佳：
+- 系统空闲时，即使 20% 批次超时也可能是正常的（冷启动、网络抖动）
+- 系统高负载时，5% 超时率就应该触发降速（CPU/IO 接近饱和）
+- 不同扫描任务的消费速率差异很大（Plex 扫描 vs Radarr 同步）
+
+**动态水位调整算法（基于 EWMA 平滑消费速率）**:
+
+```typescript
+// server/lib/scanners/baseScanner.ts - 扩展实现
+
+abstract class BaseScanner<T> {
+  // 指数加权移动平均（Exponential Weighted Moving Average）
+  private readonly EWMA_ALPHA = 0.3;  // 平滑系数，0.3 表示最近批次占 30% 权重
+  private readonly BASELINE_WINDOW = 10;  // 前 10 批作为基准线
+
+  private batchDurations: number[] = [];
+  private ewmaBatchDuration = 0;  // 平滑后的平均批次耗时
+  private maxBatchDuration = 0;   // 历史最大批次耗时
+  private minBatchDuration = Infinity;  // 历史最小批次耗时
+
+  // 消费速率 = 处理数量 / 时间
+  private consumptionRate = 0;    // items/sec
+  private ewmaConsumptionRate = 0;
+
+  // 动态水位线（根据消费速率调整）
+  private dynamicWatermark = {
+    WARN: 0.10,
+    CRITICAL: 0.30,
+    FATAL: 0.50,
+  };
+
+  // 批次处理后更新统计
+  protected onBatchComplete(batchSize: number, batchDurationMs: number) {
+    this.batchDurations.push(batchDurationMs);
+    if (this.batchDurations.length > 100) {
+      this.batchDurations.shift();  // 保留最近 100 批次
+    }
+
+    // 更新 EWMA 平均批次耗时
+    if (this.ewmaBatchDuration === 0) {
+      this.ewmaBatchDuration = batchDurationMs;  // 初始值
+    } else {
+      this.ewmaBatchDuration =
+        this.EWMA_ALPHA * batchDurationMs +
+        (1 - this.EWMA_ALPHA) * this.ewmaBatchDuration;
+    }
+
+    // 更新极值
+    this.maxBatchDuration = Math.max(this.maxBatchDuration, batchDurationMs);
+    this.minBatchDuration = Math.min(this.minBatchDuration, batchDurationMs);
+
+    // 计算消费速率（items/sec）
+    const currentRate = (batchSize / batchDurationMs) * 1000;
+    if (this.ewmaConsumptionRate === 0) {
+      this.ewmaConsumptionRate = currentRate;
+    } else {
+      this.ewmaConsumptionRate =
+        this.EWMA_ALPHA * currentRate +
+        (1 - this.EWMA_ALPHA) * this.ewmaConsumptionRate;
+    }
+
+    // 根据消费速率动态调整水位线
+    this.adjustWatermarkDynamically();
+
+    // 更新批次统计
+    this.batchStats.totalBatches++;
+    if (batchDurationMs > this.getSlowThreshold()) {
+      this.batchStats.slowBatches++;
+    }
+  }
+
+  // 动态水位线调整核心算法
+  private adjustWatermarkDynamically() {
+    // 前 10 批不调整，用于建立基准线
+    if (this.batchStats.totalBatches < this.BASELINE_WINDOW) return;
+
+    // 计算当前速率与基准速率的比值
+    const baselineRate = this.getBaselineConsumptionRate();
+    const rateRatio = this.ewmaConsumptionRate / baselineRate;
+
+    // 速率越快（系统越空闲），水位线越高
+    // 速率越慢（系统越繁忙），水位线越低
+    const adjustmentFactor = Math.max(0.3, Math.min(2.0, rateRatio));
+
+    // 调整各水位线
+    this.dynamicWatermark = {
+      WARN:     Math.min(0.25, 0.10 * adjustmentFactor),
+      CRITICAL: Math.min(0.40, 0.30 * adjustmentFactor),
+      FATAL:    Math.min(0.60, 0.50 * adjustmentFactor),
+    };
+
+    logger.debug('Dynamic watermark adjusted', {
+      label: this.scannerName,
+      rateRatio: rateRatio.toFixed(2),
+      currentRate: this.ewmaConsumptionRate.toFixed(2),
+      baselineRate: baselineRate.toFixed(2),
+      watermark: { ...this.dynamicWatermark },
+    });
+  }
+
+  // 计算基准消费速率（前 10 批平均）
+  private getBaselineConsumptionRate(): number {
+    if (this.batchDurations.length < this.BASELINE_WINDOW) return 0;
+
+    const first10Batches = this.batchDurations.slice(0, this.BASELINE_WINDOW);
+    const totalItems = first10Batches.length * this.bundleSize;
+    const totalTime = first10Batches.reduce((a, b) => a + b, 0);
+    return (totalItems / totalTime) * 1000;
+  }
+
+  // 慢批次阈值 = EWMA 平均的 2 倍
+  private getSlowThreshold(): number {
+    return this.ewmaBatchDuration * 2;
+  }
+
+  // 覆盖原 calculateWatermark 方法，使用动态水位
+  protected calculateWatermark(): 'IDLE' | 'NORMAL' | 'WARN' | 'CRITICAL' | 'FATAL' {
+    if (!this.running) return 'IDLE';
+    const { totalBatches, slowBatches, dbErrors, api429Errors } = this.batchStats;
+    if (totalBatches < this.BASELINE_WINDOW) return 'NORMAL';  // 基准线建立中
+
+    const slowRatio = slowBatches / totalBatches;
+
+    // 硬阈值检查（优先级高于动态水位）
+    if (dbErrors >= this.WATERMARK.DB_ERROR_THRESHOLD ||
+        api429Errors >= this.WATERMARK.API_429_THRESHOLD * 5) {
+      return 'FATAL';
+    }
+
+    // 使用动态水位线
+    if (slowRatio >= this.dynamicWatermark.FATAL) return 'FATAL';
+    if (slowRatio >= this.dynamicWatermark.CRITICAL) return 'CRITICAL';
+    if (slowRatio >= this.dynamicWatermark.WARN) return 'WARN';
+    return 'NORMAL';
+  }
+
+  // 自适应退避乘数（基于动态水位和消费速率）
+  protected getBackoffMultiplier(level: string): number {
+    const baseMultiplier = super.getBackoffMultiplier(level);
+    const rateRatio = this.ewmaConsumptionRate / this.getBaselineConsumptionRate();
+
+    // 消费速率越低，退避乘数越大（更激进的降速）
+    const rateAdjustment = Math.max(1.0, 2.0 - rateRatio);
+    return baseMultiplier * rateAdjustment;
+  }
+}
+```
+
+**消费速率动态水位调整矩阵**:
+
+| 消费速率比值 (当前/基准) | 说明 | WARN 水位 | CRITICAL 水位 | FATAL 水位 | 退避调整系数 |
+|------------------------|------|-----------|--------------|-----------|------------|
+| > 1.5 | 系统非常空闲，处理速度远超基准 | 0.15 | 0.40 | 0.60 | × 1.0 |
+| 1.0 - 1.5 | 系统正常负载 | 0.10 | 0.30 | 0.50 | × 1.0 - 1.5 |
+| 0.5 - 1.0 | 系统中等负载，处理变慢 | 0.075 | 0.225 | 0.375 | × 1.5 - 2.0 |
+| 0.3 - 0.5 | 系统高负载，需要降速 | 0.05 | 0.15 | 0.25 | × 2.0 |
+| < 0.3 | 系统过载，紧急降速 | 0.03 | 0.09 | 0.15 | × 2.0 |
+
+**批次耗时统计样例**:
+```
+批次 1: 1200ms (基准)  EWMA = 1200ms
+批次 2: 1300ms         EWMA = 0.3×1300 + 0.7×1200 = 1230ms
+批次 3: 800ms          EWMA = 0.3×800  + 0.7×1230 = 1091ms
+批次 4: 3500ms (慢)    EWMA = 0.3×3500 + 0.7×1091 = 1859ms
+...
+慢批次阈值 = 1859 × 2 = 3718ms
+```
+
+**动态水位调整效果**:
+- 冷启动阶段（前 10 批）：不调整，使用默认水位
+- 系统空闲时：水位上移，减少不必要的降速
+- 系统繁忙时：水位下移，提前触发降速保护
+- 长期稳定后：水位收敛到适合当前负载的最优值
 
 ---
 
@@ -1800,6 +2687,245 @@ setInterval(() => {
 }, 60000);  // 每分钟检查一次
 ```
 
+#### 6.6.6 漂移降级每步回滚条件
+
+**问题背景**:
+漂移降级是一种**保守操作**，将 `PROCESSING → UNKNOWN`、`PARTIALLY_AVAILABLE → UNKNOWN`。但降级后如果外部系统恢复正常（*arr 重新上线、Plex 重新扫描完成），需要有明确的回滚条件，将状态恢复回正常值。
+
+**降级操作与回滚条件对照表**:
+
+| 降级前状态 | 降级后状态 | 降级触发条件 | 回滚条件（恢复原状） | 回滚检查频率 |
+|-----------|-----------|-------------|---------------------|-------------|
+| `PROCESSING` | `UNKNOWN` | 超 24h 未完成 + 无活跃请求 | ✅ Radarr/Sonarr 中该媒体仍在下载队列<br>✅ 或有新的 `APPROVED` 请求创建<br>✅ 或 Plex 扫描检测到文件存在 | 下次 AvailabilitySync 运行（每小时） |
+| `PROCESSING` | `UNKNOWN` | 超 24h 未完成 + 有活跃请求 | ✅ 请求仍为 `APPROVED` 状态（保留降级，仅告警）<br>❌ 不自动回滚，需用户手动重试 | 下次 `availability-sync` 任务 |
+| `PARTIALLY_AVAILABLE` | `UNKNOWN` | 超 24h 无变化 + 无活跃请求 | ✅ Sonarr 中该季有监控的缺失剧集<br>✅ 或 Plex 扫描检测到新增文件<br>✅ 或有新的部分请求创建 | 下次 `availability-sync` 任务 |
+| `DELETED` | `UNKNOWN` | 误标删除 + 有待处理请求 | ✅ Radarr/Sonarr 中该媒体仍然存在<br>✅ 或 Plex 中检测到文件存在<br>✅ 且请求状态为 `APPROVED` | 下次 `availability-sync` 任务 |
+| `DELETED` | 保持 `DELETED` | 超 24h + 无请求 | ⚠️ 无自动回滚，需用户手动删除请求 | 永不自动回滚 |
+
+**回滚检测算法（AvailabilitySync 中补充）**:
+
+```typescript
+// server/lib/availabilitySync.ts
+
+private async runDriftRollback() {
+  const rollbackReport: RollbackReport = {
+    totalRollback: 0,
+    processingToProcessing: 0,
+    unknownToAvailable: 0,
+    errors: [],
+  };
+
+  // 场景 1: UNKNOWN 状态但 *arr 中有正在下载的记录 → 恢复 PROCESSING
+  const unknownWithProcessing = await mediaRepository
+    .createQueryBuilder('media')
+    .leftJoinAndSelect('media.requests', 'request')
+    .where('(media.status = :unknown OR media.status4k = :unknown)', {
+      unknown: MediaStatus.UNKNOWN,
+    })
+    .andWhere(qb => {
+      const subQb = qb.subQuery()
+        .select('1')
+        .from('media_request', 'req')
+        .where('req."mediaId" = media.id')
+        .andWhere('req.status = :approved');
+      return `EXISTS (${subQb.getQuery()})`;
+    }, { approved: MediaRequestStatus.APPROVED })
+    .getMany();
+
+  for (const media of unknownWithProcessing) {
+    try {
+      const rolledBack = await this.rollbackProcessingStatus(media);
+      if (rolledBack) rollbackReport.processingToProcessing++;
+    } catch (e) {
+      rollbackReport.errors.push({ tmdbId: media.tmdbId, error: e.message });
+    }
+  }
+
+  // 场景 2: UNKNOWN 状态但文件已存在 → 恢复 AVAILABLE
+  const unknownWithFiles = await mediaRepository
+    .createQueryBuilder('media')
+    .where('(media.status = :unknown OR media.status4k = :unknown)', {
+      unknown: MediaStatus.UNKNOWN,
+    })
+    .andWhere('media.updatedAt > :driftThreshold', {
+      driftThreshold: new Date(Date.now() - 48 * 60 * 60 * 1000),  // 48h 内降级的
+    })
+    .getMany();
+
+  for (const media of unknownWithFiles) {
+    try {
+      const rolledBack = await this.rollbackAvailableStatus(media);
+      if (rolledBack) rollbackReport.unknownToAvailable++;
+    } catch (e) {
+      rollbackReport.errors.push({ tmdbId: media.tmdbId, error: e.message });
+    }
+  }
+
+  rollbackReport.totalRollback =
+    rollbackReport.processingToProcessing + rollbackReport.unknownToAvailable;
+
+  if (rollbackReport.totalRollback > 0) {
+    logger.info('Drift rollback completed', {
+      label: 'AvailabilitySync',
+      ...rollbackReport,
+      fingerprint: ['drift-rollback', String(rollbackReport.totalRollback)],
+    });
+  }
+
+  return rollbackReport;
+}
+
+// 回滚 PROCESSING 状态
+private async rollbackProcessingStatus(media: Media): Promise<boolean> {
+  let rolledBack = false;
+
+  for (const is4k of [false, true]) {
+    const statusField = is4k ? 'status4k' : 'status';
+    const serviceIdField = is4k ? 'serviceId4k' : 'serviceId';
+    const externalIdField = is4k ? 'externalServiceId4k' : 'externalServiceId';
+
+    // 只有 UNKNOWN 状态的才考虑回滚
+    if (media[statusField] !== MediaStatus.UNKNOWN) continue;
+
+    // 检查是否有活跃请求
+    const hasActiveRequest = media.requests?.some(
+      r => r.is4k === is4k && r.status === MediaRequestStatus.APPROVED
+    );
+    if (!hasActiveRequest) continue;
+
+    // 检查 *arr 中是否有正在下载的记录
+    const existsInArr = await this.mediaExistsInArr(media, is4k);
+    const isDownloading = await this.isMediaDownloadingInArr(media, is4k);
+
+    if (existsInArr && isDownloading) {
+      // ✅ 满足回滚条件：恢复 PROCESSING 状态
+      media[statusField] = MediaStatus.PROCESSING;
+
+      // 保留 serviceId 和 externalServiceId（如果存在）
+      // 否则后续 BaseScanner 会重新填充
+      logger.info('Rolled back drift: UNKNOWN → PROCESSING', {
+        label: 'AvailabilitySync',
+        tmdbId: media.tmdbId,
+        is4k,
+        fingerprint: ['drift-rollback-processing', String(media.tmdbId), String(is4k)],
+      });
+
+      rolledBack = true;
+    }
+  }
+
+  if (rolledBack) {
+    await mediaRepository.save(media);
+  }
+
+  return rolledBack;
+}
+
+// 回滚 AVAILABLE 状态
+private async rollbackAvailableStatus(media: Media): Promise<boolean> {
+  let rolledBack = false;
+
+  for (const is4k of [false, true]) {
+    const statusField = is4k ? 'status4k' : 'status';
+    if (media[statusField] !== MediaStatus.UNKNOWN) continue;
+
+    // 检查 Plex/Jellyfin 中是否有文件
+    const { existsInPlex, hasMediaFiles } = await this.mediaExistsInPlex(media, is4k);
+
+    // 检查 *arr 中是否有已下载完成的文件
+    const existsInArr = await this.mediaExistsInArr(media, is4k);
+    const hasArrFiles = await this.mediaHasFilesInArr(media, is4k);
+
+    if ((existsInPlex && hasMediaFiles) || (existsInArr && hasArrFiles)) {
+      // ✅ 文件存在，恢复 AVAILABLE 状态
+      media[statusField] = MediaStatus.AVAILABLE;
+
+      logger.info('Rolled back drift: UNKNOWN → AVAILABLE', {
+        label: 'AvailabilitySync',
+        tmdbId: media.tmdbId,
+        is4k,
+        source: existsInPlex ? 'plex' : 'arr',
+        fingerprint: ['drift-rollback-available', String(media.tmdbId), String(is4k)],
+      });
+
+      rolledBack = true;
+    }
+  }
+
+  if (rolledBack) {
+    await mediaRepository.save(media);
+  }
+
+  return rolledBack;
+}
+```
+
+**降级-回滚状态机**:
+```
+PROCESSING ──┐
+             │  超 24h + 无活跃请求
+             ▼
+          UNKNOWN
+             │
+             ├─ ✅ *arr 仍在下载 + 有 APPROVED 请求
+             │       └─ 回滚 → PROCESSING
+             │
+             ├─ ✅ Plex/*arr 检测到文件已存在
+             │       └─ 回滚 → AVAILABLE
+             │
+             └─ ❌ 24h 内无变化 + 无请求
+                     └─ 保持 UNKNOWN，等待下次扫描
+```
+
+**回滚幂等性保护**:
+```typescript
+// 每次回滚操作都会记录审计日志
+private async recordRollbackAudit(
+  mediaId: number,
+  is4k: boolean,
+  fromStatus: MediaStatus,
+  toStatus: MediaStatus,
+  reason: string
+) {
+  // 使用幂等键防止重复回滚
+  const idempotencyKey = `rollback:${mediaId}:${is4k}:${fromStatus}:${toStatus}:${Date.now() / 86400000 | 0}`;
+
+  const existing = await this.redis?.get(idempotencyKey);
+  if (existing) {
+    logger.debug('Rollback already executed today, skipping', {
+      label: 'AvailabilitySync',
+      idempotencyKey,
+    });
+    return false;
+  }
+
+  await this.redis?.set(idempotencyKey, '1', 'EX', 86400);  // 24h 幂等
+
+  // 写入审计日志
+  await driftRollbackLogRepository.save({
+    mediaId,
+    is4k,
+    fromStatus,
+    toStatus,
+    reason,
+    rolledBackAt: new Date(),
+  });
+
+  return true;
+}
+```
+
+**回滚触发的通知**:
+- 回滚到 `PROCESSING`: 静默处理，不通知（避免干扰用户）
+- 回滚到 `AVAILABLE`: 触发 `MEDIA_AVAILABLE` 通知（用户期待的）
+- 回滚失败: 发送 `MEDIA_FAILED` 告警给管理员
+
+**回滚保护边界**:
+1. **24 小时内只能回滚一次**（幂等键每日粒度）
+2. **降级后 48 小时内才考虑回滚**（避免频繁状态抖动）
+3. **DELETED 状态永不自动回滚**（需用户手动干预）
+4. **有活跃请求时 PROCESSING 降级不回滚**（保持降级状态，仅告警）
+
 ---
 
 ## 七、错误回滚机制
@@ -1913,6 +3039,136 @@ fingerprint_pattern:
   contains:
     - "rollback-p0"
     - "rollback-p2"
+```
+
+### 7.0.2 Sentry 告警去重窗口
+
+**去重原理**:
+Sentry 通过 `fingerprint` 对事件进行分组，相同 fingerprint 的事件会被合并到同一个 Issue 中。去重窗口（Deduplication Window）控制同一事件在多久内重复发生时不创建新告警。
+
+**Sentry 内置去重机制**:
+```
+事件到达 Sentry → 检查 fingerprint
+    │
+    ├─ 已有同 fingerprint Issue 存在
+    │   │
+    │   ├─ 距上次事件 < 去重窗口（默认 24h）
+    │   │   └─ 合并到已有 Issue，更新事件计数
+    │   │
+    │   └─ 距上次事件 >= 去重窗口
+    │       └─ 创建新的 Issue 或者重新激活已 resolved 的 Issue
+    │
+    └─ 无同 fingerprint Issue → 创建新 Issue
+```
+
+**源码中的 fingerprint 设计与去重窗口映射**:
+
+```typescript
+// Sentry 集成示例（已在 §7.0.1 中定义）
+const sentryError = (message: string, context: {
+  fingerprint?: string[];
+  dedupeWindow?: number;  // 自定义去重窗口（毫秒）
+  // ...
+}) => {
+  Sentry.withScope((scope) => {
+    if (context.fingerprint) scope.setFingerprint(context.fingerprint);
+
+    // 自定义去重窗口：通过 Sentry SDK 的 beforeSend 钩子实现
+    scope.addEventProcessor((event) => {
+      const key = context.fingerprint?.join(':') || event.event_id;
+      const lastSentAt = this.dedupeCache.get(key);
+      const window = context.dedupeWindow || this.getDefaultDedupeWindow(context.fingerprint);
+
+      if (lastSentAt && Date.now() - lastSentAt < window) {
+        return null;  // 返回 null 表示丢弃该事件
+      }
+
+      this.dedupeCache.set(key, Date.now(), window);
+      return event;
+    });
+
+    Sentry.captureException(new Error(message));
+  });
+};
+```
+
+**去重窗口按优先级分层**:
+
+| 回滚优先级 | 默认去重窗口 | 去重键前缀 | 说明 |
+|-----------|-------------|-----------|------|
+| P0 删除 | 5 分钟 | `rollback-p0:` | 紧急事件，短窗口快速重复告警 |
+| P1 拒绝 | 15 分钟 | `rollback-p1:` | 重要事件，中等窗口 |
+| P2 API 失败 | 1 小时 | `rollback-p2:` | 业务失败，较长窗口 |
+| P3 连接错误 | 4 小时 | `rollback-p3:` | 连接错误，长窗口避免告警轰炸 |
+| P4 重试 | 24 小时 | `rollback-p4:` | 重试操作，默认 24h 窗口 |
+| 死锁强制释放 | 30 分钟 | `asyncLock-deadlock:` | 死锁事件，中等窗口 |
+| 时钟漂移检测 | 12 小时 | `clock-drift:` | 时钟问题，长窗口 |
+| 4K 回填错误 | 1 小时 | `backfill-4k-error:` | 回填错误，中等窗口 |
+
+**智能去重窗口（基于错误频率自适应）**:
+```typescript
+private getDefaultDedupeWindow(fingerprint?: string[]): number {
+  if (!fingerprint) return 24 * 60 * 60 * 1000;  // 默认 24h
+
+  const key = fingerprint.join(':');
+  const eventCount = this.eventFrequency.get(key) || 0;
+
+  // 根据事件频率动态调整窗口
+  if (eventCount > 100) return 60 * 60 * 1000;      // 高频事件：1h 窗口
+  if (eventCount > 50) return 30 * 60 * 1000;       // 中频事件：30min 窗口
+  if (eventCount > 10) return 15 * 60 * 1000;       // 低频事件：15min 窗口
+  return 5 * 60 * 1000;                              // 极少事件：5min 窗口
+}
+```
+
+**多层去重架构**:
+```
+┌──────────────────────────────────────────────────────────┐
+│  L1: 应用内去重（Javascript 内存 Map）                   │
+│      window: 5min, 避免同一实例短时间重复上报             │
+│      过期自动清理：Map + TTL                              │
+└───────────────────────────┬──────────────────────────────┘
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│  L2: Sentry SDK beforeSend 去重                           │
+│      window: 可配置，按优先级分层                          │
+│      本地缓存 + 指纹匹配                                   │
+└───────────────────────────┬──────────────────────────────┘
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│  L3: Sentry 服务端去重（Ingestion Pipeline）              │
+│      window: 24h，基于 fingerprint 分组                    │
+│      相同 Issue 内事件计数，不重复告警                      │
+└───────────────────────────┬──────────────────────────────┘
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│  L4: Alert Rule 抑制（Rate Limit）                        │
+│      10min 内超过 10 次才触发告警                           │
+│      支持 PagerDuty 静默期配置                              │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Sentry 去重配置（服务端）**:
+```yaml
+# sentry.yml 配置
+filters:
+  - !Filter
+    id: deduplicate
+    config:
+      window: 86400  # 24h 默认去重窗口
+
+alert_rules:
+  - name: P0 Critical Rollback
+    conditions:
+      - fingerprint:
+          contains: ["rollback-p0"]
+    actions:
+      - pagerduty:
+          account: oncall
+          severity: critical
+    rate_limit:
+      count: 1
+      window: 300  # 5 分钟内最多 1 次告警
 ```
 
 ---
@@ -2305,6 +3561,199 @@ class MediaRequestSubscriber {
 | PENDING | PENDING | ❌ | 无状态变更，跳过 |
 | APPROVED | FAILED | ✅ | 处理失败，标记失败状态 |
 
+#### 7.6.6 跨进程回放幂等冲突
+
+**问题背景**:
+多实例部署时，两个或多个实例可能**几乎同时**接收到相同的事件（如 TypeORM 集群主从同步延迟导致重复触发 AfterUpdate）。此时：
+
+```
+Instance A → 检查 idempotencyKey → 不存在 → 标记为存在 → 处理事件
+Instance B → 检查 idempotencyKey → 可能同时检测到不存在 → 也标记为存在 → 重复处理！
+```
+
+这就是经典的 **TOCTOU 竞态条件**（Time-of-check to time-of-use）。
+
+**源码层面的竞态风险分析**:
+
+```typescript
+// ❌ 非原子的先检查后写入（当前实现有竞态风险）
+private isDuplicateEvent(...): boolean {
+  const key = this.getIdempotencyKey(...);
+  const now = Date.now();
+
+  // 这里存在竞态窗口！
+  if (this.idempotencyKeys.has(key)) {  // Instance A 检查
+    // Instance B 也检查到不存在
+    return true;
+  }
+
+  // 在这个时间窗口，两个实例都可能通过检查
+  this.idempotencyKeys.set(key, now + this.IDEMPOTENCY_TTL);  // Instance A 设置
+  // Instance B 也设置，但实际上事件已被 A 处理了
+  return false;
+}
+```
+
+**Redis 原子幂等键实现（使用 SETNX）**:
+
+```typescript
+class DistributedIdempotencyManager {
+  private readonly IDEMPOTENCY_TTL = 300000;  // 5 分钟，覆盖扫描周期
+  private readonly LOCK_ACQUIRE_TIMEOUT = 100;  // SETNX 轮询间隔
+
+  // ✅ 原子操作：使用 Redis SETNX + PX 保证只有一个实例能获取到幂等键
+  public async tryAcquireIdempotencyKey(
+    key: string,
+    instanceId: string
+  ): Promise<{ acquired: boolean; owner?: string; conflict: boolean }> {
+    const lockValue = `${instanceId}:${Date.now()}`;
+
+    // Redis SET NX PX 原子操作：设置值当且仅当键不存在
+    const acquired = await this.redis.set(
+      this.getKey(key),
+      lockValue,
+      'PX',
+      this.IDEMPOTENCY_TTL,
+      'NX'  // 仅当键不存在时设置
+    );
+
+    if (acquired === 'OK') {
+      // 成功获取到幂等键
+      return { acquired: true, owner: instanceId, conflict: false };
+    }
+
+    // 键已存在，读取当前持有者
+    const currentValue = await this.redis.get(this.getKey(key));
+    const [owner, timestamp] = (currentValue || '').split(':');
+
+    return {
+      acquired: false,
+      owner: owner || 'unknown',
+      conflict: true,
+    };
+  }
+
+  // 幂等键释放（事件处理完成后主动删除，不等待 TTL）
+  public async releaseIdempotencyKey(key: string, instanceId: string): Promise<boolean> {
+    const currentValue = await this.redis.get(this.getKey(key));
+    const [owner] = (currentValue || '').split(':');
+
+    // 只有持有者才能释放，防止误删
+    if (owner === instanceId) {
+      await this.redis.del(this.getKey(key));
+      return true;
+    }
+
+    logger.warn('Attempted to release idempotency key owned by another instance', {
+      label: 'Idempotency',
+      key,
+      attemptedBy: instanceId,
+      actualOwner: owner,
+      fingerprint: ['idempotency-release-denied', key],
+    });
+    return false;
+  }
+
+  // 带重试的幂等获取（处理瞬时冲突）
+  public async acquireWithRetry(
+    key: string,
+    instanceId: string,
+    maxRetries = 3
+  ): Promise<{ acquired: boolean; conflict: boolean }> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const result = await this.tryAcquireIdempotencyKey(key, instanceId);
+
+      if (result.acquired) {
+        return result;
+      }
+
+      // 检查是否为瞬时冲突：检查剩余 TTL，如果很短可以等待并重试
+      const ttl = await this.redis.pttl(this.getKey(key));
+      if (ttl > 0 && ttl < 1000) {
+        // 键将在 1s 内过期，等待后重试
+        await this.delay(ttl + 50);
+        continue;
+      }
+
+      // 否则为真冲突，直接返回
+      return result;
+    }
+
+    return { acquired: false, conflict: true };
+  }
+}
+
+// 在 MediaRequestSubscriber 中使用
+class MediaRequestSubscriber {
+  public async afterUpdate(event: UpdateEvent<MediaRequest>): Promise<void> {
+    if (!event.entity) return;
+
+    const key = this.getIdempotencyKey('afterUpdate', event.entity, event.databaseEntity);
+    const { acquired, conflict, owner } = await this.idempotencyManager.acquireWithRetry(
+      key,
+      this.instanceId,
+      3
+    );
+
+    if (!acquired) {
+      if (conflict) {
+        logger.debug('Cross-instance idempotency conflict, skipping', {
+          label: 'Media Request',
+          key,
+          handledBy: owner,
+          conflict: true,
+          fingerprint: ['idempotency-conflict', key, this.instanceId],
+        });
+      } else {
+        logger.debug('Duplicate event skipped by idempotency key', {
+          label: 'Media Request',
+          key,
+          fingerprint: ['event-deduplicated', 'afterUpdate', String(event.entity.id)],
+        });
+      }
+      return;
+    }
+
+    try {
+      // 事件处理...
+      await this.sendToRadarr(event.entity);
+    } finally {
+      await this.idempotencyManager.releaseIdempotencyKey(key, this.instanceId);
+    }
+  }
+}
+```
+
+**竞态冲突类型与处理策略**:
+
+| 冲突类型 | 触发场景 | 检测方式 | 处理策略 | Sentry 指纹 |
+|---------|---------|---------|----------|------------|
+| 真冲突（不同实例） | 两个实例同时接收到同一事件 | SETNX 返回失败 + 不同 owner | 直接跳过，由获取到键的实例处理 | `['idempotency-conflict', key, localInstanceId]` |
+| 瞬时冲突（同实例重试） | 网络超时导致重试 | SETNX 失败但 TTL 很短 | 等待 TTL 过期后重试（最多 3 次） | `['idempotency-retry', key, 'attempt-'+attempt]` |
+| 死键冲突（实例崩溃） | 获取到键的实例崩溃未释放 | SETNX 失败 + TTL 很长但实例已离线 | 等待 TTL 自动过期（最长 5min） | `['idempotency-dead-key', key, ownerInstanceId]` |
+| 长时间冲突 | 某个实例长时间持有键不释放 | SETNX 持续失败 > 3 次 | 强制覆盖旧键（需配置 `forceOverride: true`） | `['idempotency-force-override', key, previousOwner]` |
+
+**幂等键命名空间**:
+```
+// 完整键格式
+jellyseerr:idem:<scope>:<entityType>:<entityId>:<eventHash>
+
+// 示例
+jellyseerr:idem:event:media_request:12345:afterUpdate:PENDING→APPROVED
+jellyseerr:idem:scan:media:6789:processMovie:full
+jellyseerr:idem:rollback:media:5555:sendToRadarr:ECONNREFUSED
+```
+
+**冲突监控指标**:
+```typescript
+// Prometheus 风格指标（建议暴露）
+idempotency_acquired_total{instance="instance-a"} 12345
+idempotency_conflict_total{type="cross-instance"} 67
+idempotency_retry_total{attempts="1"} 42
+idempotency_force_override_total 2
+idempotency_dead_key_detected_total 1
+```
+
 ---
 
 ## 八、关键设计模式总结
@@ -2313,6 +3762,8 @@ class MediaRequestSubscriber {
 - 发送到 *arr 服务使用 Promise.then().catch()，不阻塞请求响应
 - 通知发送 fire-and-forget，不等待结果
 - 扫描任务分批处理，避免长时间阻塞
+- **故障切换决策**: Rate-Limit 故障由 client 侧 catch 驱动，不依赖 Redis Sentinel
+- **5 级故障切换决策树**: 429 队列等待 → ECONNREFUSED 标记 FAILED → 4xx 不重试 → 5xx 指数退避
 
 ### 8.2 事件驱动架构
 - TypeORM 的 `@AfterInsert` / `@AfterUpdate` / `@AfterRemove` 钩子
@@ -2320,6 +3771,7 @@ class MediaRequestSubscriber {
 - **事件回放**: 利用 `event.databaseEntity` 与 `event.entity` 对比检测状态变更
 - **事务边界**: 删除操作在 `beforeRemove` 中使用传入的 `manager` 保证原子性
 - **回放幂等键**: 事件类型 + 实体 ID + updatedAt 时间戳 + 状态变更哈希，三层去重（Global Redis → Instance Map → DB Constraints）
+- **跨进程幂等冲突**: Redis SETNX 原子操作解决 TOCTOU 竞态条件，4 类冲突处理策略 + 命名空间规范
 
 ### 8.3 幂等性设计
 - 重复请求检查 (`DuplicateMediaRequestError`)
@@ -2328,6 +3780,8 @@ class MediaRequestSubscriber {
 - **防循环调用**: afterUpdate 中先校验状态再处理，避免级联更新触发死循环
 - **事件回放幂等**: `getIdempotencyKey()` + `isDuplicateEvent()` 60 秒去重窗口
 - **状态变更幂等矩阵**: 6 种典型状态转移的允许/拒绝决策表
+- **SETNX 原子幂等**: 跨实例事件去重，`tryAcquireIdempotencyKey` + `acquireWithRetry` 3 次重试
+- **4K 回填幂等**: `last4kBackfillAt` 标记 + 24h 窗口防止重复执行
 
 ### 8.4 容错机制
 - 多级错误捕获 (API 调用层 + 实体保存层)
@@ -2336,6 +3790,9 @@ class MediaRequestSubscriber {
 - **5 级回滚优先级**: P0 删除 → P1 拒绝 → P2 API 失败 → P3 连接错误 → P4 重试
 - **Sentry 告警键关联**: 每级回滚绑定唯一 fingerprint 模板 + Level 自动映射 + PagerDuty 升级策略
 - **4K 降回中间态保护**: 三元表达式条件赋值，处理中保留外部服务 ID 不被误清
+- **Sentry 多层去重窗口**: 8 类告警优先级 × 4 层去重架构（L1 应用内 → L2 SDK → L3 服务端 → L4 Alert Rule）
+- **智能去重窗口**: 基于事件频率自适应调整（高频 1h → 低频 5min）
+- **漂移降级回滚**: 5 类降级场景 × 明确回滚条件 + 4 条保护边界
 
 ### 8.5 扩展性设计
 - 通知 Agent 接口抽象，易于新增通知渠道
@@ -2343,6 +3800,8 @@ class MediaRequestSubscriber {
 - 媒体服务器类型通过枚举支持 (Plex/Jellyfin/Emby)
 - **10 种通知 Agent 标准化扩展**: BaseAgent 抽象 + NotificationAgent 接口 + 位掩码类型过滤
 - **Agent 插件热加载**: chokidar 文件监听 + require.cache 清除 + dispose 生命周期 + 接口校验 + 版本兼容性检查
+- **ABI 版本兼容矩阵**: v1.0-v1.3 4 级版本 × Adapter 模式自动适配 + semver 范围检查
+- **数据库配置迁移**: SQL `json_set` + `json_extract` 批量升级旧版本配置
 
 ### 8.6 背压与流控
 - 扫描器三层背压: Session ID 隔离 → 分批节流 → 可取消标志
@@ -2352,6 +3811,8 @@ class MediaRequestSubscriber {
 - **四级熔断水位线**: IDLE → NORMAL → WARN(10% 超时, ×1.5) → CRITICAL(30% 超时, ×3) → FATAL(50% 超时, 全局终止)
 - **硬阈值快速熔断**: DB 错误 ≥5 次、API 429 ≥15 次直接升级 FATAL
 - **健康检查 API**: 暴露 watermark、backoffMultiplier、stats 等实时监控指标
+- **动态水位调整**: EWMA 平滑消费速率 + 5 档速率比 × 动态阈值 + 自适应退避乘数
+- **前 10 批基准线**: 冷启动阶段不调整，建立基线后动态优化
 
 ### 8.7 数据一致性
 - **4K 双轨迁移**: 临时表重建 + 历史数据无缝迁移 + 回滚方案
@@ -2360,6 +3821,9 @@ class MediaRequestSubscriber {
 - **4K→1080p 中间态矩阵**: 5 种典型场景 × 6 种状态机转移路径，全覆盖无盲区
 - **漂移超 24h 兜底降级**: 3 类漂移场景（PROCESSING 超时 / PARTIALLY_AVAILABLE 卡壳 / DELETED 误标）+ 7 级状态降级决策表
 - **扫描器心跳检查**: 30 分钟无 heartbeat 自动 cancel + 重启调度
+- **4K 回填策略**: 4 级回填优先级 + 分批处理 + DRY_RUN 模式 + 报告审计
+- **跨时区时钟漂移**: NTP 3 服务器校准 + 5s 阈值 + 30s 启动阻塞 + TTL 自适应调整
+- **漂移降级回滚**: 2 类回滚场景（PROCESSING → 恢复中 / AVAILABLE → 文件存在）+ 24h 幂等保护
 
 ### 8.8 分布式考量
 - Rate-Limit 当前为内存实现，分布式部署需 Redis 集中限流
@@ -2370,3 +3834,6 @@ class MediaRequestSubscriber {
 - **Redlock 死锁识别**: 30s 锁超时 + 强制释放日志 + Sentry fingerprint 聚合
 - **全局幂等键同步**: Redis SETNX 300s TTL 覆盖多实例事件去重
 - **跨实例锁诊断 API**: getDeadlockReport() 输出持锁堆栈、预警级别、PID 等信息
+- **Sentinel vs Client 决策**: 单实例用 client 重试（低复杂度），多实例用 Redis Sentinel（高可用，10s 故障转移）
+- **实例级时钟同步**: NTP 强制校时 + UTC 时区配置 + 偏移监控告警
+- **跨进程冲突监控**: Prometheus 指标暴露（acquired/conflict/retry/dead_key）
