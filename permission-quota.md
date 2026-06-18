@@ -1196,8 +1196,6 @@ try {
    - 配额查询改为 `setLock('pessimistic_write')`（`FOR UPDATE`）
    - 或在 Media 表上的唯一索引 + 数据库层防重复插入
 
----
-
 ### 8.4 本章修改总览与优先级矩阵
 
 | 修改项 | 涉及文件数 | 新增 i18n key 数 | 优先级 | 依赖 |
@@ -1209,3 +1207,217 @@ try {
 | Plex/Jellyfin Import 空 catch | 2 | 2（导入失败通用） | 🟡 中 | 独立 |
 | CollectionRequestModal `Promise.all` → `allSettled` 汇总 | 1 | 1（汇总模板） | 🟡 中 | 依赖 catch 修复完成 |
 | 后端事务 + 悲观锁 | 1（`MediaRequest.ts`） | 0 | 🟢 低（后端独立任务） | 需数据库迁移测试 |
+
+---
+
+## 九、Promise.all 改 allSettled 落地后的 UI 路径深度分析
+
+### 9.1 当前并发请求入口与错误展示形式盘点
+
+全项目共有 **3 处 `Promise.all` 批量请求**，均为管理员/提交相关操作：
+
+| 入口位置 | 操作类型 | 并发规模 | 当前错误展示 | 有无进度/状态 UI |
+|---------|---------|---------|------------|----------------|
+| `RequestButton/index.tsx:115-119` | 批量批准/拒绝剧集请求 | 同媒体下的请求数（通常 2-20 季） | ❌ **完全无 catch**，错误静默冒泡，用户无反馈 | 无，按钮点击后直接执行，无 loading |
+| `CollectionRequestModal.tsx:201-212` | 合集批量提交电影请求 | 合集中选中的电影数（3-40 部） | ✅ 单条 Toast：`messages.requesterror`（通用错误） | ✅ `isUpdating` + Modal 按钮文案变化 |
+| `RequestItem/index.tsx:364-378` | 单条重试请求 | 1 条（不是批量） | ✅ 单条 Toast：`messages.failedretry` | ✅ `isRetrying` state，按钮 spinner |
+
+**关键发现 1：没有「管理员批量重试」功能**
+- 只有单条 `retryRequest`（`RequestItem/index.tsx:364`），不存在批量重试入口
+- 「重试」是 FAILED 状态下的单条操作，每次只发一个 POST `/api/v1/request/:id/retry`
+- 所以 allSettled 改造的目标是 **CollectionRequestModal（合集提交）** 和 **RequestButton 的批量批准/拒绝**，不涉及重试
+
+**关键发现 2：所有错误都走单条 Toast，没有列表化展示机制**
+- `useToasts.tsx` 只支持 `addToast(message, options)` 单条推送
+- 没有「多条错误聚合展示」的 Toast 变体，也没有错误详情 Modal
+- 现有的服务错误展示是 `RequestList/index.tsx:295-311` 的 `service-error-banner` 顶部横幅，但那是**列表页级别**的全局提示，不是操作级别的错误反馈
+
+### 9.2 allSettled 落地后的 UI 形式决策
+
+#### 方案对比
+
+| 方案 | 实现复杂度 | 用户体验 | 改动范围 |
+|------|----------|---------|---------|
+| **A. 聚合单条 Toast（推荐）** | 低 | 中（知道数量但不知道具体哪部） | 仅 CollectionRequestModal / RequestButton |
+| **B. 多条 Toast 逐个弹** | 低 | 差（刷屏，10 部电影 10 条 Toast） | 同上 |
+| **C. 错误详情 Modal 列表展示** | 高 | 最好 | 需要新增组件 + 大量 i18n |
+
+#### 推荐方案 A：聚合单条 Toast + 数量汇总
+
+**理由**：
+1. 与项目现有 UX 模式一致（Toast 是唯一的操作反馈渠道）
+2. 合集提交场景下，失败的电影通常是同类原因（配额超限 / 权限不足），知道数量即可
+3. 实现成本最低，不引入新组件
+
+**具体 UI 文案示例**：
+- 全部成功：保持现有成功 Toast 不变
+- 部分成功：`"Requested 5 of 8 movies successfully. 3 failed: Movie Quota exceeded."`
+- 全部失败：`"All 8 movie requests failed: Movie Quota exceeded."`
+
+**数据结构（CollectionRequestModal 内）**：
+
+```typescript
+// allSettled 返回结果处理示例
+const results = await Promise.allSettled(requests);
+
+const succeeded = results.filter(r => r.status === 'fulfilled').length;
+const failed = results.filter(r => r.status === 'rejected');
+
+if (failed.length === 0) {
+  // 全部成功 → 现有成功 Toast + onComplete + 关闭 Modal
+} else if (succeeded === 0) {
+  // 全部失败 → 单条错误 Toast，不关闭 Modal
+  const firstError = failed[0].reason;
+  // 提取第一条错误的 message 作为代表
+} else {
+  // 部分成功 → 汇总 Toast，不关闭 Modal，已成功的从列表移除
+}
+```
+
+### 9.3 提交按钮 disabled / loading 状态在部分成功场景下的收敛
+
+#### 9.3.1 当前状态机分析
+
+以 `CollectionRequestModal.tsx` 为例，按钮状态由三个独立变量共同控制：
+
+| 状态变量 | 来源 | 作用 |
+|---------|------|------|
+| `loading` (Modal prop) | `(!data && !error) || !quota` | 控制整个 Modal 的内容可见性，loading=true 时按钮 DOM 不渲染 |
+| `okDisabled` (Modal prop) | `selectedParts.length === 0` | 按钮渲染但是不可点击 |
+| `okText` (Modal prop) | `isUpdating ? 'Requesting...' : 'Request X Movies'` | 按钮文案变化 |
+| `isUpdating` (state) | `setIsUpdating(true/false)` | 标识请求是否在进行中 |
+
+**当前时序**（`CollectionRequestModal.tsx:186-239` `sendRequest` 函数）：
+
+```
+点击提交 → setIsUpdating(true)
+         → 按钮文案变为 "Requesting..."
+         → okDisabled 仍为 false（selectedParts.length > 0）
+         → 但 isUpdating=true 时用户无法再点击（按钮会被 disabled 吗？不，看代码）
+```
+
+**⚠️ 发现一个次级 Bug**：`CollectionRequestModal` 的 `okDisabled={selectedParts.length === 0}` **没有包含 `isUpdating`**！
+- 也就是说，用户在请求过程中可以反复点击确定按钮
+- 实际不会重复提交吗？要看 `sendRequest` 是否会重复触发
+- Modal 组件的 `onOk` 是按钮的 `onClick`，按钮没被 disabled 就可以多次点击
+- `isUpdating` 只改了文案，没有阻止点击
+
+对比 `MovieRequestModal.tsx:323`：`okDisabled={isUpdating || quota?.movie.restricted}` → ✅ 正确，包含了 `isUpdating`
+
+#### 9.3.2 allSettled 改造后的状态收敛设计
+
+**目标**：部分成功后，按钮状态正确收敛，用户知道可以继续操作或关闭。
+
+**状态转换矩阵**：
+
+| 场景 | isUpdating | okDisabled | okText | Modal 是否关闭 |
+|------|-----------|-----------|--------|--------------|
+| 初始状态 | false | `selectedParts.length === 0` | "Request X Movies" | 打开 |
+| 提交中 | true | true（需新增 isUpdating） | "Requesting..." | 打开 |
+| 全部成功 | false | - | - | ✅ 关闭（调用 onComplete） |
+| 全部失败 | false | `selectedParts.length === 0`（不变） | "Request X Movies" | 打开（显示错误 Toast） |
+| 部分成功 | false | `remainingSelected.length === 0` | "Request X Movies" | 打开（从选中列表移除已成功项） |
+
+**关键决策：部分成功后，已成功的电影是否从选中列表移除？**
+
+两种处理方式：
+
+**方案 A（推荐）：从选中列表移除已成功的电影**
+- 已成功的电影的 checkbox 变为「已请求」状态，不可再选
+- 用户看到剩下 N 部未成功，可以再次点击提交重试
+- 需要：`setSelectedParts(parts => parts.filter(id => !succeededIds.includes(id)))`
+- 优点：UI 状态与实际一致，再次提交不会重复请求已成功的
+- 缺点：需要维护更多状态
+
+**方案 B：不移除，让后端查重兜底**
+- 选中列表不变，用户再次点击提交
+- 后端返回 `DuplicateMediaRequestError`（409）
+- 优点：前端改动小
+- 缺点：用户困惑（我明明选了 8 部，为什么还是报 8 部的错？）
+
+**推荐方案 A**，因为：
+1. 合集页面的表格本身就有「已请求」状态的视觉反馈（`getAllRequestedParts` 函数已有此逻辑）
+2. 移除成功项符合直觉
+3. 避免用户重复提交已成功的请求
+
+#### 9.3.3 收敛时序（部分成功场景）
+
+```
+1. 用户选中 8 部电影，点击提交
+2. setIsUpdating(true) → 按钮文案变 "Requesting..."，按钮 disabled
+3. Promise.allSettled 执行 8 个 POST 请求
+4. 结果：5 成功，3 失败（配额超限）
+5. finally: setIsUpdating(false) → 按钮恢复可用
+6. 成功处理：
+   - 从 selectedParts 中移除 5 个成功的 id
+   - mutate('/api/v1/request/count')
+   - 弹汇总 Toast："Requested 5 of 8 movies. 3 failed: Movie Quota exceeded."
+7. 失败处理：3 部保持选中状态，表格 checkbox 仍为「未请求」
+8. 用户可以修改选择后再次提交
+```
+
+### 9.4 与现有错误恢复机制的协同
+
+#### 9.4.1 项目现有的「错误恢复」机制盘点
+
+项目中**没有专门的「错误恢复 hook」**，但有以下相关的恢复/重试基础设施：
+
+| 机制 | 位置 | 作用 | 能否与 allSettled 协同 |
+|------|------|------|----------------------|
+| SWR `mutate()` / `revalidate()` | 各处 SWR 使用点 | 刷新列表数据，恢复 UI 一致性 | ✅ 可以：全部/部分成功后调用 mutate |
+| SWR 自动重试 | `_app.tsx` SWRConfig | 网络失败时指数退避重试 | ❌ 不适用：POST 请求不走 SWR |
+| `isUpdating` + `finally` 模式 | 所有 Modal 提交函数 | 请求结束后重置按钮状态 | ✅ 可以：allSettled 后在 finally 中重置 |
+| `addToast` | `useToasts.tsx` | 错误通知 | ✅ 可以：汇总后弹一条 Toast |
+| `RequestItem.retry` 按钮 | `RequestItem/index.tsx:677-693` | 单条失败请求的手动重试 | ✅ 间接相关：部分成功后，失败的请求仍会显示在列表中，可单独重试 |
+| 后端 `DuplicateMediaRequestError` | `entity/MediaRequest.ts:154-162` | 防止重复提交的最后防线 | ✅ 兜底：即便前端漏移除成功项，后端也会拦截 |
+
+#### 9.4.2 allSettled 改造后的恢复路径设计
+
+**前端错误恢复 = 数据恢复 + 状态恢复 + 用户通知**
+
+1. **数据恢复（SWR mutate）**
+   - 成功 N 条 → 调用 `mutate('/api/v1/request/count')` 更新计数
+   - 成功 N 条 → 如果是 RequestButton 批量操作，调用 `onUpdate()` 刷新媒体详情
+   - 失败 M 条 → **不需要 mutate**，数据未变
+   - 注意：`mutate` 是乐观更新的反向，调用后 SWR 会重新 fetch，确保列表与后端一致
+
+2. **状态恢复（isUpdating / selectedParts）**
+   - 全部成功 → `onComplete()` → Modal 关闭
+   - 部分成功 / 全部失败 → `setIsUpdating(false)` → 按钮恢复
+   - 部分成功 → 从 `selectedParts` 中移除成功项 → 表格 checkbox 状态更新
+   - 配额预检查 → 重新计算 `currentlyRemaining`
+
+3. **用户通知（Toast 汇总）**
+   - 三种分类文案：全部成功 / 部分成功 / 全部失败
+   - 每种分类下再按错误类型细分（配额超限 / 权限不足 / 重复请求 / 网络错误）
+   - 显示第一条代表性错误，加上数量汇总
+
+4. **重试路径**
+   - 全部失败：用户修改选择后再次提交（或直接再点一次，如果是临时网络错误）
+   - 部分成功：剩余未成功的保持选中，用户可再次提交
+   - 单条精确重试：关闭 Modal 后，在请求列表页对每条失败的单独点「Retry」
+
+#### 9.4.3 与 RequestItem.retry 的关系
+
+- `RequestItem.retry` 是**列表页单条操作**，不在 Modal 内
+- allSettled 改造的是 **Modal 批量提交**场景
+- 两者是不同的操作入口，互不干扰
+- 协同点：Modal 批量提交失败的请求，提交成功后会出现在请求列表中，状态为 PENDING / APPROVED / FAILED
+  - 如果是 FAILED → 用户可以在列表页用 retry 按钮再次重试
+  - 这是「两层重试机制」：Modal 层批量 → 列表层单条
+
+### 9.5 三个并发入口的 allSettled 改造优先级
+
+| 入口 | 改造优先级 | 理由 | 改动量 |
+|------|----------|------|-------|
+| `CollectionRequestModal.tsx`（合集提交） | 🔴 最高 | 有 loading 状态但 okDisabled 漏了 isUpdating，且用户最常遇到配额超限 | 中：改 Promise.all + 加汇总 Toast + 维护选中列表 |
+| `RequestButton/index.tsx`（批量批准/拒绝） | 🟡 中 | 完全没有 catch，错误静默，但使用频次低（管理员操作） | 小：加 try-catch + 汇总 Toast |
+| `RequestItem.retry`（单条重试） | 🟢 低 | 单条操作，不需要 allSettled（本来就是单请求） | 0：不需要改 |
+
+### 9.6 附带发现的次级 Bug
+
+| Bug | 位置 | 严重度 | 修复方式 |
+|-----|------|-------|---------|
+| `okDisabled` 漏包含 `isUpdating` | `CollectionRequestModal.tsx:289` | 🟡 中 | 改为 `okDisabled={selectedParts.length === 0 || isUpdating}` |
+| 批量批准/拒绝完全无错误反馈 | `RequestButton/index.tsx:115-123` | 🟡 中 | 加 try-catch + Toast |
+| `modifyRequest`（单条批准/拒绝）也无 catch | `RequestButton/index.tsx:95-105` | 🟡 中 | 加 try-catch + Toast |
