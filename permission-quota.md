@@ -927,3 +927,285 @@ const { data: quota } = useSWR<QuotaResponse>(url, { fallbackData: defaultQuota 
 | 3. 首次加载无降级 | MovieRequestModal.tsx、CollectionRequestModal.tsx（可选 TvRequestModal） | 增加 `fallbackData: { movie: {used:0, restricted:false}, tv: {...} }` | 低（后端有兜底检查） |
 
 **推荐修复顺序**：Bug 1（死锁最严重）→ Bug 3（fallbackData 顺带消除死锁）→ Bug 2（i18n 工作量较大，可延后）。
+
+---
+
+## 八、延伸面：i18n 可复用工具、其他 Modal 同步改造、并发提交边界
+
+### 8.1 仓库中有没有现成的 i18n 通用错误 hook 可以复用？
+
+#### 8.1.1 现有 i18n 基础设施盘点
+
+仓库中不存在独立的 `useError` / `useRequestError` / `formatError` 等错误处理 hook。i18n 相关的工具链如下：
+
+| 工具 | 位置 | 功能 | 能否复用 |
+|------|------|------|---------|
+| `defineMessages` | `src/utils/defineMessages.ts:10-26` | 封装 react-intl 的 `defineMessages`，给 key 加前缀 | ✅ 可直接复用，新增错误 i18n key 的标准方式 |
+| `useIntl()` | react-intl（通过 `import { useIntl } from 'react-intl'`） | 翻译文案 | ✅ 所有 Modal 已在用 |
+| `useToasts` | `src/hooks/useToasts.tsx:10-48` | Toast 通知封装，`addToast(message, options)` | ✅ 所有 Modal 已在用，但**内部未封装错误格式化** |
+| `globalMessages` | `src/i18n/globalMessages` | 全局通用文案 | 仅有 `error`、`success` 等基础 key，无配额/权限专用错误 |
+
+`defineMessages` 工具的核心是加前缀：
+
+```typescript
+// src/utils/defineMessages.ts:10-26
+export default function defineMessages<T extends Record<string, string>>(
+  prefix: string,
+  messages: T
+): Messages<T> {
+  // 返回的 message id 自动变成 `${prefix}.${key}`
+  // 例如 defineMessages('components.RequestModal', { requesterror: '...' })
+  // → id = "components.RequestModal.requesterror"
+}
+```
+
+#### 8.1.2 现有项目中「能正确透传后端错误」的最佳实践参考
+
+项目里**少数几个地方**已经正确处理了 `axios.isAxiosError()`，可以作为复用模板：
+
+| 文件 | 行号 | 处理模式 | 可借鉴点 |
+|------|------|---------|---------|
+| `UserList/index.tsx` | 404-415 | `e?.response?.data?.errors?.includes('USER_EXISTS')` → 映射为特定 i18n key | ✅ 错误码 + i18n 映射模式 |
+| `Login/AddEmailModal.tsx` | 80-88 | `axios.isAxiosError(e) && e.response?.data?.message === ApiErrorCode.InvalidEmail` | ✅ 精确匹配后端 ApiErrorCode 常量 |
+| `Login/LocalLogin.tsx` | 69-75 | `axios.isAxiosError(e) && e.response?.status === 403` → 选择不同文案 | ✅ 按状态码分类 |
+| `TitleCard/ErrorCard.tsx` | 32-42 | `axios.isAxiosError(e) || e.response?.status !== 404` 才弹 Toast | ✅ 过滤预期错误不打扰用户 |
+| `Settings/SettingsMetadata.tsx` | 118-182 | 读取 `error.response.data.*` 展示后端返回的测试报告数据 | ✅ 结构化透传后端 detail |
+
+**结论：没有现成的通用 hook 可以直接复用，但项目内有足够多的「正确用法代码片段」可以抽取。**
+
+#### 8.1.3 建议：新增 i18n key（无需新建 hook）
+
+三种改造成本从低到高：
+
+**方案 A（最小侵入，推荐）**：在 3 个 RequestModal 各自的 `defineMessages` 内新增 key：
+
+```typescript
+// MovieRequestModal.tsx 的 defineMessages（第 21-38 行）中新增：
+quotaExceededMovie: 'Movie quota exceeded. Please try again later.',
+quotaExceededTv: 'Series quota exceeded. Please try again later.',
+noPermissionRequest: 'You do not have permission to make this request.',
+```
+
+在 10 种 locale json（`src/i18n/locale/*.json`）中同步补翻译。匹配逻辑：
+
+```typescript
+catch (e) {
+  let errorMessage = intl.formatMessage(messages.requesterror);
+  if (axios.isAxiosError(e) && e.response?.data?.message) {
+    const msg = e.response.data.message;
+    if (msg.includes('Movie Quota exceeded')) {
+      errorMessage = intl.formatMessage(messages.quotaExceededMovie);
+    } else if (msg.includes('Series Quota exceeded')) {
+      errorMessage = intl.formatMessage(messages.quotaExceededTv);
+    } else if (msg.includes('permission')) {
+      errorMessage = intl.formatMessage(messages.noPermissionRequest);
+    }
+  }
+  addToast(errorMessage, { appearance: 'error', autoDismiss: true });
+}
+```
+
+**方案 B（复用性更好）**：新建 `src/utils/requestError.ts` 导出一个纯函数：
+
+```typescript
+import type { IntlShape, MessageDescriptor } from 'react-intl';
+import axios from 'axios';
+
+export function formatRequestError(
+  e: unknown,
+  intl: IntlShape,
+  messages: Record<string, MessageDescriptor>,
+  fallbackKey: string
+): string {
+  if (!axios.isAxiosError(e) || !e.response?.data?.message) {
+    return intl.formatMessage(messages[fallbackKey]);
+  }
+  const msg = e.response.data.message;
+  if (msg.includes('Quota exceeded')) { ... }
+  // ...
+}
+```
+
+**方案 C（暂不需要）**：新建 `useRequestError` hook — 仅当项目中超过 10+ 组件需要相同逻辑时才值得抽象，当前使用场景集中在 3 个 Modal，成本大于收益。
+
+---
+
+### 8.2 其他 Modal / 操作点是否要同步改造 catch 块？
+
+#### 8.2.1 全仓库 `catch {}` 空参数代码普查
+
+通过 `catch {` 正则搜索，共发现 **11 处空 catch**（未解构 error 参数）。分类评估如下：
+
+##### ▶️ 第一类：请求 Modal（用户可见度最高，必须同步修）
+
+| 文件 | catch 行 | 当前错误消息 | 修复优先级 |
+|------|---------|------------|----------|
+| `RequestModal/MovieRequestModal.tsx` | 127 | `requesterror` | 🔴 最高（配额/权限核心场景） |
+| `RequestModal/MovieRequestModal.tsx` | 170 | 静默无 Toast | 🟡 中（取消请求，失败后用户无法感知） |
+| `RequestModal/MovieRequestModal.tsx` | 215 | `errorediting` | 🔴 高 |
+| `RequestModal/TvRequestModal.tsx` | 160 | `errorediting` / `requestcancelled` | 🔴 高 |
+| `RequestModal/TvRequestModal.tsx` | 225 | `requesterror` | 🔴 最高 |
+| `RequestModal/CollectionRequestModal.tsx` | 232 | `requesterror` | 🔴 最高（含**并发 Promise.all** 语义） |
+
+**注意：CollectionRequestModal 的 catch 语义特殊**（第 201-237 行）：
+
+```typescript
+// CollectionRequestModal.tsx:201-212
+await Promise.all(
+  (data?.parts.filter((part) => selectedParts.includes(part.id)) ?? []).map(
+    async (part) => {
+      await axios.post<MediaRequest>('/api/v1/request', { ... });
+    }
+  )
+);
+```
+
+这是**并发提交多个电影请求**（合集里每部电影一个 POST）。`Promise.all` 的特性是：只要有一个子请求失败就整体 catch，部分成功的请求不会自动回滚。修复此 catch 时需考虑：
+
+- 能否区分「第 N 部电影配额不足」vs「第 M 部权限被拒」？
+- 是否需要逐个检查成功失败再展示汇总？
+- **当前代码只要有一个子请求失败，就只弹通用「Something went wrong」Toast，用户不知道哪些电影成功了，必须手动刷新请求列表确认。**
+
+##### ▶️ 第二类：Issue Modal / 批量操作 / 设置 Modal（次优先级）
+
+| 文件 | catch 行 | 当前错误消息 | 修复优先级 | 说明 |
+|------|---------|------------|----------|------|
+| `IssueModal/CreateIssueModal.tsx` | 141-145 | `toastFailedCreate` | 🟡 中 | Issue 不涉及配额，但可能遇到 403（无 CREATE_ISSUES 权限）、404（媒体不存在）、429（限频） |
+| `RequestList/RequestItem/index.tsx` | 337-341 | `failedmodify` | 🟡 中 | 批准/拒绝请求的操作，403（无 MANAGE_REQUESTS 权限）需明确提示 |
+| `RequestList/RequestItem/index.tsx` | 370-374 | `failedretry` | 🟡 中 | 重试请求失败的错误详情：可能被拒绝过的媒体又被拉黑了 |
+| `UserList/BulkEditModal.tsx` | 60-64 | `userfail` | 🟢 低 | 批量改权限，错误原因通常是 403（非管理员），不需要非常细的 detail |
+| `UserList/PlexImportModal.tsx` | 86 | 无 Toast，失败后 `setImporting(false)` | 🟡 中 | 导入用户失败后用户完全不知道原因（连接超时？令牌失效？） |
+| `UserList/JellyfinImportModal.tsx` | 106 | 同上静默 | 🟡 中 | 同上 |
+| `OverrideRule/OverrideRuleModal.tsx` | 111 | 静默（仅 `setIsValidated(false)`） | 🟢 低 | 连接 Radarr/Sonarr 测试失败，UI 已有红色状态提示辅助，不必须 Toast |
+| `OverrideRule/OverrideRuleModal.tsx` | 189 | 注释写着 `// set error here` 但**完全没处理** | 🟠 高 | 保存 OverrideRule 失败是真 bug：用户点保存但没成功，完全无反馈，Modal 也不关闭 |
+| `UserList/index.tsx` | 295-299 | `userdeleteerror` | 🟡 中 | 删除用户时的 403（无法删除主管理员）需要区分 |
+
+##### ▶️ 第三类：4K 场景与普通场景的关系
+
+RequestModal 本身**不区分 4K / 非 4K** —— 同一个组件通过 `is4k` prop 控制：
+- `RequestButton.tsx:67-68` 维护两个独立 state：`showRequestModal` 和 `showRequest4kModal`
+- `RequestButton.tsx:87-93` 分别处理 `active4kRequest`
+- 但最终渲染的是同一个 `MovieRequestModal` / `TvRequestModal` / `CollectionRequestModal`
+
+**结论：4K Modal 和非 4K Modal 是**同一个组件实例**，只需在 Movie / Tv / Collection 三个 RequestModal 中改一次，4K 场景自动受益。**
+
+#### 8.2.2 本次修复的建议边界
+
+| 范围 | 建议操作 | 理由 |
+|------|---------|------|
+| 3 个 RequestModal（共 6 处 catch） | **必须同步修** | 配额/权限是核心场景，是本次分析的主要目标 |
+| CreateIssueModal + RequestItem 3 处操作 catch | **建议顺便修** | 同样涉及 403 权限 detail，新增 i18n key 后代码模式一致 |
+| BulkEditModal + UserList 删除 + Plex/Jellyfin Import | **可以延后** | 管理端操作，使用频次低 |
+| OverrideRuleModal 第 189 行空 catch | **强烈建议修** | 有 `// set error here` TODO 注释，是明确的历史债 |
+| OverrideRuleModal 第 111 行 + Tiles 第 89 行 | **可以不动** | 测试连接失败已有 UI 状态提示 |
+
+---
+
+### 8.3 修复后请求队列在并发提交场景下的错误透传与重试边界
+
+#### 8.3.1 现有的并发请求路径盘点
+
+| 并发入口 | 类型 | 并发规模 | 后端事务/隔离 |
+|---------|------|---------|--------------|
+| `CollectionRequestModal.tsx:201-212` | `Promise.all` + N 个 `POST /api/v1/request` | 合集里的电影数量（通常 3-20，极端情况 40+） | 每个 POST 独立事务 |
+| `RequestButton.tsx:95-123` 的 `approveRequests` / `declineRequests` | `Promise.all` + N 个 `POST /:id/approve` | 批量操作的选中项数量（通常 5-50） | 每个 POST 独立事务 |
+| 前端用户快速双击按钮 | 重复提交（UI 无全局防抖） | 通常 2 次 | 后端有 `DuplicateMediaRequestError` 防护 |
+
+#### 8.3.2 后端 `MediaRequest.request()` 的并发安全分析
+
+代码位置：`server/entity/MediaRequest.ts:47-450`
+
+**三个关键检查阶段（均无显式事务/锁）：**
+
+```
+阶段 1：权限检查（第 60-112 行）→ 纯内存读（user.permissions）
+阶段 2：配额检查（第 114-120 行）→ getQuota() 执行 SELECT COUNT
+阶段 3：查重 + 写入（第 122 行起）→ SELECT 是否存在 Media + INSERT MediaRequest
+```
+
+**关键发现：没有数据库事务包裹，存在竞争窗口。**
+
+竞态场景（时序问题）：
+1. 用户配额剩余 1 次，在 10ms 内连续发送两个合法请求
+2. 请求 A 在阶段 2 配额检查通过（used=4/5）
+3. 请求 B 也在阶段 2 配额检查通过（同一时刻 used=4/5，A 尚未 COMMIT）
+4. 请求 A 阶段 3 INSERT 成功（现在 used=5）
+5. 请求 B 阶段 3 也 INSERT 成功（used=6，**实际超额 1**）
+
+配额检查的 SQL（`User.ts:293-348`）用 `findAndCount` + 内存累加，**不加 `FOR UPDATE` 行锁**，在高并发下无法严格保证不超限。
+
+#### 8.3.3 修复前端 catch 后对后端边界的影响
+
+| 维度 | 修复前边界 | 修复后边界（仅改前端 catch / SWR fallback） | 是否变化 |
+|------|----------|------------------------------------------|---------|
+| 前端重复按钮点击防护 | `isUpdating` + Modal loading=true 时按钮 DOM 不渲染 | 不变（fallbackData 后 loading 能正常翻 false，**反而更早启用 `okDisabled` 防重复点击**） | ✅ 加固，无负面影响 |
+| `Promise.all` 部分成功 | 只要 1 个失败就整体 catch，静默吞掉已成功请求，Toast 通用错误 | 同上，但用户能看到第 N 条错误原因；**后端实际部分成功不变** | ⚠️ 需要额外进度提示才能完全解决（可选改造） |
+| `DuplicateMediaRequestError`（409） | 前端吞掉，显示通用错误 | 修复后可精确提示「This media already has a pending request」 | ✅ 用户困惑减少 |
+| `QuotaRestrictedError`（403） | 前端吞掉 | 修复后精确提示配额超额 + 周期天数 | ✅ 边界清晰化，用户不会反复提交重试 |
+| `RequestPermissionError`（403） | 前端吞掉 | 修复后提示无特定权限 | ✅ 减少管理员被无效咨询 |
+| 后端竞态超限 | 存在（小概率） | 前端 catch 修复不改变数据库隔离级别，竞态仍存在 | ❌ 不变（需后端加事务/乐观锁才能修复，前端无能为力） |
+
+#### 8.3.4 重试边界的变化
+
+**重试入口 1：RequestItem 的 `retryRequest`（`RequestItem/index.tsx:364-378`）**
+
+```typescript
+try {
+  const result = await axios.post(`/api/v1/request/${request.id}/retry`);
+} catch {
+  addToast(intl.formatMessage(messages.failedretry), { ... });
+}
+```
+
+后端 retry 路由（`request.ts:636-661`）：
+- 仅要求 `MANAGE_REQUESTS` 权限
+- 逻辑是把 `status` 从 `FAILED` 改为 `APPROVED` 然后 `save()`
+- save 后触发 Subscriber 再次发请求给 Radarr/Sonarr
+- **没有重试次数限制**：管理员可以无限点重试（可能对下游 *arr 造成压力）
+
+本次前端 catch 修复后：如果 retry 失败是因为 403（突然没权限了）或媒体被拉黑，用户能知道具体原因，而不是盲目反复重试。
+
+**重试入口 2：SWR 自动重试**
+
+`_app.tsx:191-198` 的 SWRConfig 未配置 `shouldRetryOnError: false`，所以配额/权限 SWR 默认会在失败后指数退避重试 5 次。
+
+- **Bug 3 修复前**：MovieRequestModal 在 SWR 重试的 30 秒窗口内持续卡 loading
+- **Bug 3 修复后（fallbackData）**：即便 SWR 还在后台重试，Modal 已经用默认配额渲染内容，用户可以操作
+- **建议同步加**：`shouldRetryOnError: (err) => err.response?.status !== 403`（403 永远不可能通过重试解决，避免无意义的请求）
+
+#### 8.3.5 并发场景下的修复建议（延伸，非本次核心）
+
+1. **CollectionRequestModal 的 `Promise.all` 改为 `Promise.allSettled`**：
+   - 遍历结果分 `fulfilled` / `rejected` 分组
+   - 汇总 Toast：「成功请求 5 部，2 部配额超限，1 部无权限」
+   - 自动 `mutate('/api/v1/request/count')` 更新列表
+
+2. **SWR 配置针对 403/401 关闭重试**：
+   ```typescript
+   // _app.tsx 的 SWRConfig value 中新增
+   shouldRetryOnError: (err) => {
+     if (axios.isAxiosError(err)) {
+       return ![401, 403, 404, 409].includes(err.response?.status ?? 0);
+     }
+     return true;
+   }
+   ```
+
+3. **后端并发保护（独立 PR，非本次前端修复）**：
+   - 在 `MediaRequest.request()` 外层包裹 TypeORM 事务
+   - 配额查询改为 `setLock('pessimistic_write')`（`FOR UPDATE`）
+   - 或在 Media 表上的唯一索引 + 数据库层防重复插入
+
+---
+
+### 8.4 本章修改总览与优先级矩阵
+
+| 修改项 | 涉及文件数 | 新增 i18n key 数 | 优先级 | 依赖 |
+|-------|----------|----------------|-------|------|
+| 3 个 RequestModal 的 6 处 catch 透传后端 message | 3 | 3-6（配额/权限/重复请求） | 🔴 最高 | 先加 i18n key，加 locale 翻译 |
+| IssueModal + RequestItem 4 处操作 catch | 2 | 2-3（issue 创建失败/重试失败） | 🟠 高 | 可复用相同匹配模式 |
+| OverrideRuleModal 第 189 行空 catch（TODO 注释） | 1 | 2（创建失败/更新失败） | 🟠 高 | 最简单，无需细分错误类型 |
+| SWR `shouldRetryOnError` 跳过 403 | 1（`_app.tsx`） | 0 | 🟡 中 | 独立，无依赖 |
+| Plex/Jellyfin Import 空 catch | 2 | 2（导入失败通用） | 🟡 中 | 独立 |
+| CollectionRequestModal `Promise.all` → `allSettled` 汇总 | 1 | 1（汇总模板） | 🟡 中 | 依赖 catch 修复完成 |
+| 后端事务 + 悲观锁 | 1（`MediaRequest.ts`） | 0 | 🟢 低（后端独立任务） | 需数据库迁移测试 |
