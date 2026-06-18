@@ -283,3 +283,291 @@ catch {
    - DECLINED 状态的请求不占用配额
    - PENDING、APPROVED、PROCESSING、AVAILABLE、COMPLETED 均占用配额
    - 这意味着管理员拒绝请求后，用户的配额会自动「退还」
+
+---
+
+## 五、家庭组共享场景下的配额边界分析
+
+### 5.1 Seerr 无「家庭组配额汇总」概念：完全按独立用户计量
+
+**关键结论：Seerr 不实现任何 Plex Home / Jellyfin 家庭组的配额层级汇总逻辑。**
+
+用户类型定义在 `server/constants/user.ts:1-6`，仅有四种独立账户类型：
+
+```typescript
+enum UserType {
+  PLEX = 1,      // Plex 登录用户（含 Plex Home 成员）
+  LOCAL = 2,     // 本地创建用户
+  JELLYFIN = 3,  // Jellyfin 登录用户
+  EMBY = 4,      // Emby 登录用户
+}
+```
+
+配额计量逻辑 `User.getQuota()` 完全基于 `requestedBy.id`（当前用户的 Seerr 内部 ID）进行统计，与 Plex/Jellyfin 服务端的家庭组层级、家长账户 ID、成员归属关系**完全解耦**。
+
+**证据链：**
+1. `User.ts:293-304` 电影配额查询的 WHERE 条件只有 `requestedBy: { id: this.id }`
+2. `User.ts:317-348` 剧集配额查询同样只过滤 `requestedBy.id = :userId`
+3. `plextv.ts:67-68` 中虽然 Plex API 返回了 `home` 字段标识用户是否属于 Plex Home，但该字段**仅用于服务端连接检测**，从未参与配额或权限计算
+4. Plex 用户导入逻辑 `routes/user/index.ts:657-722` 中，每个 Plex 用户（无论家庭组成员还是好友共享）均被创建为拥有独立 `id` 的 Seerr 用户行
+
+**实际效果示例：**
+- Plex Home 家长账户（User ID: 1）配额 = 统计 `requestedBy.id = 1` 的请求
+- Plex Home 孩子账户（User ID: 5）配额 = 统计 `requestedBy.id = 5` 的请求
+- 两者**互不影响、各自独立**，不存在汇总到家长或家庭共享配额池的机制
+
+### 5.2 家长撤销成员资格时的配额处理
+
+Seerr 中有三种与「成员资格撤销」相关的操作，配额处理行为各不同：
+
+#### 场景 A：解除 Plex/Jellyfin 账户关联（Unlink Linked Account）
+
+代码位置：`server/routes/user/usersettings.ts:311-360`（Plex）、`460-515`（Jellyfin）
+
+```typescript
+// Plex 解除关联核心逻辑
+user.userType = UserType.LOCAL;    // 转换为本地用户
+user.plexId = null;                // 清除 Plex ID
+user.plexUsername = null;
+user.plexToken = null;
+await userRepository.save(user);
+```
+
+**配额处理：完全不触动已用配额。**
+- 用户的 `id`（主键）保持不变
+- `movieQuotaLimit / tvQuotaLimit / Days` 等配额字段保持原值
+- 历史 `MediaRequest` 记录的 `requestedBy.id` 关联不变
+- 效果：用户「降级」为本地账户后，配额的已用值、剩余值与解除前**完全一致**，配额额度继续在原时间窗口内累计
+
+**前置条件保护**（`usersettings.ts:343-346`）：
+- 要求用户已设置 `email` 和 `password`，防止解除后无法登录
+- id = 1 的主管理员禁止解除媒体服务器关联
+
+#### 场景 B：从用户列表删除用户（Delete User）
+
+代码位置：`server/routes/user/index.ts:593-655`
+
+```typescript
+// 先手动删除所有请求（触发 Subscriber 级联更新 Media 状态）
+await requestRepository.remove(user.requests, { chunk: user.requests.length / 1000 });
+// 再删除用户行
+await userRepository.delete(user.id);
+```
+
+**配额处理：已用配额随用户记录一起被删除。**
+- 用户所有的 `MediaRequest` 记录被显式删除（而非依赖数据库 CASCADE，因为 CASCADE 不会触发 TypeORM 的 `afterRemove` Subscriber）
+- 用户行被 DELETE，配额字段一并消失
+- 对其他用户的配额无任何影响（因为按 id 独立计量）
+- `MediaRequestSubscriber.afterRemove`（`subscriber/MediaRequestSubscriber.ts:1075-1084`）会将对应 Media 状态重置为 UNKNOWN/DELETED，但不触及任何配额统计
+
+**前置保护**（`routes/user/index.ts:609-621`）：
+- id = 1 的主管理员不可删除
+- 非 Owner（id ≠ 1）不能删除 ADMIN 用户
+
+#### 场景 C：Plex/Jellyfin 服务端撤销共享但用户未在 Seerr 中被删除
+
+这是最常见的「软撤销」场景：家长在 plex.tv 上移除了家庭成员的服务器访问权限，但 Seerr 数据库中仍然保留该用户行。
+
+**配额处理：无任何变化，配额计量继续独立进行。**
+- Seerr 不主动与 Plex/Jellyfin 同步成员资格状态
+- 该用户的后续请求在认证阶段（auth middleware）会因 Plex 令牌失效或无服务器访问权限而失败
+- 但已统计的配额不会被清零、退还或转移
+- 管理员需要手动执行「删除用户」或「禁用用户」操作
+
+### 5.3 配额边界总结表
+
+| 操作场景 | 用户 Seerr ID | 历史请求记录 | 已用配额值 | 剩余配额值 |
+|---------|-------------|------------|----------|----------|
+| Plex Home 成员提交请求 | ✅ 保留（独立 id） | ✅ 计入该用户 id | ✅ 独立累计，不汇总家长 | ✅ 独立扣减 |
+| 解除 Plex 关联（转本地用户） | ✅ 不变 | ✅ 保留，关联不变 | ✅ 不变，继续累计 | ✅ 不变 |
+| 删除用户 | ❌ 被删除 | ❌ 被级联删除 | ❌ 随用户消失 | ❌ 随用户消失 |
+| Plex 服务端撤销共享 | ✅ 保留 | ✅ 保留 | ✅ 保留（但用户可能无法再提交新请求） | ✅ 保留 |
+| 管理员拒绝某条请求 | ✅ 不变 | ✅ 保留（状态 DECLINED） | ⬇️ 自动退还（DECLINED 不计入） | ⬆️ 自动增加 |
+
+---
+
+## 六、上游故障容错：前端对配额 API 错误的处理行为
+
+### 6.1 配额 API 可能失败的场景
+
+后端配额接口 `GET /api/v1/user/:id/quota`（`routes/user/index.ts:801-832`）可能返回的错误：
+
+| HTTP 状态 | 触发条件 |
+|----------|---------|
+| 403 Forbidden | 查看他人配额但不同时拥有 `MANAGE_USERS` **且** `MANAGE_REQUESTS` 权限 |
+| 404 Not Found | 用户 id 不存在 |
+| 500 Internal Server Error | 数据库查询异常、TypeORM 错误等 |
+
+此外还包括：网络超时、DNS 失败、服务端重启导致的连接失败。
+
+### 6.2 各组件的容错行为分析
+
+#### （1）MiniQuotaDisplay（用户下拉菜单中的配额预览）
+
+代码位置：`src/components/Layout/UserDropdown/MiniQuotaDisplay/index.tsx:21-31`
+
+```typescript
+const { data, error } = useSWR<QuotaResponse>(`/api/v1/user/${userId}/quota`);
+
+if (error) {
+  return null;  // 静默降级：有错误直接不渲染
+}
+
+if (!data && !error) {
+  return <SmallLoadingSpinner />;  // 加载中显示旋转指示器
+}
+```
+
+**容错策略：静默隐藏（Silent Degradation）**
+- ✅ 403 / 404 / 500 / 网络错误：**直接返回 null，不显示任何内容**，用户看到的是下拉菜单中缺失了配额区块，没有 Toast、没有错误提示
+- ✅ 加载中：显示小型加载 Spinner
+- ✅ 无配额限制（limit 均为 0）：同样不渲染（第 35 行判断）
+- **无本地缓存回退**：SWR 默认配置下如果有缓存数据会显示缓存，但首次加载失败就什么都不显示
+
+#### （2）MovieRequestModal / CollectionRequestModal（电影请求模态框）
+
+代码位置：
+- `MovieRequestModal.tsx:66-71`（SWR 配额获取）
+- `MovieRequestModal.tsx:319`（Modal loading 判断）
+- `MovieRequestModal.tsx:323`（okDisabled 判断）
+
+```typescript
+const { data: quota } = useSWR<QuotaResponse>(
+  user && (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+    ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
+    : null
+);
+
+// Modal 级别的加载判断
+<Modal
+  loading={(!data && !error) || !quota}  // 配额没拿到 → 整个 Modal 保持加载状态
+  ...
+  okDisabled={isUpdating || quota?.movie.restricted}  // quota 为 undefined 时不限制
+>
+```
+
+**容错策略：持续加载（Blocking Loading）**
+- ✅ 加载中（`!quota` 且无 error）：Modal 持续显示 loading 遮罩，用户无法交互
+- ⚠️ 403 / 500 等错误：SWR 返回 `error`，但组件**只解构了 `data: quota`**，未使用 `error` 变量
+  - 结果：`quota` 为 `undefined`
+  - Modal 的 `loading={(!data && !error) || !quota}` → `!quota = true` → **持续卡在加载状态**
+  - `okDisabled={... || quota?.movie.restricted}` → `undefined?.restricted = undefined` → falsy → 按钮可点击
+  - 用户可绕过前端配额限制直接提交（后端仍会检查配额并返回 403，最终触发统一 Toast 报错）
+- **无本地缓存回退**：如果之前没加载成功过，SWR 没有缓存数据
+
+CollectionRequestModal 的行为完全一致（`CollectionRequestModal.tsx:267`）。
+
+#### （3）TvRequestModal（剧集请求模态框）
+
+代码位置：`TvRequestModal.tsx:91-96`、`TvRequestModal.tsx:392-393`
+
+```typescript
+const { data: quota } = useSWR<QuotaResponse>(
+  user && (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+    ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
+    : null
+);
+
+<Modal
+  loading={!data && !error}  // 只等媒体详情加载，不等 quota
+  ...
+>
+```
+
+**容错策略：不阻塞加载 + 静默降级（Non-blocking + Silent）**
+- ✅ 加载中：Modal 只等待媒体详情（`!data && !error`），**不等待配额数据**
+- ✅ 配额 API 失败：`quota` 为 `undefined`
+  - 配额 UI 区块因 `quota` 为空不渲染（QuotaDisplay 组件不显示）
+  - `currentlyRemaining`（`TvRequestModal.tsx:98-101`）退化为 `(0) - selected + editingLength`，可能显示负数
+  - 「全选」按钮（`TvRequestModal.tsx:305-327`）因 `quota?.tv.limit` 为 undefined，跳过配额限制逻辑
+  - 用户仍然可以提交，由后端做最终检查
+- ✅ 不会卡住 UI，用户可以继续操作（但没有配额提示）
+
+#### （4）UserProfile（用户资料页配额展示）
+
+代码位置：`src/components/UserProfile/index.tsx:66-75`、`148-153`
+
+```typescript
+const { data: quota } = useSWR<QuotaResponse>(
+  user && (user.id === currentUser?.id || currentHasPermission(..., { type: 'and' }))
+    ? `/api/v1/user/${user.id}/quota`
+    : null
+);
+
+// 渲染时做短路判断
+{quota && (user.id === currentUser?.id || ...) && (
+  <QuotaSection ... />
+)}
+```
+
+**容错策略：静默降级（Silent Degradation）**
+- ✅ 403 / 404 / 500：`quota` 为 undefined，`{quota && ...}` 判断直接短路，配额卡片不渲染
+- ✅ 无 Toast，无错误提示
+- ✅ 用户资料页其他内容（请求历史、通知设置等）正常显示
+
+#### （5）QuotaDisplay 组件本身（纯展示层）
+
+代码位置：`src/components/RequestModal/QuotaDisplay/index.tsx:39-147`
+
+QuotaDisplay 是受控组件，只接收 props，不自己发请求：
+
+```typescript
+const QuotaDisplay = ({ quota, mediaType, userOverride, remaining, overLimit }) => {
+  // 计算进度时使用多重 nullish fallback
+  progress={Math.round(
+    ((remaining ?? quota?.remaining ?? 0) / (quota?.limit ?? 1)) * 100
+  )}
+```
+
+- `quota` 为 `undefined` 时：`remaining ?? undefined ?? 0 = 0`，`limit ?? 1 = 1`，进度显示 0%
+- 文本也安全 fallback 为 0，但如果父组件没传 `overLimit`，不会显示红色超量提示
+
+### 6.3 提交阶段的后端兜底与前端 Toast
+
+无论前端配额加载状态如何，提交请求时后端 `MediaRequest.request()`（`entity/MediaRequest.ts:114-120`）始终会做配额检查：
+
+```typescript
+const quotas = await requestUser.getQuota();
+if (requestBody.mediaType === MediaType.MOVIE && quotas.movie.restricted) {
+  throw new QuotaRestrictedError('Movie Quota exceeded.');
+}
+```
+
+前端在 `MovieRequestModal.tsx:127-131`、`TvRequestModal.tsx:225-229` 的提交 catch 中：
+
+```typescript
+catch {
+  addToast(intl.formatMessage(messages.requesterror), {
+    appearance: 'error',
+    autoDismiss: true,
+  });
+}
+```
+
+**问题**：catch 块没有捕获 `error` 参数，后端返回的具体错误消息（如 `Movie Quota exceeded.` vs `You do not have permission...`）被完全丢弃，用户看到的永远是「Something went wrong while submitting the request.」。
+
+### 6.4 容错行为汇总对比
+
+| 组件 | API 失败时的行为 | 是否阻塞 UI | 是否显示 Toast | 是否降级使用缓存 | 后端兜底 |
+|-----|----------------|-----------|--------------|----------------|---------|
+| MiniQuotaDisplay | 静默不渲染（return null） | ❌ 不阻塞 | ❌ 无 | SWR 有缓存则用缓存 | 不涉及 |
+| MovieRequestModal | **持续卡在 loading 状态**，按钮可点击 | ✅ 阻塞 Modal | ❌ 无 | 首次失败无缓存 | ✅ 提交时检查 |
+| CollectionRequestModal | **持续卡在 loading 状态**，按钮可点击 | ✅ 阻塞 Modal | ❌ 无 | 首次失败无缓存 | ✅ 提交时检查 |
+| TvRequestModal | 不阻塞，配额 UI 隐藏，全选跳过配额检查 | ❌ 不阻塞 | ❌ 无 | SWR 有缓存则用缓存 | ✅ 提交时检查 |
+| UserProfile | 配额卡片不渲染，其他内容正常 | ❌ 不阻塞 | ❌ 无 | SWR 有缓存则用缓存 | 不涉及 |
+| 提交 catch（所有 Modal） | 显示通用错误 Toast | ❌ 不阻塞 | ✅ 通用错误 Toast | 不涉及 | ✅（已生效） |
+
+### 6.5 当前容错设计的风险点
+
+1. **MovieRequestModal / CollectionRequestModal 的潜在死锁**：
+   - 配额 API 返回 403/500 时，Modal 的 `loading` prop 恒为 true（因为 error 被忽略、`!quota` 成立）
+   - 用户无法关闭 Modal（除非刷新页面或点击背景，但 `loading={true}` 可能禁用背景点击）
+   - 应改为解构 `error` 并在出错时终止加载状态
+
+2. **前端配额预检查失效导致的用户困惑**：
+   - TvRequestModal 在配额 API 失败时允许用户点击「全选」和「提交」，但后端仍会返回配额超限 403
+   - 用户看到的是通用「提交失败」Toast，而非具体的配额提示，体验不一致
+
+3. **配额错误与权限错误同质化**：
+   - 403 可能是权限不足也可能是配额超限，但前端 catch 块未区分
+   - 建议：catch 中解构 `error.response?.data?.message`，按后端消息显示具体原因，或根据状态码 + 消息关键词展示「配额已用完，请 X 天后再试」vs「无操作权限」
