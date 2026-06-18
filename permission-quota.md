@@ -571,3 +571,359 @@ catch {
 3. **配额错误与权限错误同质化**：
    - 403 可能是权限不足也可能是配额超限，但前端 catch 块未区分
    - 建议：catch 中解构 `error.response?.data?.message`，按后端消息显示具体原因，或根据状态码 + 消息关键词展示「配额已用完，请 X 天后再试」vs「无操作权限」
+
+---
+
+## 七、三条 Bug 的代码级修复路径深度分析
+
+### 7.1 Bug 1：SWR 补解构 error 后，loading 能否在 useEffect 里正确翻 false
+
+#### 7.1.1 Modal 组件的 loading 工作机制
+
+Modal 组件（`src/components/Common/Modal/index.tsx:44-250`）接收 `loading` prop 后，内部通过两个互斥的 `Transition` 控制显示：
+
+```tsx
+// 第 112-117 行：loading=true 时显示 Spinner
+<Transition show={loading}>
+  <div style={{ position: 'absolute' }}>
+    <LoadingSpinner />
+  </div>
+</Transition>
+
+// 第 118-135 行：loading=false 时显示表单内容
+<Transition show={!loading} ref={modalRef}>
+  {/* 实际 Modal 内容 + 按钮 */}
+</Transition>
+```
+
+**关键细节**：
+- 两个 Transition 通过 `show={loading}` vs `show={!loading}` 实现切换
+- `useClickOutside`（第 83-87 行）始终挂载，但点击背景时 `backgroundClickable` 为 true 才触发 `onCancel`。**`loading` 不影响背景点击**，所以用户即使在死锁状态也能点背景关闭 Modal（只是看不到内容）
+- 按钮区域（第 193-244 行）在 `<Transition show={!loading}>` 内部，loading=true 时 DOM 不渲染，**确认按钮不可点击**，但 `okDisabled` 的判断仍正确执行（只是渲染层被覆盖）
+
+#### 7.1.2 当前 MovieRequestModal 的死锁逻辑溯源
+
+代码位置：`src/components/RequestModal/MovieRequestModal.tsx:61-71` 和 `317-323`
+
+```tsx
+// 第 61-71 行：两个 SWR
+const { data, error } = useSWR<MovieDetails>(`/api/v1/movie/${tmdbId}`, {
+  revalidateOnMount: true,
+});
+// ⚠️ 配额 SWR 只解构 data，不解构 error
+const { data: quota } = useSWR<QuotaResponse>(
+  user && ... ? `/api/v1/user/${...}/quota` : null
+);
+
+// 第 319 行：loading 计算
+loading={(!data && !error) || !quota}
+```
+
+**死锁真值表演绎**（配额 API 返回 403 的场景）：
+
+| 变量 | 值 | 原因 |
+|------|----|------|
+| `data`（电影详情） | 非 null | 电影详情 API 成功 |
+| `error`（电影详情） | undefined | 电影详情无错 |
+| `quota` | undefined | 配额 SWR 失败，data 为 undefined |
+| `quotaError`（未被解构） | Error 对象 | 实际存在但无法访问 |
+| `(!data && !error)` | `false` | 因为 data 存在 |
+| `!quota` | `true` | quota 为 undefined |
+| **最终 loading** | **`true`** | OR 运算结果恒真 |
+
+CollectionRequestModal 完全相同（`CollectionRequestModal.tsx:54-64`、`267`）。
+
+TvRequestModal 无此问题（`TvRequestModal.tsx:392-393`）：`loading={!data && !error}` 只等媒体详情，不等配额。
+
+#### 7.1.3 修复方案：不需要 useEffect，直接在 loading 表达式中加入 error
+
+**正确做法（推荐）**：解构 error 并在 loading 表达式中短路：
+
+```tsx
+// MovieRequestModal.tsx / CollectionRequestModal.tsx
+// Step 1: 补解构 error
+const { data: quota, error: quotaError } = useSWR<QuotaResponse>(
+  user && ... ? `/api/v1/user/${...}/quota` : null
+);
+
+// Step 2: 修改 loading 表达式（仅在 既没数据 也 没错误 时才显示 loading）
+loading={(!data && !error) || (!quota && !quotaError)}
+//                                    ^^^^^^^^^^^^^^^^^^^^
+//                                    新增：配额有错误时不再卡 loading
+```
+
+**为什么不需要 useEffect？**
+- loading 是纯派生值（derived state），不是独立 state，无需通过 useEffect 监听 error 变化再 setState
+- SWR 的 `data` 和 `error` 本身是响应式的，它们变化会触发组件重渲染，重新计算 loading prop
+- 如果引入 `useState + useEffect` 反而增加不必要的重渲染和状态同步问题
+
+**修复后的真值表**：
+
+| 场景 | quota | quotaError | `!quota && !quotaError` | loading 最终值 |
+|------|-------|-----------|------------------------|--------------|
+| 加载中 | undefined | undefined | true | true（显示 Spinner，正常） |
+| 成功 | 非 null | undefined | false | false（显示内容） |
+| 403 失败 | undefined | Error 对象 | false | false（显示内容，后端兜底） |
+| 500 失败 | undefined | Error 对象 | false | false（显示内容，后端兜底） |
+
+**需要同步修改的文件**：
+- `src/components/RequestModal/MovieRequestModal.tsx:66,319`（两处：第 66 行解构、第 319 行 loading 表达式）
+- `src/components/RequestModal/CollectionRequestModal.tsx:59,267`（同上两处）
+- TvRequestModal 不受影响（不等待 quota），但建议也加上错误解构以保持代码一致性
+
+---
+
+### 7.2 Bug 2：catch 块保留后端错误 detail 的实现路径与接口兼容性
+
+#### 7.2.1 后端错误响应结构（已稳定，无需兼容改造）
+
+后端全局错误处理中间件定义在 `server/index.ts:255-269`：
+
+```tsx
+server.use(
+  (
+    err: { status: number; message: string; errors: string[] },
+    _req: Request,
+    res: Response,
+    _next: NextFunction
+  ) => {
+    res.status(err.status || 500).json({
+      message: err.message,   // 后端抛出的人类可读消息
+      errors: err.errors,     // 可选：字段级校验错误数组
+    });
+  }
+);
+```
+
+请求路由层的具体错误映射（`server/routes/request.ts:316-334`）：
+
+```tsx
+switch (error.constructor) {
+  case RequestPermissionError:
+  case QuotaRestrictedError:
+    return next({ status: 403, message: error.message });
+    //                               ^^^^^^^^^^^^^^^^^^^^
+    // 例如："Movie Quota exceeded." / "You do not have permission to make 4K movie requests."
+  case DuplicateMediaRequestError:
+    return next({ status: 409, message: error.message });
+  ...
+}
+```
+
+**结论：后端响应格式已稳定为 `{ message: string, errors?: string[] }`**，且 message 是有语义的英文原文，前端可直接解析关键词或直接展示。
+
+测试文件也验证了此格式（`server/routes/request.test.ts:44-56`、`issue.test.ts:45-56`）。
+
+#### 7.2.2 前端 catch 中错误对象的实际结构
+
+项目使用 `axios`，错误通过 `axios.isAxiosError(e)` 识别。参考 `TitleCard/ErrorCard.tsx:33`、`SettingsMetadata.tsx:118`、`Login/LocalLogin.tsx:71` 等已有的正确用法：
+
+```typescript
+// axios 错误对象结构
+e.response?.status    // HTTP 状态码，如 403
+e.response?.data?.message  // 后端返回的 { message } 字段内容
+e.message             // axios 本地消息（如 "Request failed with status code 403"）
+```
+
+#### 7.2.3 修复方案：分层展示，优先后端消息，fallback 到通用文案
+
+**当前代码**（MovieRequestModal.tsx:127-131，TvRequestModal.tsx:225-229，CollectionRequestModal 类似）：
+
+```tsx
+catch {
+  addToast(intl.formatMessage(messages.requesterror), {
+    appearance: 'error',
+    autoDismiss: true,
+  });
+}
+```
+
+**修复后代码**（三个 Modal 均需修改）：
+
+```tsx
+catch (e) {
+  let errorMessage = intl.formatMessage(messages.requesterror); // 默认 fallback
+
+  if (axios.isAxiosError(e) && e.response?.data?.message) {
+    const backendMessage = e.response.data.message;
+    // 可选：根据关键词映射为 i18n 消息（如果需要多语言）
+    // 例如：
+    // if (backendMessage.includes('Quota exceeded')) {
+    //   errorMessage = intl.formatMessage(messages.quotaExceeded);
+    // } else if (backendMessage.includes('permission')) {
+    //   errorMessage = intl.formatMessage(messages.noPermission);
+    // } else {
+    //   errorMessage = backendMessage; // 兜底直接显示后端英文
+    // }
+
+    // 简单方案：直接显示后端 message（当前后端都是英文，需新增 i18n key 才完美）
+    errorMessage = backendMessage;
+  }
+
+  addToast(errorMessage, {
+    appearance: 'error',
+    autoDismiss: true,
+  });
+}
+```
+
+#### 7.2.4 兼容性与 i18n 分析
+
+**需要修改的文件清单**（共 3 个 Modal，9 处 catch 块）：
+
+| 文件 | catch 位置 | 当前消息 | 用途 |
+|------|----------|---------|------|
+| MovieRequestModal.tsx | 127 行 | `requesterror` | 提交新请求失败 |
+| MovieRequestModal.tsx | 170 行 | 无 Toast | 取消请求失败（静默） |
+| MovieRequestModal.tsx | 215 行 | `errorediting` | 编辑请求失败 |
+| TvRequestModal.tsx | 225 行（搜索 catch） | `requesterror` | 提交新请求失败 |
+| TvRequestModal.tsx | 搜索 edit catch | `errorediting` | 编辑请求失败 |
+| CollectionRequestModal.tsx | 搜索 sendRequest catch | `requesterror` | 提交合集请求失败 |
+
+**i18n 兼容性评估**：
+- 当前 `messages.requesterror` 在 `defineMessages` 中有 4 种语言的翻译（`src/i18n/locale/*`）
+- 后端返回的 `message` 是纯英文，若直接显示会导致非英文用户看到英文错误
+- **推荐做法**：新增 i18n key（`quotaExceededMovie`、`quotaExceededSeries`、`noRequestPermission` 等），在 catch 中按关键词匹配
+- **最小侵入做法**：先判断是否为 AxiosError，若状态码为 403 且 message 包含 "Quota"，显示新的 `quotaExceeded` i18n 消息；其余仍用 `requesterror`
+
+---
+
+### 7.3 Bug 3：首次加载失败的降级回退（缓存 vs 默认值）修改位置
+
+#### 7.3.1 当前 SWR 全局配置与缓存机制
+
+全局 SWR 配置在 `src/pages/_app.tsx:191-198`：
+
+```tsx
+<SWRConfig
+  value={{
+    fetcher: (url) => axios.get(url).then((res) => res.data),
+    fallback: {
+      '/api/v1/auth/me': user, // SSR 注入的初始用户数据
+    },
+    // 无 onErrorRetry、无 errorRetryCount，使用 SWR 默认重试策略
+  }}
+>
+```
+
+SWR 默认重试策略：
+- 首次失败后指数退避重试（最多重试 5 次）
+- 重试会继续更新 `error`，但不会更新 `data`
+- 只有**同一 key 之前成功过**的数据才会保留在 SWR 缓存中并通过 `data` 返回
+
+#### 7.3.2 各组件当前的降级行为分析
+
+| 组件 | 配额数据不可用时的行为 | 使用 SWR fallback？ |
+|------|----------------------|-------------------|
+| MiniQuotaDisplay | `if (error) return null`（`MiniQuotaDisplay/index.tsx:25-27`） | 无，静默隐藏 |
+| MovieRequestModal | `!quota` → 卡 loading 死锁（Bug 1） | 无 fallbackData |
+| CollectionRequestModal | 同上死锁 | 无 fallbackData |
+| TvRequestModal | `quota?.tv.remaining ?? 0` → 退化为 0 | 无 fallbackData，但代码用了 `??` 兜底 |
+| UserProfile | `{quota && ...}` → 配额卡片不渲染 | 无 fallbackData |
+| QuotaDisplay（子组件） | `remaining ?? quota?.remaining ?? 0`、`quota?.limit ?? 1` | 无，靠 props 传值的 `??` 兜底 |
+
+#### 7.3.3 降级回退方案对比
+
+**方案 A：使用 SWR `fallbackData`（推荐）**
+
+SWR 原生支持 `fallbackData`，在**首次加载且无缓存**时作为初始 data 展示。参考已有的 `useUser.ts:68-69`：
+
+```tsx
+const { data, error } = useSWR<User>(url, {
+  fallbackData: initialData,  // SSR 注入的初始用户
+  ...
+});
+```
+
+在三个 RequestModal 中的应用：
+
+```tsx
+// 默认配额：视为无限制（restricted=false, limit=0），避免阻塞请求
+const defaultQuota: QuotaResponse = {
+  movie: { used: 0, restricted: false },
+  tv: { used: 0, restricted: false },
+};
+
+const { data: quota, error: quotaError } = useSWR<QuotaResponse>(
+  user && ... ? `/api/v1/user/${...}/quota` : null,
+  {
+    fallbackData: defaultQuota,
+    // 可选：shouldRetryOnError: false  // 避免失败后反复重试
+  }
+);
+```
+
+**方案 B：通过 JSX 中 `??` 运算符内联兜底**
+
+当前 TvRequestModal 的 `currentlyRemaining` 已部分采用（`TvRequestModal.tsx:98-101`）：
+
+```tsx
+const currentlyRemaining =
+  (quota?.tv.remaining ?? 0) - selectedSeasons.length + ...;
+```
+
+但这不够：`quota?.movie.restricted` 在 quota undefined 时为 undefined，导致 `okDisabled` 判断逻辑不完整。
+
+**方案 C：SWR 全局 `fallback` 中预填所有用户配额 key**
+
+不推荐：用户 id 是动态的，无法在 `_app.tsx` 的静态 fallback 中预知。
+
+#### 7.3.4 推荐的修改位置与具体代码
+
+**优先级最高：修复 MovieRequestModal 和 CollectionRequestModal（消除死锁 + 合理降级）**
+
+```tsx
+// MovieRequestModal.tsx:66-71 修改后
+const defaultQuota: QuotaResponse = {
+  movie: { used: 0, restricted: false },
+  tv: { used: 0, restricted: false },
+};
+
+const { data: quota, error: quotaError } = useSWR<QuotaResponse>(
+  user &&
+    (!requestOverrides?.user?.id || hasPermission(Permission.MANAGE_USERS))
+    ? `/api/v1/user/${requestOverrides?.user?.id ?? user.id}/quota`
+    : null,
+  { fallbackData: defaultQuota }  // 新增
+);
+
+// MovieRequestModal.tsx:319 修改后
+loading={(!data && !error) || (!quota && !quotaError && !defaultQuota)}
+// 注：用了 fallbackData 后 quota 至少是 defaultQuota，!quota 永远为 false，
+// 所以可以简化为：loading={!data && !error}
+```
+
+**TvRequestModal.tsx:91-96**（一致性优化，原无死锁，但可加 fallbackData 让 UI 更平滑）：
+
+```tsx
+const defaultQuota: QuotaResponse = { ... };
+const { data: quota } = useSWR<QuotaResponse>(url, { fallbackData: defaultQuota });
+```
+
+**MiniQuotaDisplay（一致性优化）**：
+- 当前 `if (error) return null` 行为合理，无需改动
+- 若需体验更好，可改为显示「配额信息暂时不可用」提示，但当前静默降级符合 Seerr 整体 UX
+
+**UserProfile**：
+- 当前 `{quota && ...}` 短路行为合理，资料页不强求显示配额
+- 无需改动
+
+#### 7.3.5 降级为默认值的安全性考量
+
+将 `defaultQuota.restricted` 设为 `false`（无限制）是安全的，因为：
+
+1. 后端 `MediaRequest.request()`（`MediaRequest.ts:114-120`）始终会再次调用 `getQuota()` 并检查 `restricted`，前端降级不会绕过配额限制
+2. 降级场景（配额 API 失败）下，用户体验优先于前端预检查；后端兜底足以防止超限
+3. 如果 `restricted` 设为 `true`，会导致配额 API 暂时故障时所有用户都无法提交请求，属于误杀
+
+---
+
+### 7.4 三条 Bug 的修改总览
+
+| Bug | 需改文件 | 修改点 | 风险等级 |
+|-----|---------|-------|---------|
+| 1. loading 死锁 | MovieRequestModal.tsx、CollectionRequestModal.tsx | 解构 `error: quotaError` + 修改 loading 表达式 | 低（纯派生值，无副作用） |
+| 2. catch 丢失错误 detail | MovieRequestModal.tsx、TvRequestModal.tsx、CollectionRequestModal.tsx（多个 catch） | 补 `catch (e)` 参数 + `axios.isAxiosError(e)` 判断 + 读取 `e.response.data.message` | 中（需决定是显示后端原文还是新增 i18n key） |
+| 3. 首次加载无降级 | MovieRequestModal.tsx、CollectionRequestModal.tsx（可选 TvRequestModal） | 增加 `fallbackData: { movie: {used:0, restricted:false}, tv: {...} }` | 低（后端有兜底检查） |
+
+**推荐修复顺序**：Bug 1（死锁最严重）→ Bug 3（fallbackData 顺带消除死锁）→ Bug 2（i18n 工作量较大，可延后）。
