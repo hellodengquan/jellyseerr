@@ -902,9 +902,9 @@ processMovie() / processShow()
 
 ## 11. Job 执行时间统计与 Metric 暴露
 
-### 11.1 执行时间统计策略
+### 11.1 执行时间统计的总体策略
 
-**核心结论**：代码中没有显式的 `Date.now() - startTime` 执行时间记录逻辑，也没有集成 Prometheus / StatsD 等 metric 库。时间相关的统计全部**通过日志 + 进度跟踪**间接暴露。
+**核心结论**：代码中**没有任何独立的执行时间统计模块**，也没有 `Date.now() - startTime` 的显式耗时计算。时间相关的统计全部通过「日志 + 进度跟踪 + lastScan 时间戳」间接暴露，需由外部工具自行解析。
 
 #### （1）进度跟踪而非耗时跟踪
 
@@ -967,28 +967,180 @@ settingsRoutes.get('/jobs', (_req, res) => {
   - 扫描器类 job：`running: () => plexRecentScanner.status().running`
   - command 类 job（如 download-sync）：没有 `running` getter，永远返回 `false`
 
-#### （4）日志中的隐式耗时统计
-
-虽然没有显式统计，但可以从日志时间戳推断耗时。扫描器 `startRun()` 和 `endRun()` 都会写日志：
-
+前端通过 `useSWR` 每 5 秒轮询一次该接口（`src/components/Settings/SettingsJobsCache/index.tsx:187-189`）：
 ```typescript
-// server/lib/scanners/baseScanner.ts:651
-this.log('Scan starting', 'info', { sessionId });
-
-// server/lib/scanners/plex/index.ts:147
-this.log(this.isRecentOnly ? 'Recently Added Scan Complete' : 'Full Scan Complete', 'info');
+const { data, error, mutate: revalidate } = useSWR<Job[]>('/api/v1/settings/jobs', {
+  refreshInterval: 5000,  // 5秒轮询
+});
 ```
 
-通过分析日志中同 `sessionId` 的 "Scan starting" 到 "Scan Complete" / "Scan interrupted" 的时间差，可以计算出实际耗时。
+### 11.2 sessionId + 机器日志：执行时间差的隐式解析路径
 
-#### （5）缺失的 Metric 能力
+虽然代码中没有内置的耗时计算，但系统提供了完整的日志基础设施，可通过 `sessionId` 关联同一次扫描的起止日志来计算时间差。
 
-- ❌ 没有 Prometheus exporter（没有 `prom-client` / `prometheus-api-metrics` 等依赖）
-- ❌ 没有 `execution_time_ms` / `job_duration_seconds` 等 counter/gauge
-- ❌ 没有成功率/失败率统计
-- ❌ 没有 `/metrics` 端点
+#### （1）sessionId 的完整生命周期
 
-> **设计取舍**：Jellyseerr 定位为轻量级家庭媒体请求系统，不面向大规模监控场景。运行状态通过前端 Jobs 页面的进度条展示即可，无需专业 metric 系统。
+```typescript
+// server/lib/scanners/baseScanner.ts:646-672
+protected startRun(): string {
+  const settings = getSettings();
+  const sessionId = randomUUID();  // ← 生成唯一会话 ID
+  this.sessionId = sessionId;
+
+  this.log('Scan starting', 'info', { sessionId });  // ← 开始日志，携带 sessionId
+
+  // ... 初始化 4K 检测等 ...
+
+  this.running = true;
+  return sessionId;
+}
+
+// server/lib/scanners/baseScanner.ts:677-681
+protected endRun(sessionId: string): void {
+  if (this.sessionId === sessionId) {
+    this.running = false;  // ← endRun 本身不写日志，只改状态
+  }
+}
+```
+
+**完成日志在子类 `run()` 方法中手动写入**（以 Plex 为例）：
+
+```typescript
+// server/lib/scanners/plex/index.ts:65-159
+public async run(): Promise<void> {
+  const sessionId = this.startRun();   // ① 开始：写 "Scan starting" 日志，带 sessionId
+  try {
+    // ... 所有扫描逻辑 ...
+    // paginateLibrary() / processItem() / loop() 等等
+    // ② 完成：写 "Scan Complete" 日志（不带 sessionId）
+    this.log(
+      this.isRecentOnly ? 'Recently Added Scan Complete' : 'Full Scan Complete',
+      'info'
+    );
+  } catch (e) {
+    // ③ 中断：写 "Scan interrupted" 日志（不带 sessionId）
+    this.log('Scan interrupted', 'error', { errorMessage: e.message });
+  } finally {
+    this.endRun(sessionId);  // ④ 清理：重置 running = false
+  }
+}
+```
+
+#### （2）机器日志格式与解析入口
+
+Winston 的 `machineLogFileTransport` 会把所有日志以 JSON 格式写入 `.machinelogs-%DATE%.json` 文件（`server/logger.ts:29-44`）：
+
+```typescript
+// server/logger.ts:29-44
+const machineLogFileTransport = new winston.transports.DailyRotateFile({
+  filename: `${process.env.CONFIG_DIRECTORY}/logs/.machinelogs-%DATE%.json`,
+  datePattern: 'YYYY-MM-DD',
+  maxSize: '20m',
+  maxFiles: '1d',    // 只保留 1 天的机器日志
+  format: winston.format.combine(
+    winston.format.splat(),
+    winston.format.timestamp(),  // 每条日志带 ISO 时间戳
+    winston.format.json()        // JSON 格式，便于程序解析
+  ),
+});
+```
+
+每条机器日志的结构：
+```json
+{
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "level": "info",
+  "label": "Plex Scan",
+  "message": "Scan starting",
+  "sessionId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**解析 API 挂载点**：`GET /settings/logs`（`server/routes/settings/index.ts:538-643`）—— 这是前端"日志"页面的后端接口，也是机器日志的唯一程序入口。
+
+```typescript
+// server/routes/settings/index.ts:593-631
+fs.readFileSync(logFile, 'utf-8')
+  .split('\n')                 // 每行一条 JSON
+  .forEach((line) => {
+    if (!line.length) return;
+    const logMessage = JSON.parse(line);  // 解析 JSON 日志
+    // ... 过滤、搜索、分页 ...
+    logs.push(logMessage);
+  });
+
+const displayedLogs = logs.reverse().slice(skip, skip + pageSize);
+return res.status(200).json({
+  pageInfo: { pages, pageSize, results, page },
+  results: displayedLogs,
+});
+```
+
+#### （3）时间差解析的"手动"路径
+
+代码中**没有任何地方自动计算或存储执行耗时**。要得到某次扫描的实际耗时，需要外部自行：
+
+1. 调用 `GET /settings/logs` 或直接读取 `.machinelogs.json` 文件
+2. 找到 label 为 "Plex Scan"（或其他扫描器）且 message 为 "Scan starting" 的日志，记录其 `sessionId` 和 `timestamp`
+3. 找到同 label 下 message 为 "Scan Complete" 或 "Scan interrupted" 的日志，记录 `timestamp`
+4. **但有一个问题**：完成/中断日志**不携带 sessionId**，无法精确匹配。只能通过「label + 时间顺序」大致推断（某 label 的 start 到下一个 start/complete/interrupted 之间的时间差）
+
+```
+日志时间线（单扫描器场景）：
+├─ 10:00:00 [Plex Scan] Scan starting, sessionId=abc...  ← 开始
+├─ 10:05:23 [Plex Scan] Recently Added Scan Complete     ← 完成（无 sessionId）
+├─ 11:00:00 [Plex Scan] Scan starting, sessionId=def...  ← 下一次开始
+└─ ...
+```
+
+> ⚠️ **注意**：由于完成日志不带 sessionId，如果用户在扫描进行中点了"Run Now" 触发了新会话（`sessionId` 切换，旧会话被 abort），仅通过日志无法精确区分两个会话的各自耗时，只能区分开始时间。
+
+#### （4）lastScan 时间戳：不是耗时，是"上次扫描时间点"
+
+`Library.lastScan`（`server/lib/settings/index.ts:17-23`）保存的是**扫描完成时刻的时间戳**，不是执行时长：
+
+```typescript
+// server/lib/settings/index.ts:17-23
+export interface Library {
+  id: string;
+  name: string;
+  enabled: boolean;
+  type: 'show' | 'movie';
+  lastScan?: number;  // ← Date.now()，扫描完成时写入
+}
+```
+
+写入位置（`plex/index.ts:126-138`）：
+```typescript
+const newLibraries = settings.plex.libraries.map((lib) => {
+  if (lib.id === library.id) {
+    return { ...lib, lastScan: Date.now() };  // ← 完成时记录当前时间
+  }
+  return lib;
+});
+settings.plex.libraries = newLibraries;
+await settings.save();  // 持久化到 settings.json
+```
+
+**用途**：给下一次 "Recently Added Scan" 做增量拉取的时间边界（`addedAt > lastScan - 10min`），不是做统计用的。
+
+### 11.3 无独立统计模块的设计验证
+
+通过全局搜索验证，代码中完全没有独立的执行时间统计模块：
+
+| 关键词 | 搜索结果 | 结论 |
+|--------|----------|------|
+| `startTime` / `startTimeMs` / `startTimestamp` | 无相关 job 统计代码 | ❌ |
+| `Date.now() - start` / `performance.now` / `process.hrtime` | 无 job 耗时计算 | ❌ |
+| `executionTime` / `jobDuration` / `runTime` / `elapsed` | 仅存在于非 job 场景 | ❌ |
+| `prom-client` / `statsd` / `metric` | package.json 无相关依赖 | ❌ |
+| `/metrics` 端点 | 无此路由 | ❌ |
+
+**唯一的"时间统计"相关工具**：
+- `humanize-duration`（前端依赖）：用于 `SettingsJobsCache` 组件中格式化人类可读时间，但不是用于 job 执行时间，而是用于缓存 TTL 展示
+- `FormattedRelativeTime`（React Intl）：前端展示 "Next Execution" 的相对时间
+
+> **设计取舍**：Jellyseerr 定位为轻量级家庭媒体请求系统，单进程单用户（最多几个家庭成员），不需要专业的 APM/metric 能力。运行状态通过前端 Jobs 页面的进度条 + 日志即可满足排障需求，不值得为统计耗时增加代码复杂度。
 
 ---
 
@@ -1177,6 +1329,8 @@ const libraryItems = await this.plexClient.getRecentlyAdded(
 | **专用扫描直调** | 直接调用 `scanner.run()` 绕过调度层 | `server/routes/settings/index.ts:261-268`, `427-434` | Plex/Jellyfin 全量扫描的专用启停入口 |
 | **失败 Alert 通知** | TypeORM Subscriber 的 AfterUpdate 生命周期 → `MEDIA_FAILED` → `notificationManager.sendNotification()` | `server/subscriber/MediaRequestSubscriber.ts:398-472`, `server/entity/MediaRequest.ts:736-837` | 仅在 Radarr/Sonarr 提交请求失败时推给管理员；扫描类 job 失败只写日志 |
 | **多 worker 幂等** | 四层保护：AsyncLock → 前置查询 → DB 唯一约束 → UPDATE 幂等 | `server/utils/asyncLock.ts`, `server/entity/Media.ts`, `server/migration/postgres/1734786061496-InitialMigration.ts` | 保证单实例部署数据正确；多实例不脏数据但重复跑任务 |
-| **状态 Metric 暴露** | `GET /settings/jobs` + 各 scanner.status() 返回 `{ running, progress, total, nextExecutionTime }` | `server/routes/settings/index.ts:657-669`, `baseScanner.ts:15-24` | 前端 Jobs 页面展示进度和下次执行时间；无 Prometheus 等专业 metric |
+| **状态 Metric 暴露** | `GET /settings/jobs` 每 5s 轮询 + 各 scanner.status() 返回 `{ running, progress, total, nextExecutionTime }` | `server/routes/settings/index.ts:657-669`, `baseScanner.ts:15-24`, `SettingsJobsCache/index.tsx:187-189` | 前端 Jobs 页面展示进度和下次执行时间；无 Prometheus 等专业 metric |
+| **执行时间统计** | 无独立统计模块，通过 sessionId + 机器日志（`.machinelogs.json`）+ `GET /settings/logs` 间接解析 | `server/logger.ts:29-44`, `baseScanner.ts:646-681`, `server/routes/settings/index.ts:538-643` | 开始日志带 sessionId，完成/中断日志不带；需外部按 label + 时间顺序人工推算耗时 |
+| **lastScan 时间戳** | 扫描完成时 `Date.now()` 写入 `settings.plex.libraries[].lastScan`，持久化到 settings.json | `plex/index.ts:126-138`, `settings/index.ts:17-23` | 用于 Recently Added 扫描的增量时间边界，不是统计字段 |
 | **断网恢复** | 三层超时（10s API 超时 + 单条目 catch 隔离 + 顶层 finally 重置 running）+ lastScan 10min 缓冲 + 幂等重跑 | `plex/index.ts:65-159`, `baseScanner.ts:208-224`, `settings/index.ts:629` | 断网时安全终止，不脏数据；下一次 cron 自动恢复，Recently Added 扫描不漏 |
 | **可用性同步防误删** | 非 404 错误假设媒体存在（宁漏勿错） | `availabilitySync.ts:711-724`, `934-947`, `1071-1085` | 防止网络波动导致已下载媒体被误标记为 DELETED |
