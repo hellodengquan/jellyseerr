@@ -609,7 +609,298 @@ POST /plex/sync  ─────────────────────
 
 ---
 
-## 7. 设计要点总结（补充）
+## 8. Job 失败后的 Alert 通知机制
+
+### 8.1 通知系统架构
+
+通知采用 **Manager + Agent** 模式，`NotificationManager` 持有所有注册的 Agent（Discord/Telegram/Slack/Pushbullet/Pushover/Webhook 等），发送时遍历所有满足条件的 Agent：
+
+```typescript
+// server/lib/notifications/index.ts:92-114
+class NotificationManager {
+  private activeAgents: NotificationAgent[] = [];
+
+  public sendNotification(type: Notification, payload: NotificationPayload): void {
+    this.activeAgents.forEach((agent) => {
+      if (agent.shouldSend()) {
+        agent.send(type, payload);  // 每个 agent 内部异步，fire-and-forget
+      }
+    });
+  }
+}
+```
+
+**支持的通知类型**（`server/lib/notifications/index.ts:6-20`）：
+```
+MEDIA_PENDING = 2        // 新请求待审批
+MEDIA_APPROVED = 4       // 请求已批准
+MEDIA_AVAILABLE = 8      // 媒体已下载可用
+MEDIA_FAILED = 16        // 请求处理失败 ← 我们关注的类型
+TEST_NOTIFICATION = 32   // 测试
+MEDIA_DECLINED = 64      // 请求被拒绝
+MEDIA_AUTO_APPROVED = 128
+ISSUE_CREATED = 256
+ISSUE_COMMENT = 512
+ISSUE_RESOLVED = 1024
+ISSUE_REOPENED = 2048
+MEDIA_AUTO_REQUESTED = 4096
+```
+
+Agent 注册挂载点（`server/index.ts:132`）：
+```typescript
+notificationManager.registerAgents([
+  new DiscordAgent(settings.notifications.agents.discord),
+  new TelegramAgent(settings.notifications.agents.telegram),
+  new SlackAgent(settings.notifications.agents.slack),
+  new PushoverAgent(settings.notifications.agents.pushover),
+  new PushbulletAgent(settings.notifications.agents.pushbullet),
+  new EmailAgent(settings.notifications.agents.email),
+  new WebhookAgent(settings.notifications.agents.webhook),
+  new GotifyAgent(settings.notifications.agents.gotify),
+  new PushNotificationAgent(),
+  new LunaSeaAgent(settings.notifications.agents.lunasea),
+]);
+```
+
+### 8.2 MEDIA_FAILED 通知的两个触发挂载点
+
+`MEDIA_FAILED` 只针对"**请求被批准后提交到 Radarr/Sonarr 失败**"这一业务场景，**扫描器/同步 job 本身的失败（API 超时、网络错误等）不会发通知，只写日志**。
+
+两个挂载点都在 `MediaRequestSubscriber`（TypeORM 的 `AfterInsert` / `AfterUpdate` 生命周期 subscriber）里，对应两种失败路径：
+
+#### 挂载点 1：异步 Promise 链中的 .catch()（Radarr/Sonarr 服务端返回错误）
+
+```typescript
+// server/subscriber/MediaRequestSubscriber.ts:376-432
+radarr
+  .addMovie(radarrMovieOptions)        // 异步提交，不阻塞 HTTP 响应
+  .then(async (radarrMovie) => {
+    // 成功：写回 externalServiceId 等字段
+    media.externalServiceId = radarrMovie.id;
+    await mediaRepository.save(media);
+  })
+  .catch(async () => {                 // 失败：触发 MEDIA_FAILED 通知
+    // 1. 把请求状态标记为 FAILED 并持久化
+    if (entity.status !== MediaRequestStatus.FAILED) {
+      entity.status = MediaRequestStatus.FAILED;
+      await requestRepository.save(entity);
+    }
+
+    // 2. 写 warn 日志（含请求 ID、媒体 ID、radarrMovieOptions）
+    logger.warn('Something went wrong sending movie request to Radarr, marking status as FAILED', {...});
+
+    // 3. 【关键】发送失败通知
+    MediaRequest.sendNotification(entity, media, Notification.MEDIA_FAILED);
+  })
+```
+
+**触发场景**：Radarr/Sonarr 响应 4xx/5xx、请求体被拒绝、API key 无效、服务端内部错误等。
+
+#### 挂载点 2：同步 try/catch（连接/配置错误）
+
+```typescript
+// server/subscriber/MediaRequestSubscriber.ts:446-472
+} catch (e) {
+  // 连接错误、配置缺失（无默认 Sonarr/Radarr server）等
+  entity.status = MediaRequestStatus.FAILED;
+  await requestRepository.save(entity);
+
+  logger.warn('Failed to send movie request to Radarr due to connection or configuration error...', {...});
+
+  MediaRequest.sendNotification(entity, media, Notification.MEDIA_FAILED);
+}
+```
+
+**触发场景**：网络超时、DNS 解析失败、Radarr/Sonarr 服务不可达、找不到默认 server 配置等。
+
+### 8.3 通知构造与分发：MediaRequest.sendNotification()
+
+静态方法 `MediaRequest.sendNotification()`（`server/entity/MediaRequest.ts:736-837`）是所有通知类型（含 MEDIA_FAILED）的统一构造器：
+
+```typescript
+// server/entity/MediaRequest.ts:736-837
+static async sendNotification(entity: MediaRequest, media: Media, type: Notification) {
+  const tmdb = new TheMovieDb();
+  try {
+    // 根据类型设置 event 文案、notifyAdmin、notifySystem
+    switch (type) {
+      case Notification.MEDIA_FAILED:
+        event = `${entity.is4k ? '4K ' : ''}${mediaType} Request Failed`;
+        break;  // notifyAdmin 和 notifySystem 保持 true（通知管理员和系统）
+      // ...其他类型
+    }
+
+    // 拉取 TMDB 元数据（标题、简介、海报）构造完整 payload
+    if (entity.type === MediaType.MOVIE) {
+      const movie = await tmdb.getMovie({ movieId: media.tmdbId });
+      notificationManager.sendNotification(type, {
+        media,
+        request: entity,
+        notifyAdmin: true,      // MEDIA_FAILED 会通知管理员
+        notifySystem: true,     // 也会推到系统通知
+        notifyUser: undefined,  // 不单独通知请求用户（通过 admin/system 渠道覆盖）
+        event,
+        subject: `${movie.title} (${year})`,
+        message: truncate(movie.overview, 500),
+        image: `https://image.tmdb.org/t/p/w600_and_h900_bestv2${movie.poster_path}`,
+      });
+    }
+    // TV show 同理
+  } catch (e) {
+    // 【自保护】：发送通知本身失败时，只写日志，不向上抛
+    logger.error('Something went wrong sending media notification(s)', {...});
+  }
+}
+```
+
+### 8.4 其他 Job 失败的处理方式（只记日志，不发通知）
+
+对比扫描器/同步类 job，它们的错误处理**不会触发任何通知 Agent**，完全依赖日志：
+
+| Job 类型 | 失败位置 | 处理方式 | 发通知？ |
+|----------|----------|----------|----------|
+| Plex/Jellyfin 扫描（processItem） | `plex/index.ts:209-224` catch | `this.log('Failed to process Plex media', 'error', {...})` | ❌ |
+| Plex/Jellyfin 扫描（paginateLibrary） | `plex/index.ts:203` `.catch` 后 reject | 冒泡到 `run()` 的 try/finally，finally 只调 `endRun()` | ❌ |
+| Radarr/Sonarr Scanner | `baseScanner.ts` 的 `loop()` | 同样只写日志 | ❌ |
+| DownloadTracker.update() | `downloadtracker.ts:110-116` | `logger.error('Unable to get queue from Radarr server...')` | ❌ |
+| AvailabilitySync.run() | `availabilitySync.ts` | logger.error + throw | ❌ |
+| WatchlistSync.sync() | `watchlistsync.ts` | logger.error | ❌ |
+| Blocklist tag processor | `blocklistedTagsProcessor.ts` | logger.error | ❌ |
+
+**设计意图**：扫描/同步类 job 是周期性的（1分钟~1小时），失败后下一轮调度自然重试，通知会刷屏；只有"用户请求被批准但提交到下载器失败"这种需要人工介入的业务失败才推 Alert。
+
+---
+
+## 9. 多 Worker 部署下的任务幂等保证
+
+### 9.1 核心结论：Jellyseerr 设计为单进程部署
+
+代码库中搜索 `cluster`、`worker_threads`、`fork`、`redis`、`bull`、`agenda`、`bee-queue` 等关键词均未命中真实的分布式队列或多 worker 协调逻辑。实际部署模式是：
+
+> **单 Node.js 进程（Next.js + Express）+ 单 node-schedule 调度器 + 内存态锁与缓存**
+
+如果用户强行用 PM2 cluster 模式或 k8s 多副本部署，会存在 §9.4 列出的风险。但代码仍然在**数据库层 + 业务层**设计了多层幂等保护，足以保证数据不脏。
+
+### 9.2 四层幂等保护
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     四层幂等保护（从上到下强度递增）                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  第 1 层：进程内 AsyncLock（内存态，仅单进程有效）                       │
+│  第 2 层：业务前置查询（getExisting + 重复请求检查）                     │
+│  第 3 层：数据库唯一约束（跨进程的最后硬防线）                            │
+│  第 4 层：UPDATE 幂等语义（重复 save() 只覆盖字段，不会新增记录）          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+#### 第 1 层：进程内 AsyncLock（单进程有效）
+
+`server/utils/asyncLock.ts`，以 `tmdbId` 为 key，单进程内把"查询 → 判断 → 写入"变成原子操作。详见 §2.1。
+
+> ⚠️ 多进程下失效：每个进程有独立的 `AsyncLock` 实例，不同进程对同一 `tmdbId` 的操作不会互相阻塞。
+
+#### 第 2 层：业务前置查询
+
+**扫描器侧**（`server/lib/scanners/baseScanner.ts:113` 的 `processMovie()`）：
+```typescript
+await this.asyncLock.dispatch(tmdbId, async () => {
+  const existing = await this.getExisting(tmdbId, MediaType.MOVIE);
+  if (existing) {
+    // UPDATE 分支：只更新字段，不新建
+    existing.status = ...;
+    existing.mediaAddedAt = ...;
+    await mediaRepository.save(existing);  // 幂等更新
+  } else {
+    // INSERT 分支：新建 Media
+    const newMedia = new Media({...});
+    await mediaRepository.save(newMedia);
+  }
+});
+```
+
+**请求侧**（`server/entity/MediaRequest.ts:171-216` 的 `MediaRequest.request()`）：
+```typescript
+// 查重 1：同媒体 + 同分辨率 已存在非 DECLINED/COMPLETED 的请求 → 拒绝
+const existing = await requestRepository.createQueryBuilder('request')
+  .leftJoinAndSelect('request.media', 'media')
+  .where('request.is4k = :is4k', { is4k: requestBody.is4k })
+  .andWhere('media.tmdbId = :tmdbId', { tmdbId: tmdbMedia.id })
+  .andWhere('media.mediaType = :mediaType', { mediaType })
+  .getMany();
+
+if (existing[0].status !== DECLINED && existing[0].status !== COMPLETED) {
+  throw new DuplicateMediaRequestError('Request for this media already exists.');
+}
+
+// 查重 2：同用户 + 同媒体 的自动请求 → 拒绝
+if (existing.find(r => r.requestedBy.id === requestUser.id && r.isAutoRequest)) {
+  throw new DuplicateMediaRequestError('Auto-request for this media and user already exists.');
+}
+```
+
+#### 第 3 层：数据库唯一约束（跨进程硬防线）
+
+从 Postgres 初始迁移（`server/migration/postgres/1734786061496-InitialMigration.ts`）和实体定义汇总：
+
+| 表 | 唯一约束 | 代码位置 | 作用 |
+|----|----------|----------|------|
+| `media` | `UQ_41a289eb...` UNIQUE (`tvdbId`) | `server/entity/Media.ts:94` | 同剧集不能插入两条 |
+| `media` | `@Index(['tmdbId', 'mediaType'])`（联合索引，查 existing 用） | `server/entity/Media.ts:30` | 逻辑唯一键（不是 DB unique，但业务层强依赖） |
+| `watchlist` | `UNIQUE_USER_DB` UNIQUE (`tmdbId`, `requestedById`) | migration:35 | 同用户的同监视列表条目不重复 |
+| `blacklist` | `UQ_6bbafa28...` UNIQUE (`tmdbId`) | migration:8 | 同 tmdbId 只能拉黑一次 |
+| `user_settings` | UNIQUE (`userId`) | migration:8 | 每个用户只有一份设置 |
+| `user_push_subscription` | `UQ_6427d07d...` UNIQUE (`endpoint`, `userId`) + UNIQUE (`auth`) | migration:9 | 推送订阅去重 |
+| `media_request` | **没有数据库级 unique** | — | 依赖业务层第 2 层检查 + 状态机防止重复 |
+
+> ⚠️ 注意 `media` 表的 `(tmdbId, mediaType)` 只建了 `@Index` 没建 `UNIQUE`，如果 AsyncLock 在多进程下失效，极端情况下可能插入两条同 tmdbId 同 mediaType 的记录（但 tvdbId unique 会挡住剧集）。
+
+#### 第 4 层：UPDATE 的幂等语义
+
+即便真的重复触发了处理流程，`save()` 对已有实体是 UPDATE，只覆盖字段不会新增：
+
+```typescript
+// 例如 availabilitySync.run() 中：
+media.status = MediaStatus.AVAILABLE;
+await mediaRepository.save(media);  // 重复执行 N 次结果相同
+```
+
+`Media` 实体没有"自增计数器"或"累加型字段"，全部是 set-this-value 的覆盖写，天然幂等。
+
+### 9.3 扫描器去重（单进程内）
+
+除了 AsyncLock，扫描器本身还通过三层机制保证单进程内不重入：
+
+```
+BaseScanner.startRun() → running=true, sessionId=new UUID()
+        │
+        ▼
+loop() 入口双重检查：
+  1. if (!this.running) throw "Sync was aborted"
+  2. if (this.sessionId !== sessionId) throw "New session was started. Old session aborted"
+        │
+        ▼
+processMovie() / processShow()
+  → AsyncLock.dispatch(tmdbId, callback)  // 媒体级串行化
+```
+
+**多进程下的效果**：每个进程独立维护 `running` 和 `sessionId`，所以多实例部署时同一扫描任务会在每个实例各跑一遍。但最终落 DB 时由第 2/3/4 层幂等保护兜底，不会产生重复数据，只是 API 调用翻倍、浪费资源。
+
+### 9.4 多 Worker 强行部署的风险与已知限制
+
+| 风险 | 原因 | 是否有兜底 |
+|------|------|------------|
+| **cron 任务重复执行 N 次**（N=实例数） | `node-schedule` 是进程内存态，每个实例独立注册 timer | ✅ 扫描/同步幂等，数据不会脏；但 Radarr/Plex/TMDB API 调用翻倍，可能触发对方限流 |
+| **AsyncLock 跨进程失效** | 每个进程独立 EventEmitter 实例 | ✅ DB 唯一约束兜底；媒体表 `(tmdbId, mediaType)` 非 unique 有理论重复风险 |
+| **缓存不一致** | 各实例独立 node-cache | ✅ 仅性能影响，不影响数据正确性 |
+| **DownloadTracker 进度状态漂移** | 各实例独立维护内存态 Map | ⚠️ 前端看到的下载进度可能在多个实例间跳动 |
+| **running 状态无法跨进程取消** | 每个实例独立 running 标志 | ⚠️ 在 A 实例点 Cancel，B 实例仍继续跑；最终结果不脏但浪费资源 |
+
+**官方建议**：Jellyseerr/Overseerr 的 Docker 官方部署示例均为单容器。多实例部署需自行前置 Nginx 会话保持 + 单实例专跑定时任务（如通过环境变量 `DISABLE_SCHEDULED_JOBS=true` 在非主实例屏蔽 `startJobs()`，但代码中目前**没有**这个开关，需自行改造）。
+
+---
+
+## 10. 设计要点总结（最终完整版）
 
 | 机制 | 实现方式 | 关键文件 | 目的 |
 |------|----------|----------|------|
@@ -625,3 +916,5 @@ POST /plex/sync  ─────────────────────
 | **重启恢复策略** | 内存态不持久化 + lastScan 持久化 + 幂等扫描 | `server/index.ts`, `plex/index.ts:103` | 无状态设计，重启后由 cron 或手动触发重新跑 |
 | **通用手动触发** | `job.invoke()` 复用 cron 注册的 callback | `server/routes/settings/index.ts:671-689` | Run Now / 外部 webhook 触发所有 job，不影响调度节奏 |
 | **专用扫描直调** | 直接调用 `scanner.run()` 绕过调度层 | `server/routes/settings/index.ts:261-268`, `427-434` | Plex/Jellyfin 全量扫描的专用启停入口 |
+| **失败 Alert 通知** | TypeORM Subscriber 的 AfterUpdate 生命周期 → `MEDIA_FAILED` → `notificationManager.sendNotification()` | `server/subscriber/MediaRequestSubscriber.ts:398-472`, `server/entity/MediaRequest.ts:736-837` | 仅在 Radarr/Sonarr 提交请求失败时推给管理员；扫描类 job 失败只写日志 |
+| **多 worker 幂等** | 四层保护：AsyncLock → 前置查询 → DB 唯一约束 → UPDATE 幂等 | `server/utils/asyncLock.ts`, `server/entity/Media.ts`, `server/migration/postgres/1734786061496-InitialMigration.ts` | 保证单实例部署数据正确；多实例不脏数据但重复跑任务 |
