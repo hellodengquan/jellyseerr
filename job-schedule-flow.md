@@ -900,7 +900,266 @@ processMovie() / processShow()
 
 ---
 
-## 10. 设计要点总结（最终完整版）
+## 11. Job 执行时间统计与 Metric 暴露
+
+### 11.1 执行时间统计策略
+
+**核心结论**：代码中没有显式的 `Date.now() - startTime` 执行时间记录逻辑，也没有集成 Prometheus / StatsD 等 metric 库。时间相关的统计全部**通过日志 + 进度跟踪**间接暴露。
+
+#### （1）进度跟踪而非耗时跟踪
+
+`BaseScanner` 定义了三个核心字段，用于前端展示扫描进度（而非耗时）：
+
+```typescript
+// server/lib/scanners/baseScanner.ts:59-61
+protected progress = 0;      // 当前已处理的偏移量（start 参数）
+protected items: T[] = [];   // 本批要处理的所有条目
+protected totalSize?: number = 0;  // 总数（Plex API 返回的 totalSize）
+```
+
+`StatusBase` 接口（`server/lib/scanners/baseScanner.ts:15-19`）统一了所有扫描器的状态结构：
+```typescript
+export type StatusBase = {
+  running: boolean;    // 是否在运行
+  progress: number;    // 已处理数量
+  total: number;       // 总数
+};
+```
+
+#### （2）各 Job 的 status() 实现
+
+所有实现 `RunnableScanner` 接口的类都有 `status()` 方法，返回运行状态 + 扩展信息：
+
+| Job 类型 | status() 返回结构 | 代码位置 |
+|----------|-------------------|----------|
+| Plex 扫描 | `{ running, progress, total, currentLibrary, libraries }` | `plex/index.ts:55-63` |
+| Jellyfin 扫描 | `{ running, progress, total, currentLibrary, libraries }` | `jellyfin/index.ts:542-550` |
+| Radarr 扫描 | `{ running, progress, total, currentServer, servers }` | `radarr/index.ts:36-44` |
+| Sonarr 扫描 | `{ running, progress, total, currentServer, servers }` | `sonarr/index.ts:44-52` |
+| Blocklist Tags Processor | `{ running, progress, total }` | `blocklistedTagsProcessor.ts:49-54` |
+| AvailabilitySync | 无 status()，仅 `public running = false` | `availabilitySync.ts:23` |
+| DownloadTracker | 无 status()，内存态 Map | `downloadtracker.ts` |
+| WatchlistSync | 无 status() | `watchlistsync.ts` |
+
+#### （3）Metric 暴露口：`GET /settings/jobs`
+
+所有 job 的状态通过 HTTP API 暴露给前端（`server/routes/settings/index.ts:657-669`）：
+
+```typescript
+settingsRoutes.get('/jobs', (_req, res) => {
+  return res.status(200).json(
+    scheduledJobs.map((job) => ({
+      id: job.id,
+      name: job.name,
+      type: job.type,
+      interval: job.interval,
+      cronSchedule: job.cronSchedule,
+      nextExecutionTime: job.job.nextInvocation(),  // 下一次执行时间
+      running: job.running ? job.running() : false,   // 当前是否在运行
+    }))
+  );
+});
+```
+
+**暴露的字段解读**：
+- `nextExecutionTime`：由 `node-schedule` 的 `Job.nextInvocation()` 方法计算返回 Date 对象
+- `running`：由每个 job 在注册时绑定的 `running` getter 提供
+  - 扫描器类 job：`running: () => plexRecentScanner.status().running`
+  - command 类 job（如 download-sync）：没有 `running` getter，永远返回 `false`
+
+#### （4）日志中的隐式耗时统计
+
+虽然没有显式统计，但可以从日志时间戳推断耗时。扫描器 `startRun()` 和 `endRun()` 都会写日志：
+
+```typescript
+// server/lib/scanners/baseScanner.ts:651
+this.log('Scan starting', 'info', { sessionId });
+
+// server/lib/scanners/plex/index.ts:147
+this.log(this.isRecentOnly ? 'Recently Added Scan Complete' : 'Full Scan Complete', 'info');
+```
+
+通过分析日志中同 `sessionId` 的 "Scan starting" 到 "Scan Complete" / "Scan interrupted" 的时间差，可以计算出实际耗时。
+
+#### （5）缺失的 Metric 能力
+
+- ❌ 没有 Prometheus exporter（没有 `prom-client` / `prometheus-api-metrics` 等依赖）
+- ❌ 没有 `execution_time_ms` / `job_duration_seconds` 等 counter/gauge
+- ❌ 没有成功率/失败率统计
+- ❌ 没有 `/metrics` 端点
+
+> **设计取舍**：Jellyseerr 定位为轻量级家庭媒体请求系统，不面向大规模监控场景。运行状态通过前端 Jobs 页面的进度条展示即可，无需专业 metric 系统。
+
+---
+
+## 12. Plex Sync 中途断网时的恢复策略
+
+### 12.1 三层超时保护
+
+断网恢复依赖三层超时机制，从 API 层到业务层逐层兜底：
+
+#### 第 1 层：全局 API 请求超时（可配置）
+
+```typescript
+// server/lib/settings/index.ts:184, 629
+export interface NetworkSettings {
+  apiRequestTimeout: number;  // 默认 10000ms（10秒），用户可在设置中修改
+}
+```
+
+所有 API 客户端（Plex、Radarr、Sonarr、TMDB 等）创建时都会传入这个 timeout：
+
+```typescript
+// server/api/servarr/base.ts:101-111
+const timeout = getSettings().network.apiRequestTimeout;
+super(url, { apikey: apiKey }, {
+  nodeCache: cacheManager.getCache(cacheName).data,
+  timeout,  // ← 10 秒超时，断网后最多等待 10 秒就抛错
+});
+
+// server/api/externalapi.ts:33-42
+this.axios = axios.create({
+  baseURL: baseUrl,
+  timeout: options.timeout,  // ← 所有 ExternalAPI 子类共享
+  // ...
+});
+```
+
+#### 第 2 层：单条目错误隔离（不影响其他条目）
+
+`processItem()` 内层有独立 try/catch，单个媒体处理失败不会终止整个扫描：
+
+```typescript
+// server/lib/scanners/plex/index.ts:208-224
+private async processItem(plexitem: PlexLibraryItem) {
+  try {
+    if (plexitem.type === 'movie') {
+      await this.processPlexMovie(plexitem);
+    } else if (plexitem.type === 'show' || ...) {
+      await this.processPlexShow(plexitem);
+    }
+  } catch (e) {
+    // 只写 error 日志，不 throw，继续处理下一个
+    this.log('Failed to process Plex media', 'error', {
+      errorMessage: e.message,
+      title: plexitem.title,
+    });
+  }
+}
+```
+
+**断网场景下的效果**：处理到第 N 个条目时断网 → 第 N 个条目 catch 住打日志 → 继续处理第 N+1 个 → 第 N+1 个也超时打日志 → ... 直到本批全部处理完（每个都超时 10 秒）。
+
+#### 第 3 层：顶层 try/catch/finally 保证状态重置
+
+`run()` 方法的顶层错误处理，确保无论发生什么错误，`running` 标志都会被重置：
+
+```typescript
+// server/lib/scanners/plex/index.ts:65-159
+public async run(): Promise<void> {
+  const sessionId = this.startRun();  // running = true
+  try {
+    // ... 所有业务逻辑 ...
+    // getRecentlyAdded() / paginateLibrary() / processItem() 都在这里
+    // 任何一步抛未 catch 的错误都会跳到 catch
+  } catch (e) {
+    this.log('Scan interrupted', 'error', { errorMessage: e.message });
+  } finally {
+    this.endRun(sessionId);  // ← 无论成功失败，一定重置 running = false
+  }
+}
+```
+
+### 12.2 断网场景下的具体行为
+
+以 **Plex Full Sync 进行到第 3 批（已处理 120/5000 条）时突然断网** 为例：
+
+```
+时间线：
+├─ T0: run() 开始，startRun() → running=true, sessionId=uuid1
+├─ T1: 第 1 批 (0-19) 处理完成
+├─ T2: 第 2 批 (20-39) 处理完成
+├─ T3: 第 3 批 (40-59) 处理中，第 42 条时断网
+│    ├─ 第 42 条：await this.plexClient.getMetadata(...) → 等待 10s 超时
+│    ├─ catch 打 error 日志 → 继续第 43 条
+│    ├─ 第 43-59 条：每条都超时 10s → 累计 18*10s = 180s
+├─ T4: 第 3 批处理完，setTimeout(4s) 后调 paginateLibrary(60-79)
+│    ├─ this.plexClient.getLibraryContents(..., { offset: 60 }) → 超时 10s
+│    ├─ throw new Error('getaddrinfo EAI_AGAIN plex.tv')
+│    ├─ 冒泡到 run() 的 catch → log('Scan interrupted', ...)
+├─ T5: finally 块执行 endRun(sessionId) → running=false
+└─ 扫描终止，已处理的 41 条数据已落库，进度丢失
+```
+
+### 12.3 恢复策略：断点续传 + 幂等性
+
+扫描中断后，**没有断点续传（不会从第 43 条继续）**，但通过两个机制保证最终一致性：
+
+#### （1）lastScan 时间戳 + 10 分钟缓冲（适用于 Recently Added 扫描）
+
+```typescript
+// server/lib/scanners/plex/index.ts:98-107
+const libraryItems = await this.plexClient.getRecentlyAdded(
+  library.id,
+  library.lastScan
+    ? { addedAt: library.lastScan - 1000 * 60 * 10 }  // ← 10 分钟缓冲
+    : undefined,
+  library.type
+);
+```
+
+**恢复效果**：下一次扫描（5 分钟后 cron 触发，或手动 Run Now）只拉取 `addedAt > lastScan - 10min` 的媒体，中断期间新增的不会漏掉。
+
+#### （2）Full Scan 的幂等恢复
+
+全量扫描没有 `lastScan` 偏移，下一次启动会从 offset=0 重新开始。但由于：
+- `getExisting(tmdbId)` 前置查询 → 已处理的走 UPDATE 分支
+- 所有字段是覆盖写而非累加 → 重复处理结果相同
+- `AsyncLock` 保证单进程内同媒体不并发写
+
+**恢复效果**：重新扫描会重复处理前 41 条，但数据库结果完全一致，只是浪费一些 API 调用和时间。
+
+#### （3）"失败就放弃，下次再说"的设计哲学
+
+代码中**没有**任何重试逻辑：
+- ❌ 没有指数退避（`exponential-backoff` 只是 node-gyp 的间接依赖，实际未使用）
+- ❌ 没有 `retry: 3` 配置
+- ❌ 没有死信队列（DLQ）
+
+**设计意图**：Plex/Radarr/Sonarr 都是本地/局域网服务，网络中断通常是短暂的（重启路由器、短暂掉线）。1 分钟~1 小时的 cron 周期已经足够让服务恢复，重试反而可能加剧网络拥塞。
+
+### 12.4 AvailabilitySync 的额外兜底："宁漏勿错"
+
+可用性同步有一个特殊的断网保护逻辑：如果 API 返回非 404 错误（如 500/超时/网络错误），**假设媒体仍然存在**，避免因网络问题误标记为已删除：
+
+```typescript
+// server/lib/availabilitySync.ts:711-724
+} catch (ex) {
+  if (!ex.message.includes('404')) {
+    existsInRadarr = true;  // ← 非 404 错误，不删除，避免误判
+    logger.debug('Failure retrieving... from Radarr.', { ... });
+  }
+}
+
+// Plex 同理（server/lib/availabilitySync.ts:934-947）
+} catch (ex) {
+  if (!ex.message.includes('404')) {
+    existsInPlex = true;    // ← 宁漏勿错
+    preventSeasonSearch = true;
+  }
+}
+
+// Jellyfin 更保守（server/lib/availabilitySync.ts:1071-1085）
+} catch (ex) {
+  if (!ex.message.includes('404') && !ex.message.includes('500')) {
+    existsInJellyfin = true;  // ← 连 500 都排除
+  }
+}
+```
+
+---
+
+## 13. 设计要点总结（最终完整版）
 
 | 机制 | 实现方式 | 关键文件 | 目的 |
 |------|----------|----------|------|
@@ -918,3 +1177,6 @@ processMovie() / processShow()
 | **专用扫描直调** | 直接调用 `scanner.run()` 绕过调度层 | `server/routes/settings/index.ts:261-268`, `427-434` | Plex/Jellyfin 全量扫描的专用启停入口 |
 | **失败 Alert 通知** | TypeORM Subscriber 的 AfterUpdate 生命周期 → `MEDIA_FAILED` → `notificationManager.sendNotification()` | `server/subscriber/MediaRequestSubscriber.ts:398-472`, `server/entity/MediaRequest.ts:736-837` | 仅在 Radarr/Sonarr 提交请求失败时推给管理员；扫描类 job 失败只写日志 |
 | **多 worker 幂等** | 四层保护：AsyncLock → 前置查询 → DB 唯一约束 → UPDATE 幂等 | `server/utils/asyncLock.ts`, `server/entity/Media.ts`, `server/migration/postgres/1734786061496-InitialMigration.ts` | 保证单实例部署数据正确；多实例不脏数据但重复跑任务 |
+| **状态 Metric 暴露** | `GET /settings/jobs` + 各 scanner.status() 返回 `{ running, progress, total, nextExecutionTime }` | `server/routes/settings/index.ts:657-669`, `baseScanner.ts:15-24` | 前端 Jobs 页面展示进度和下次执行时间；无 Prometheus 等专业 metric |
+| **断网恢复** | 三层超时（10s API 超时 + 单条目 catch 隔离 + 顶层 finally 重置 running）+ lastScan 10min 缓冲 + 幂等重跑 | `plex/index.ts:65-159`, `baseScanner.ts:208-224`, `settings/index.ts:629` | 断网时安全终止，不脏数据；下一次 cron 自动恢复，Recently Added 扫描不漏 |
+| **可用性同步防误删** | 非 404 错误假设媒体存在（宁漏勿错） | `availabilitySync.ts:711-724`, `934-947`, `1071-1085` | 防止网络波动导致已下载媒体被误标记为 DELETED |
