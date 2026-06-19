@@ -372,7 +372,244 @@ try {
 
 ---
 
-## 5. 设计要点总结
+## 5. 容器重启时的 Job 状态恢复机制
+
+### 5.1 启动挂载点
+
+容器重启后的 job 调度初始化链路全部挂在 `server/index.ts` 的 Next.js `app.prepare()` Promise 链中，执行顺序如下：
+
+```typescript
+// server/index.ts:62-156
+app.prepare()
+  .then(async () => {
+    // 1. 数据库初始化与迁移
+    await checkOverseerrMerge();
+    const dbConnection = dataSource.isInitialized
+      ? dataSource
+      : await dataSource.initialize();
+    if (process.env.NODE_ENV === 'production') {
+      await dbConnection.runMigrations();
+    }
+
+    // 2. 加载配置文件（settings.json）—— cron 表达式从此处读取
+    const settings = await getSettings().load();          // server/index.ts:84
+    restartFlag.initializeSettings(settings);
+
+    // 3. 网络/代理/DNS 缓存初始化
+    // ... proxy, DNS cache setup ...
+
+    // 4. 注册通知 Agent
+    notificationManager.registerAgents([...]);            // server/index.ts:132
+
+    // 5. 【关键挂载点】只有用户存在时才启动调度
+    const userRepository = getRepository(User);
+    const totalUsers = await userRepository.count();
+    if (totalUsers > 0) {
+      startJobs();                                         // server/index.ts:148
+    } else {
+      logger.info('Skipping starting the scheduled jobs...');
+    }
+
+    // 6. Express 路由与监听
+    // ... routes setup, server.listen() ...
+  })
+```
+
+### 5.2 状态恢复的设计取舍
+
+Jellyseerr **不做任何"运行中状态持久化"恢复**，核心原因与设计如下：
+
+#### （1）内存态即状态，不持久化
+所有与 job 相关的运行状态全部是内存变量，重启即丢失，由下一轮调度自动覆盖：
+
+| 状态对象 | 存储位置 | 重启后行为 |
+|----------|----------|------------|
+| `scheduledJobs[]` 数组 | `server/job/schedule.ts:31` 全局内存 | 重新 `startJobs()` 时重新 push，所有 timer 重新注册 |
+| `BaseScanner.running` / `progress` / `sessionId` | 扫描器实例内存字段（如 `plexFullScanner`） | 重新创建时默认 `running=false`，无需恢复 |
+| `AsyncLock.locked` / `ee` 队列 | `baseScanner.ts:67` 中的 `AsyncLock` 实例 | 锁随实例一起重置，无挂起等待者 |
+| `DownloadTracker.radarrServers / sonarrServers` | `downloadtracker.ts:28-29` | `{}` 空对象，等 1 分钟后的 `download-sync` 填充 |
+| `node-cache` 中的 API 缓存 | 各 `ExternalAPI` 的 nodeCache | 丢失，下一次请求重新拉取并缓存 |
+
+#### （2）为什么不恢复进度？
+- 数据库中**没有** `job_runs`、`scan_progress` 之类的持久化表，TypeORM 实体里只定义了 `Media`、`MediaRequest`、`Session`、`Blocklist` 等业务实体
+- 扫描结果（媒体条目是否存在）本身就落在 `Media` 表里，具有**幂等性**——即便扫描中断，下一次扫描从 `getExisting()` 分支走 UPDATE 而非 INSERT，不会重复创建
+- `lastScan` 时间戳持久化在 `settings.json` 的 `plex.libraries[].lastScan` 字段里（`plexRecentScanner` 每次跑完会写入），重启后"最近新增扫描"只拉取 `addedAt > lastScan - 10min` 的数据，不会因重启漏扫
+
+```typescript
+// server/lib/scanners/plex/index.ts:101-104
+const libraryItems = await this.plexClient.getRecentlyAdded(
+  library.id,
+  library.lastScan
+    ? { addedAt: library.lastScan - 1000 * 60 * 10 }  // 给 10 分钟缓冲，避免漏扫
+    : undefined,
+  library.type
+);
+```
+
+#### （3）"假恢复"：startup 时是否立刻跑一次？
+不跑。`startJobs()` **只注册定时回调**，不主动 `job.invoke()`，所以首次触发必须等 cron 到点：
+
+```typescript
+// server/job/schedule.ts:45-56
+scheduledJobs.push({
+  ...
+  job: schedule.scheduleJob(
+    jobs['plex-recently-added-scan'].schedule,  // 注册而非立即执行
+    () => { plexRecentScanner.run(); }
+  ),
+  ...
+});
+```
+
+如果用户想立刻触发，可以：
+- 通过前端 Jobs 页面的 **Run Now** 按钮 → `POST /settings/jobs/:jobId/run`（见 §6.2）
+- 或等下一次 cron 触发
+
+#### （4）重启保护：running / sessionId 两层守卫
+虽然不做进度恢复，但 `BaseScanner` 的两层机制保证了"旧进程中断 → 新进程启动时扫描器内部状态是干净的"：
+
+- `running=false`（初始值）：如果用户在重启瞬间触发了手动扫描，`loop()` 第一轮检查会失败，避免半初始化执行
+- `sessionId`（每个 `startRun()` 新生成 UUID）：保证如果上一次会话因重启中断，后续 `loop()` 递归调用全部 self-abort，不会继续跑老 session
+
+---
+
+## 6. 多触发路径：Cron 触发 vs Webhook/手动触发 vs 直接调用
+
+### 6.1 三条触发路径总览
+
+同一个扫描器（例如 `plexFullScanner.run()`）有**三条完全不同的入口**，其中前两条**共用同一个调度回调**，第三条**绕过调度直接调用实例方法**：
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                        三种触发方式对比                                      │
+├────────────────────────┬───────────────────────┬─────────────────────────────┤
+│ Cron 定时触发           │ Web 手动触发（通用）    │ API 直调（专用）              │
+├────────────────────────┼───────────────────────┼─────────────────────────────┤
+│ node-schedule 内部     │ POST /settings/jobs/  │ POST /settings/plex/sync     │
+│ timer 到点自动执行     │ :jobId/run            │ POST /settings/jellyfin/sync │
+│                        │                       │ 等专用端点                    │
+├────────────────────────┼───────────────────────┼─────────────────────────────┤
+│ 走 scheduleJob 注册时  │ 走 Job.invoke() → 同  │ 直接 scanner.run()           │
+│ 传入的 callback        │ 一个 callback          │ 不经过 scheduledJobs 数组    │
+└────────────────────────┴───────────────────────┴─────────────────────────────┘
+```
+
+### 6.2 路径一：Cron 触发（标准链路）
+
+注册位置：`server/job/schedule.ts` 中每个任务的 `schedule.scheduleJob(cron, callback)`
+
+```typescript
+// server/job/schedule.ts:45-53
+job: schedule.scheduleJob(
+  jobs['plex-recently-added-scan'].schedule,   // cron: '0 */5 * * * *'
+  () => {
+    logger.info('Starting scheduled job: Plex Recently Added Scan', { label: 'Jobs' });
+    plexRecentScanner.run();                   // 直接调用扫描器单例的 run()
+  }
+),
+```
+
+**特点**：
+- 到点由 `node-schedule` 的 `Invocation` 队列触发
+- 不受 HTTP 请求上下文限制
+- 失败**不重试**（扫描器自身 catch 住 + 下一轮调度重试）
+
+### 6.3 路径二：通用手动/Webhook 触发（共用调度回调）
+
+前端 **Run Now** 按钮最终调用 `POST /settings/jobs/:jobId/run`（`server/routes/settings/index.ts:671-689`），这是**所有 13 个 job 共用的通用入口**。关键代码：
+
+```typescript
+// server/routes/settings/index.ts:671-689
+settingsRoutes.post<{ jobId: string }>('/jobs/:jobId/run', (req, res, next) => {
+  const scheduledJob = scheduledJobs.find((job) => job.id === req.params.jobId);
+
+  if (!scheduledJob) {
+    return next({ status: 404, message: 'Job not found.' });
+  }
+
+  // 【差异化核心】：调用 node-schedule 的 Job.invoke()
+  scheduledJob.job.invoke();   // ← 和 Cron 触发共用完全相同的 callback 函数
+
+  return res.status(200).json({
+    id: scheduledJob.id,
+    running: scheduledJob.running ? scheduledJob.running() : false,
+  });
+});
+```
+
+**Cron 触发 vs 手动触发的差异化细节**：
+
+| 维度 | Cron 触发 | 手动/Webhook 触发（invoke()） |
+|------|----------|------------------------------|
+| 执行的函数 | `scheduleJob` 注册的 callback（闭包内的 `scanner.run()`） | **同一个 callback**，完全共享 |
+| 调用者 | node-schedule 内部 Job.fire() | HTTP 路由 → `job.invoke()` |
+| 响应状态 | 无响应（后台任务，写日志） | 同步返回 `200` + 当前状态 JSON |
+| `nextInvocation` 重置 | 到点后自动排下一次 | `invoke()` **不影响**下一次调度时间，cron 节奏不变 |
+| `cancelFn` 检查 | 不检查 | 不检查（但 `running` 标志在 scanner.run() 内生效） |
+| 日志前缀 | `label: 'Jobs'` + 完整任务名 | 完全相同（同 callback 内 logger 调用） |
+| 互斥锁生效 | 是（scanner 内部 `running` + `asyncLock`） | 是（完全同前） |
+
+> **关于"Webhook"说明**：Seerr 本身**没有**接收 Radarr/Sonarr/Plex 推送 Webhook 的 HTTP 端点（代码检索 `OnDownload/OnGrab/OnImport` 等关键词无命中）。真正的"外部触发"走的是这条通用 Run API：外部系统 POST `/settings/jobs/:jobId/run` 即可，效果与点 Run Now 完全一致。
+
+### 6.4 路径三：专用 API 直调（绕过调度）
+
+针对 Plex/Jellyfin 两个最重的扫描任务，另外提供了专用端点，**完全不经过 `scheduledJobs` 数组和 `node-schedule`**：
+
+```typescript
+// server/routes/settings/index.ts:261-268
+settingsRoutes.post('/plex/sync', (req, res) => {
+  if (req.body.cancel) {
+    plexFullScanner.cancel();                      // 直调实例 cancel()
+  } else if (req.body.start) {
+    plexFullScanner.run();                         // ← 直接调实例的 run()，不走 invoke
+  }
+  return res.status(200).json(plexFullScanner.status());
+});
+
+// server/routes/settings/index.ts:427-434  Jellyfin 同理
+settingsRoutes.post('/jellyfin/sync', (req, res) => {
+  if (req.body.cancel) {
+    jellyfinFullScanner.cancel();
+  } else if (req.body.start) {
+    jellyfinFullScanner.run();
+  }
+  return res.status(200).json(jellyfinFullScanner.status());
+});
+```
+
+与路径二的本质差异：
+
+| 维度 | 通用 invoke()（路径二） | 专用 scanner.run()（路径三） |
+|------|------------------------|-----------------------------|
+| 调度层介入 | 经 `node-schedule::Job.invoke` | 完全绕过调度层 |
+| 能触发的 job | 全部 13 个（只要在 `scheduledJobs` 数组里） | 只有 Plex/Jellyfin Full Scan 两个 |
+| 执行对象 | 闭包内 `plexRecentScanner.run()` 等（不同实例） | 直接操作 `plexFullScanner` 单例 |
+| 返回的 running 检查 | `scheduledJob.running?.()`（可能为 undefined） | `scanner.status()` 一定有值 |
+| cancel 支持 | 需另走 `POST /jobs/:jobId/cancel` 端点 | 同一个端点 `{ cancel: true }` body 即可 |
+| 前端入口 | Jobs 列表的 ▶ Run Now | Settings → Plex/Jellyfin 配置页的 Sync 按钮 |
+
+### 6.5 三条路径最终的汇聚点
+
+无论从哪条路径触发，最终都落到扫描器单例的 `run()` 上，由 §2 的互斥机制保证幂等与安全：
+
+```
+Cron timer
+   │
+   ├─ scheduleJob callback ──► plexFullScanner.run() ──┐
+   │                                                    │
+POST /jobs/:jobId/run ───► job.invoke() ───────────────┤
+   │                                                    ├─► startRun()
+   │                                                    │    │
+POST /plex/sync  ──────────────────────────────────────┘    └─► loop()
+                                                                  │
+                                                            asyncLock.dispatch()
+                                                                  │
+                                                             processMovie()/Show()
+```
+
+---
+
+## 7. 设计要点总结（补充）
 
 | 机制 | 实现方式 | 关键文件 | 目的 |
 |------|----------|----------|------|
@@ -384,3 +621,7 @@ try {
 | TMDB 限流 | setTimeout(250ms) | `server/job/blocklistedTagsProcessor.ts` | 遵守 TMDB API 速率限制 |
 | 容错退避 | 缓存 + 静默失败 + 下次重试 | `server/api/externalapi.ts`, `server/lib/downloadtracker.ts` | 避免单个失败导致整体任务崩溃 |
 | 后台刷新 | getRolling 缓存策略 | `server/api/externalapi.ts` | 减少响应延迟，同时保持数据新鲜度 |
+| **启动挂载** | `app.prepare()` → `startJobs()`，仅 `totalUsers > 0` 时注册 | `server/index.ts:62-156` | 保证配置/DB 就绪后再注册 timer |
+| **重启恢复策略** | 内存态不持久化 + lastScan 持久化 + 幂等扫描 | `server/index.ts`, `plex/index.ts:103` | 无状态设计，重启后由 cron 或手动触发重新跑 |
+| **通用手动触发** | `job.invoke()` 复用 cron 注册的 callback | `server/routes/settings/index.ts:671-689` | Run Now / 外部 webhook 触发所有 job，不影响调度节奏 |
+| **专用扫描直调** | 直接调用 `scanner.run()` 绕过调度层 | `server/routes/settings/index.ts:261-268`, `427-434` | Plex/Jellyfin 全量扫描的专用启停入口 |
