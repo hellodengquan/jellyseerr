@@ -605,6 +605,27 @@ EnableMediaPlayback ────────────► 完全忽略
    ```
    limit 非零 且 used ≥ limit → 真正受限。limit=0（管理员或未设配额）永远返回 `restricted=false`。
 
+#### 9.2.1 配额预占用机制（核心设计）
+
+**"预占用"就是 `status != DECLINED` 这条规则本身**——只要请求没被明确拒绝，就会计入配额占用，这是该项目配额系统最核心的设计。
+
+完整状态对应表（`server/entity/MediaRequest.ts:529-531` 的 `MediaRequestStatus` 枚举）：
+
+| 状态 | 占配额？ | 说明 |
+|---|---|---|
+| `PENDING` (1) | ✅ 是 | 用户提交，等待审批 |
+| `APPROVED` (2) | ✅ 是 | 已批准，等待下载 |
+| `DECLINED` (3) | ❌ 否 | 被拒绝，配额释放 |
+| `FAILED` (4) | ✅ 是 | 下载失败 |
+| `PROCESSING` (5) | ✅ 是 | 正在下载 |
+| `COMPLETED` (6) | ✅ 是 | 已完成 |
+
+**关键行为**：
+1. **用户提交即占用**（`MediaRequest.ts:459-521` `request()` 方法中 new 出来就是 PENDING 或 APPROVED 状态，立即计入配额）
+2. **拒绝才归还**（只有管理员点"Decline"将状态改为 DECLINED，配额才释放）
+3. **滚动窗口过期自然释放**（若设置了 quotaDays，超过 N 天的请求自动退出统计窗口）
+4. **删除请求也释放**（`MediaRequestSubscriber.afterRemove()` 触发父状态更新，但配额归还靠的是记录从数据库消失，不在统计范围内了）
+
 ### 9.3 请求拦截点：`MediaRequest.request()`
 
 配额拒绝发生在**创建请求前立即拦截**，贯穿两处代码：
@@ -635,6 +656,20 @@ case QuotaRestrictedError:
 ```
 前端可据此展示"配额超限"提示。
 
+#### 9.4.1 状态变化时的配额自动归还
+
+当请求状态被管理员修改时，配额会自动重算（因为 `getQuota()` 是实时查询，不是缓存）：
+
+**管理员拒绝请求**：`POST /api/v1/request/:id/decline`（`server/routes/request.ts:672-694`）
+- 将 `request.status` 改为 `MediaRequestStatus.DECLINED`
+- 触发 `MediaRequestSubscriber.afterUpdate()` → `updateParentStatus()`（`MediaRequestSubscriber.ts:820-904`）
+- 拒绝的同时将所有 `SeasonRequest.status` 也改为 DECLINED（`MediaRequestSubscriber.ts:890-904`）
+- 下次 `getQuota()` 查询时，`status != DECLINED` 条件自动排除该请求 → **配额自动归还**
+
+**管理员批准请求**：状态改为 APPROVED，配额仍被占用（因为 `status != DECLINED` 仍然成立），没有归还。
+
+**删除用户时**：`requestRepository.remove(user.requests)` 批量删除请求，`afterRemove` 事件触发父 Media 状态更新，但配额归还是因为记录消失了。
+
 ### 9.5 与邀请流程的配合
 
 邀请/创建用户时的配额写入：
@@ -645,9 +680,140 @@ case QuotaRestrictedError:
 
 ---
 
-## 十、会话与鉴权中间件
+## 十、邀请生命周期事件审计
 
-### 10.1 用户注入中间件
+> 澄清：该项目**没有独立的审计日志数据库表**（没有 `audit_log` / `event_log` 表），事件审计完全通过 **winston logger 写入日志文件** 实现。
+
+### 10.1 日志基础设施
+
+定义于 `server/logger.ts:1-75`，winston 配置双通道输出：
+
+| 日志通道 | 文件名 | 格式 | 保留策略 | 用途 |
+|---|---|---|---|---|
+| seerr | `seerr-%DATE%.log` | 人类可读文本 | 7天轮转，单文件20MB | 业务日志 |
+| machine | `.machinelogs-%DATE%.json` | JSON | 1天轮转，单文件20MB | 机器解析日志 |
+
+日志级别默认 `debug`，可通过 `LOG_LEVEL` 环境变量覆盖。
+
+### 10.2 邀请相关的关键审计事件
+
+以下是邀请/用户生命周期各阶段的日志触发点：
+
+#### 10.2.1 用户创建阶段
+
+| 事件 | 代码位置 | 日志级别 | 关键字段 |
+|---|---|---|---|
+| 管理员创建本地用户成功 | `server/routes/user/index.ts:222` 前后（无显式日志） | - | 无 |
+| 批量导入 Plex 用户成功 | `server/routes/user/index.ts:711` 前后（无显式日志） | - | 无 |
+| 批量导入 Jellyfin 用户成功 | `server/routes/user/index.ts:791` 前后（无显式日志） | - | 无 |
+| 自助登录首次创建 Plex 用户 | `server/routes/auth.ts:147-183`（创建成功无日志） | - | 无 |
+| 自助登录首次创建 Jellyfin 用户 | `server/routes/auth.ts:454-483`（创建成功无日志） | - | 无 |
+| 重置密码链接发送成功 | `server/routes/auth.ts:739` | `info` | `email, label: 'Auth API'` |
+| 重置密码链接发送失败（邮箱不存在） | `server/routes/auth.ts:749` | `error` | `email, label: 'Auth API'` |
+
+> **重要发现**：用户创建（邀请）成功本身**没有日志记录**，只有失败/异常路径有日志。这是设计缺陷，审计能力较弱。
+
+#### 10.2.2 用户登录阶段
+
+| 事件 | 代码位置 | 日志级别 | 关键字段 |
+|---|---|---|---|
+| Plex 登录未导入 + newPlexLogin=false | `server/routes/auth.ts:149-158` | `warn` | `ip, plexId, plexUsername, email, label: 'Auth API'` |
+| Plex 登录但无服务器访问权限 | `server/routes/auth.ts:187-195` | `warn` | `ip, plexId, plexUsername, email, label: 'Auth API'` |
+| 本地登录密码错误 | `server/routes/auth.ts:615-624` | `warn` | `ip, email, userId, label: 'Auth API'` |
+| 本地登录成功 | `server/routes/auth.ts:636` 前后（无显式日志） | - | 无 |
+
+#### 10.2.3 请求审批阶段（邀请后用户行为）
+
+| 事件 | 代码位置 | 日志级别 | 关键字段 |
+|---|---|---|---|
+| 请求被拉黑媒体拦截 | `server/entity/MediaRequest.ts:144-151` | `warn` | `tmdbId, mediaType, label: 'Media Request'` |
+| 重复请求拦截 | `server/entity/MediaRequest.ts:188-197` | `warn` | `tmdbId, mediaType, is4k, label: 'Media Request'` |
+| Plex 设备获取失败 | `server/api/plextv.ts:206-210` | `error` | `errorMessage, label: 'Plex.tv API'` |
+| 删除用户失败 | `server/routes/user/index.ts:643-647` | `error` | `userId, message, label: 'User API'` |
+
+#### 10.2.4 账户关联/解绑阶段
+
+| 事件 | 代码位置 | 日志级别 | 关键字段 |
+|---|---|---|---|
+| 关联 Plex 失败（邮箱不匹配/已绑定） | `server/routes/user/usersettings.ts:276-300` | 无显式日志（直接抛错） | - |
+| 关联 Jellyfin 失败 | `server/routes/user/usersettings.ts:375-445` | 无显式日志（直接抛错） | - |
+| 关联 Plex/Jellyfin 成功 | 无日志 | - | - |
+| 解绑成功 | 无日志 | - | - |
+
+### 10.3 审计缺陷总结
+
+1. **无持久化审计表**：日志文件轮转 7 天后丢失，无法做长期审计
+2. **成功路径几乎无日志**：创建用户、登录成功、关联账户等正常操作均不记录
+3. **无操作人记录**：管理员创建用户、审批请求等操作未记录操作人（modifiedBy 字段只存于 MediaRequest，用户操作没有）
+4. **无结构化事件类型**：日志 message 是自由文本，难以做聚合分析
+5. **无 IP 地址全局记录**：仅登录失败和少量错误路径记录了 ip，大部分操作无 IP
+
+---
+
+## 十一、Plex Home 子账号与主账号的关联
+
+> 澄清：该项目**在数据模型中识别了 Plex Home 关系，但在业务逻辑中完全没有使用它**。Plex Home 子账号与主账号在 Seerr 中是**完全独立的两个用户**，没有任何关联逻辑。
+
+### 11.1 数据层识别：PlexDevice 中的 home / ownerID 字段
+
+Plex.tv API 返回的设备列表（`/api/resources`）中，每个 Device 包含 `home` 和 `ownerID` 字段：
+
+**接口定义**：
+- `server/interfaces/api/plexInterfaces.ts:40-41`：`ownerID?: string; home?: boolean;`
+- `server/api/plextv.ts:67-68`（原始 XML 字段）：`ownerID?: string; home?: string;`
+
+**解析代码**（`server/api/plextv.ts:194-195`）：
+```typescript
+ownerID: pxml.$?.ownerID,
+home: pxml.$?.home == '1' ? true : false,
+```
+
+字段含义（Plex 官方语义）：
+- `home: true`：该设备属于 Plex Home 网络
+- `ownerID`：Plex Home 主账号的用户 ID（子账号的设备会带上主账号的 ownerID）
+
+### 11.2 Plex Home 字段的实际使用情况
+
+在整个代码库中搜索 `\.home` 和 `ownerID`：
+- `server/interfaces/api/plexInterfaces.ts:40-41`：接口声明
+- `server/api/plextv.ts:67-68`：XML 字段声明
+- `server/api/plextv.ts:194-195`：解析赋值
+- **没有任何地方读取这两个字段用于业务判断**
+
+**前端也不展示**：
+- `src/components/UserList/index.tsx`：用户列表只展示 username、email、userType、permissions
+- `src/pages/users/[userId]/settings/linked-accounts.tsx`：关联账户页只展示 plexUsername / jellyfinUsername
+
+### 11.3 实际行为：Plex Home 子账号与主账号完全独立
+
+假设 Plex Home 配置如下：
+- 主账号 A（plexId=100，ownerID=100，home=true）
+- 子账号 B（plexId=200，ownerID=100，home=true）
+
+在 Seerr 中的表现：
+
+| 场景 | 行为 |
+|---|---|
+| A 先登录 | 创建用户 User1（plexId=100） |
+| B 再登录（用 B 自己的 PIN 授权） | 创建**独立**的 User2（plexId=200），**不会**关联到 User1 |
+| 管理员给 User1 管理员权限 | User2 仍是普通用户，权限不共享 |
+| User1 有 10 部电影配额 | User2 配额独立计算 |
+| 删除 User1 | User2 不受影响 |
+| User1 请求了电影 X | User2 仍可请求电影 X（不会被判定为重复） |
+
+### 11.4 为什么没有关联逻辑
+
+从代码设计推测的原因：
+1. Seerr 的权限模型是按 Seerr 用户独立管理的，不继承 Plex 的权限关系
+2. Plex Home 子账号本身有独立的 Plex ID 和邮箱，可以独立登录 Seerr
+3. 没有"家庭组共享配额"、"主账号代子账号审批"等需求场景
+4. 识别 home/ownerID 可能是为了未来扩展，目前只是"透传但不使用"
+
+---
+
+## 十二、会话与鉴权中间件
+
+### 12.1 用户注入中间件
 
 `server/middleware/auth.ts:9-41` `checkUser`
 
@@ -659,7 +825,7 @@ case QuotaRestrictedError:
 3. 设置 req.locale（用户设置或全局默认）
 ```
 
-### 10.2 权限校验中间件
+### 12.2 权限校验中间件
 
 `server/middleware/auth.ts:43-58` `isAuthenticated(permissions?, options?)`
 
@@ -669,7 +835,7 @@ case QuotaRestrictedError:
 
 ---
 
-## 十一、完整协作流程图
+## 十三、完整协作流程图
 
 ```
 管理员视角                           新用户视角
@@ -724,25 +890,30 @@ case QuotaRestrictedError:
 
 ---
 
-## 十二、关键代码文件索引
+## 十四、关键代码文件索引
 
 | 功能 | 文件路径 |
 |---|---|
 | 用户类型常量 | `server/constants/user.ts` |
 | 权限位枚举与 hasPermission 算法 | `server/lib/permissions.ts` |
+| 日志系统（winston 双通道配置） | `server/logger.ts` |
 | 用户实体（含 getQuota、resetPassword、密码哈希） | `server/entity/User.ts` |
 | 会话实体（Session expiredAt 字段） | `server/entity/Session.ts` |
-| 请求实体（含 QuotaRestrictedError、onDelete 级联配置、配额拦截逻辑） | `server/entity/MediaRequest.ts` |
+| 请求实体（含 QuotaRestrictedError、onDelete 级联配置、配额拦截逻辑、状态枚举） | `server/entity/MediaRequest.ts` |
 | 关注清单实体（onDelete: CASCADE） | `server/entity/Watchlist.ts` |
 | 用户设置实体（onDelete: CASCADE） | `server/entity/UserSettings.ts` |
 | Issue/评论实体（onDelete 级联配置） | `server/entity/Issue.ts` |
+| MediaRequest 事件订阅（afterRemove/updateParentStatus/状态级联） | `server/subscriber/MediaRequestSubscriber.ts` |
+| Media 事件订阅（子请求状态同步） | `server/subscriber/MediaSubscriber.ts` |
+| IssueComment 事件订阅（通知） | `server/subscriber/IssueCommentSubscriber.ts` |
+| Plex 设备接口（home/ownerID 字段定义） | `server/interfaces/api/plexInterfaces.ts` |
 | 认证路由（登录/登出/重置密码过期判定/Jellyfin 设备注销） | `server/routes/auth.ts` |
-| 请求路由（QuotaRestrictedError → 403 映射） | `server/routes/request.ts` |
+| 请求路由（QuotaRestrictedError → 403 映射、审批/拒绝） | `server/routes/request.ts` |
 | 用户管理路由（CRUD/导入/删除时手动清理请求/配额字段写入） | `server/routes/user/index.ts` |
 | 用户设置路由（密码/关联冲突校验/权限） | `server/routes/user/usersettings.ts` |
 | 设置路由（libraries 全局启用/禁用、rate-limit） | `server/routes/settings/index.ts` |
 | 鉴权中间件（Session 读取、权限校验） | `server/middleware/auth.ts` |
-| Plex.tv API 封装（含 checkUserAccess 服务器权限校验） | `server/api/plextv.ts` |
+| Plex.tv API 封装（含 checkUserAccess 服务器权限校验、home/ownerID 解析） | `server/api/plextv.ts` |
 | Jellyfin API 封装（Policy 接口定义、登录） | `server/api/jellyfin.ts` |
 | 服务器启动（Session TTL / maxAge 配置、clientIp 解析） | `server/index.ts` |
 | Plex 扫描器（libraries enabled 过滤逻辑） | `server/lib/scanners/plex/index.ts` |
