@@ -582,7 +582,312 @@ export const hasNotificationType = (types, value): boolean => {
 
 ---
 
-## 七、核心代码文件索引
+## 七、评论 Markdown 渲染管道与 XSS 防护
+
+### 1. 渲染架构概览
+
+```
+用户输入（textarea）
+      │
+      ▼  服务端原样存储（IssueComment.message = 原始文本）
+      │
+      ▼  前端渲染时通过 ReactMarkdown 组件转 HTML
+      │
+      ├─ allowedElements 白名单过滤
+      ├─ skipHtml 禁止原始 HTML
+      └─ React 虚拟 DOM 自动转义（二次保障）
+```
+
+### 2. 前端渲染组件
+
+**IssueDescription**（`src/components/IssueDetails/IssueDescription/index.tsx:148-155`）
+
+渲染 Issue 的第一条 Comment（即问题描述）：
+
+```tsx
+<div className="prose mt-4">
+  <ReactMarkdown
+    allowedElements={['p', 'em', 'strong', 'ul', 'ol', 'li']}
+    skipHtml
+  >
+    {description}
+  </ReactMarkdown>
+</div>
+```
+
+**IssueComment**（`src/components/IssueDetails/IssueComment/index.tsx:225-232`）
+
+渲染后续评论：
+
+```tsx
+<div className="prose w-full max-w-full">
+  <ReactMarkdown
+    skipHtml
+    allowedElements={['p', 'em', 'strong', 'ul', 'ol', 'li']}
+  >
+    {comment.message}
+  </ReactMarkdown>
+</div>
+```
+
+### 3. XSS 防护的三层机制
+
+| 层级 | 机制 | 说明 |
+|------|------|------|
+| **第一层：`skipHtml`** | react-markdown 配置 | 完全禁止 HTML 标签。`<script>alert(1)</script>` 不会被执行，而是被当作纯文本渲染 |
+| **第二层：`allowedElements`** | react-markdown 配置 | 白名单只允许 6 种元素：`p`, `em`, `strong`, `ul`, `ol`, `li`。标题（`h1-h6`）、链接（`a`）、图片（`img`）、代码块（`code`/`pre`）等全部被过滤 |
+| **第三层：React 自动转义** | React JSX 机制 | 即使前两层被绕过，React 默认对 `{}` 内插值做 HTML 转义，不会执行恶意脚本 |
+
+### 4. 被过滤掉的 Markdown 特性
+
+| 用户输入 | 渲染结果 | 原因 |
+|----------|----------|------|
+| `# 标题` | 纯文本 `# 标题` | `h1` 不在白名单 |
+| `[链接](https://...)` | 纯文本 `链接` | `a` 不在白名单 |
+| `![图片](url)` | 纯文本 `![图片](url)` | `img` 不在白名单 |
+| `` `代码` `` | 纯文本 `代码` | `code` 不在白名单 |
+| `> 引用` | 纯文本 `> 引用` | `blockquote` 不在白名单 |
+| `<script>alert(1)</script>` | 纯文本 `alert(1)` | `skipHtml` + 白名单双重过滤 |
+| `**粗体**` | **粗体** | `strong` 在白名单 ✅ |
+| `*斜体*` | *斜体* | `em` 在白名单 ✅ |
+| `- 列表项` | · 列表项 | `ul`/`li` 在白名单 ✅ |
+
+### 5. 列表页的纯文本截断渲染
+
+**IssueItem**（`src/components/IssueList/IssueItem/index.tsx:112-117`）
+
+Issue 列表页中，评论描述**不走 Markdown 渲染**，直接截断纯文本：
+
+```tsx
+const description = issue.comments?.[0]?.message || '';
+const maxDescriptionLength = 120;
+const truncatedDescription = shouldTruncate
+  ? description.substring(0, maxDescriptionLength) + '...'
+  : description;
+```
+
+截断后的文本放在 `<span>` 中，Tooltip 展示全文时也用 `whitespace-pre-wrap` 纯文本样式，**不经过 ReactMarkdown**。
+
+### 6. 服务端无额外过滤
+
+后端 `IssueComment.message` 字段为 `text` 类型，直接存储用户原始输入，不做任何 sanitize 或 HTML 转义。XSS 防护完全依赖前端渲染时 react-markdown 的白名单 + React 的自动转义。
+
+---
+
+## 八、Issue 与 Admin 投诉处理（Blocklist）的协同关系
+
+### 1. 结论：Issue 与 Blocklist 是两套独立系统
+
+经过全代码库搜索，Issue 和 Blocklist 之间**没有任何直接的代码关联**。搜索 `issue.*blocklist` / `blocklist.*issue` 返回 0 命中。
+
+两者共享同一媒体资源（Media 实体），但各自独立运作：
+
+```
+                    ┌──────────────┐
+                    │  Media 实体   │
+                    └──────┬───────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+           ▼               ▼               ▼
+    ┌──────────┐   ┌──────────┐   ┌──────────────┐
+    │  Issues  │   │ Requests │   │  Blocklist   │
+    │ (投诉报告)│   │ (请求)   │   │ (黑名单屏蔽) │
+    └──────────┘   └──────────┘   └──────────────┘
+    独立 CRUD      独立 CRUD       独立 CRUD
+    独立通知        独立通知         无通知
+```
+
+### 2. 权限体系对比
+
+| 权限 | 值 | 说明 |
+|------|-----|------|
+| `MANAGE_ISSUES` | 1048576 | 管理 Issue（解决/重开/删除任意 Issue） |
+| `VIEW_ISSUES` | 2097152 | 查看 Issue 列表和详情 |
+| `CREATE_ISSUES` | 4194304 | 创建 Issue 和评论 |
+| `MANAGE_BLOCKLIST` | 268435456 | 管理 Blocklist（添加/删除黑名单） |
+| `VIEW_BLOCKLIST` | 1073741824 | 查看 Blocklist |
+
+**关键区别**：
+- Issue 权限面向**所有用户**开放（CREATE_ISSUES 是独立权限，普通用户可拥有）
+- Blocklist 权限面向**管理员**（MANAGE_BLOCKLIST/VIEW_BLOCKLIST 只授予管理员）
+- Issue 的 `MANAGE_ISSUES` 和 Blocklist 的 `MANAGE_BLOCKLIST` 是**完全独立的位标志**，一个用户可以只有其一
+
+### 3. 管理员的实际协同工作流
+
+虽然代码层面无关联，但管理员在实际操作中存在**隐性的手动协同**：
+
+```
+1. 用户报告 Issue（如"这个视频有严重的版权问题"）
+2. 管理员查看 Issue 详情，判断严重程度
+3. 管理员可能：
+   a. 解决 Issue → POST /issue/:id/resolved
+   b. 同时将媒体加入 Blocklist → POST /blocklist（另开页面操作）
+4. Blocklist 生效后：
+   - Media.status → BLOCKLISTED
+   - 该媒体不会再出现在发现页/搜索中
+   - 但已存在的 Issue 不会自动解决
+```
+
+### 4. Blocklist 的自动化机制
+
+**BlocklistedTagsProcessor**（`server/job/blocklistedTagsProcessor.ts`）
+
+这是一个定时任务（`server/job/schedule.ts:246-260`），自动将包含特定 TMDB 关键词的媒体加入黑名单：
+
+```
+定时运行（默认每天）
+  → 清除之前按标签加入的 Blocklist 条目
+  → 遍历 blocklistedTags 设置中的每个关键词
+  → 通过 TMDB Discover API 搜索带该关键词的影视
+  → 将结果逐个 addToBlocklist()
+  → Media.status = BLOCKLISTED
+```
+
+> 注意：此任务**只处理 Blocklist**，不触碰 Issue。即使媒体因标签被加入黑名单，其上的 Open Issue 也不会自动解决。
+
+### 5. Blocklist 与 Media 的级联删除
+
+当从 Blocklist 中移除条目时（`server/routes/blocklist.ts:264-312`）：
+
+```
+删除 Blocklist 条目
+  → 同时删除对应的 Media 条目（mediaRepository.remove）
+  → Media 的 onDelete: 'CASCADE' → 级联删除所有关联的 Issues 和 Comments
+```
+
+这意味着**解除 Blocklist 会连带删除该媒体的所有 Issue**。这是一个容易忽略的副作用。
+
+---
+
+## 九、Issue 统计接口与数据归档
+
+### 1. 统计接口：GET /issue/count
+
+**路由位置**：`server/routes/issue.ts:167-227`
+
+**权限**：无（任何已登录用户均可访问，甚至未检查 isAuthenticated）
+
+**返回结构**：
+
+```json
+{
+  "total": 42,
+  "video": 15,
+  "audio": 8,
+  "subtitles": 12,
+  "others": 7,
+  "open": 30,
+  "closed": 12
+}
+```
+
+**实现方式**：执行 **7 次独立 COUNT 查询**：
+
+```typescript
+const totalCount    = query.getCount();                                    // 全量
+const videoCount    = query.where('issue.issueType = :issueType', { issueType: 1 }).getCount();
+const audioCount    = query.where('issue.issueType = :issueType', { issueType: 2 }).getCount();
+const subtitlesCount = query.where('issue.issueType = :issueType', { issueType: 3 }).getCount();
+const othersCount   = query.where('issue.issueType = :issueType', { issueType: 4 }).getCount();
+const openCount     = query.where('issue.status = :issueStatus', { issueStatus: 1 }).getCount();
+const closedCount   = query.where('issue.status = :issueStatus', { issueStatus: 2 }).getCount();
+```
+
+> ⚠️ 性能隐患：7 次独立 SQL 而非 GROUP BY 聚合。当 Issue 数量大时，可优化为 `SELECT issueType, status, COUNT(*) FROM issue GROUP BY issueType, status` 一次查完。
+
+### 2. 统计数据的消费方
+
+| 消费位置 | 使用的字段 | 说明 |
+|----------|-----------|------|
+| `src/components/Layout/index.tsx:33-34` | `issueResponse?.open` | 全局 SWR 请求 `/api/v1/issue/count` |
+| `src/components/Layout/Sidebar/index.tsx:306-316` | `openIssuesCount` | 侧边栏 "Issues" 菜单项旁的红色 Badge |
+| `src/components/Layout/MobileMenu/index.tsx` | `openIssuesCount` | 移动端菜单的红色 Badge |
+| `src/components/IssueDetails/index.tsx:151` | `mutate('/api/v1/issue/count')` | 状态变更后手动刷新计数 |
+| `src/components/IssueModal/CreateIssueModal/index.tsx:135` | `mutate('/api/v1/issue/count')` | 创建 Issue 后手动刷新计数 |
+
+**数据流**：
+
+```
+GET /issue/count
+    │
+    ▼ Layout 组件全局 SWR 缓存
+    │
+    ├─→ Sidebar.openIssuesCount = response.open
+    └─→ MobileMenu.openIssuesCount = response.open
+    
+    Issue 状态变更 / 创建 → mutate('/api/v1/issue/count') → SWR 重新请求 → Badge 更新
+```
+
+### 3. Issue 列表接口：GET /issue
+
+**路由位置**：`server/routes/issue.ts:18-100`
+
+**权限**：`MANAGE_ISSUES` 或 `VIEW_ISSUES` 或 `CREATE_ISSUES`（任一即可）
+
+**查询参数**：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| take | number | 10 | 每页条数 |
+| skip | number | 0 | 跳过条数 |
+| filter | string | - | `all`/`open`/`resolved` |
+| sort | string | - | `added`/`modified` |
+| userId | number | - | 按创建者过滤 |
+
+**排序逻辑**：
+
+```typescript
+switch (sort) {
+  case 'modified':
+    query.orderBy('issue.updatedAt', 'DESC');  // 最后修改时间
+    break;
+  default:
+    query.orderBy('issue.createdAt', 'DESC');  // 默认：创建时间倒序
+}
+```
+
+**过滤逻辑**：
+
+```typescript
+switch (filter) {
+  case 'open':
+    query.andWhere('issue.status = :status', { status: IssueStatus.OPEN });
+    break;
+  case 'resolved':
+    query.andWhere('issue.status = :status', { status: IssueStatus.RESOLVED });
+    break;
+  // 'all' 不加过滤
+}
+```
+
+**userId 过滤**：额外条件 `issue.createdBy.id = :userId`，仅管理员可用（普通用户自动追加自己的 id）。
+
+### 4. 数据归档与清理机制
+
+**结论：Issue 没有任何归档或自动清理机制。**
+
+经过全代码库搜索：
+
+| 搜索维度 | 结果 |
+|----------|------|
+| 关键词 `archive`/`purge`/`retention` 在 server 目录 | 0 命中（与 Issue 相关） |
+| 定时任务 `server/job/schedule.ts` | 无 Issue 相关定时任务 |
+| `availabilitySync` | 不处理 Issue |
+| `MediaSubscriber` | 不处理 Issue |
+| 媒体删除时的级联行为 | `onDelete: 'CASCADE'` → Issue 和 Comments 随 Media 一起删除 |
+
+**Issue 数据的"归档"实际上只有两种方式**：
+
+1. **手动解决**：`POST /issue/:id/resolved`，标记为 RESOLVED，数据仍在数据库
+2. **手动删除**：`DELETE /issue/:issueId`，硬删除 Issue + Comments
+3. **被动级联删除**：Media 被删除时（包括 Blocklist 解除时），Issue 随之删除
+
+**RESOLVED 状态的 Issue 会永远留在数据库中**，没有 TTL、没有归档表、没有软删除标记。唯一清理方式是管理员手动删除或关联 Media 被删。
+
+---
+
+## 十、核心代码文件索引
 
 | 文件 | 职责 |
 |------|------|
@@ -590,25 +895,38 @@ export const hasNotificationType = (types, value): boolean => {
 | `server/entity/Issue.ts` | Issue 实体 + OneToMany 关系 + AfterLoad 排序 |
 | `server/entity/IssueComment.ts` | IssueComment 实体 |
 | `server/entity/Media.ts` | Media 实体 + getMedia/getRelatedMedia 静态方法 + issues 反查 |
+| `server/entity/Blocklist.ts` | Blocklist 实体 + addToBlocklist 静态方法 |
 | `server/entity/UserSettings.ts` | 用户通知偏好存储 + hasNotificationType 方法 |
 | `server/interfaces/api/issueInterfaces.ts` | 前后端 API 接口类型 |
-| `server/routes/issue.ts` | Issue CRUD + 评论 + 状态变更 |
+| `server/routes/issue.ts` | Issue CRUD + 评论 + 状态变更 + count 统计 |
 | `server/routes/issueComment.ts` | Comment 独立 CRUD |
+| `server/routes/blocklist.ts` | Blocklist CRUD + 集合黑名单 |
 | `server/routes/movie.ts` | 电影详情页，调用 Media.getMedia() 反查 issues |
 | `server/routes/tv.ts` | 剧集详情页，调用 Media.getMedia() 反查 issues |
 | `server/subscriber/IssueSubscriber.ts` | Issue 创建/状态变更 → 触发通知 |
 | `server/subscriber/IssueCommentSubscriber.ts` | Comment 创建 → 触发通知（排除第1条） |
 | `server/subscriber/MediaSubscriber.ts` | 媒体状态变更 → 只更新 MediaRequest，**不处理 Issue** |
+| `server/lib/permissions.ts` | 权限枚举（含 MANAGE_ISSUES/VIEW_ISSUES/CREATE_ISSUES/MANAGE_BLOCKLIST） |
 | `server/lib/notifications/index.ts` | 通知类型枚举 + 权限过滤 + Manager |
 | `server/lib/notifications/agents/agent.ts` | 通知代理接口 + Payload 结构 |
 | `server/lib/notifications/agents/email.ts` | Email 通知代理，含完整管理员/用户双通路 |
 | `server/lib/notifications/agents/discord.ts` | Discord 通知代理，含 @提及逻辑 |
 | `server/lib/notifications/agents/webpush.ts` | WebPush 浏览器推送代理 |
 | `server/lib/availabilitySync.ts` | 媒体可用性同步，**不处理 Issue 自动关闭** |
+| `server/job/schedule.ts` | 定时任务调度器，**无 Issue 相关任务** |
+| `server/job/blocklistedTagsProcessor.ts` | 关键词黑名单自动扫描，**只处理 Blocklist** |
+| `src/components/IssueDetails/IssueDescription/index.tsx` | Issue 描述的 Markdown 渲染（allowedElements + skipHtml） |
+| `src/components/IssueDetails/IssueComment/index.tsx` | Issue 评论的 Markdown 渲染（allowedElements + skipHtml） |
+| `src/components/IssueDetails/index.tsx` | Issue 详情页主组件（SWR 数据流 + 操作入口） |
+| `src/components/IssueList/index.tsx` | Issue 列表页（过滤/排序/分页） |
+| `src/components/IssueList/IssueItem/index.tsx` | Issue 列表项（纯文本截断描述，无 Markdown） |
+| `src/components/IssueModal/CreateIssueModal/index.tsx` | 创建 Issue 弹窗 |
+| `src/components/Layout/index.tsx` | 全局 SWR 请求 /issue/count |
+| `src/components/Layout/Sidebar/index.tsx` | 侧边栏 Issue 计数 Badge |
 
 ---
 
-## 八、容易混淆的点总结
+## 十一、容易混淆的点总结
 
 1. **Issue 没有 message 字段**：描述全在 comments[0]，创建 Issue 时的 message 直接变成第一条 Comment
 2. **第一条 Comment 不触发 ISSUE_COMMENT**：IssueCommentSubscriber 中有判断跳过，避免和 ISSUE_CREATED 重复
@@ -622,3 +940,11 @@ export const hasNotificationType = (types, value): boolean => {
 10. **notifySystem 含义不一致**：Discord/Webhook 当全局开关用，Email/WebPush 直接忽略此字段按用户偏好发
 11. **用户通知偏好是位标志**：每个 agent 一个数字，通过 `&` 运算判断是否订阅某类通知
 12. **Manager 不决定接收者**：NotificationManager 只分发给 agent，每个 agent 自己查用户表、自己过滤接收人
+13. **Markdown 白名单极严格**：只允许 p/em/strong/ul/ol/li 六种元素，链接、图片、代码块、标题全部被过滤
+14. **XSS 防护全在前端**：后端原样存储，不 sanitize；前端靠 react-markdown 的 skipHtml + allowedElements + React 自动转义三层防护
+15. **列表页不走 Markdown**：IssueItem 组件直接 substring 截断纯文本，Tooltip 也用 whitespace-pre-wrap 而非 ReactMarkdown
+16. **Issue 与 Blocklist 完全独立**：代码中零关联，管理员需手动在两个页面分别操作
+17. **解除 Blocklist 会级联删除 Issue**：删除 Blocklist 条目 → 删除 Media → onDelete:CASCADE → Issues 全没了
+18. **count 接口无权限检查**：`GET /issue/count` 未调用 isAuthenticated，且执行 7 次独立 COUNT 查询（可优化为 GROUP BY）
+19. **Issue 没有归档/清理机制**：RESOLVED 的 Issue 永远留在数据库，无 TTL、无归档表、无定时清理任务
+20. **BlocklistedTagsProcessor 不影响 Issue**：关键词黑名单自动扫描只处理 Blocklist + Media 状态，不碰 Issue
