@@ -60,11 +60,38 @@
 - Plex：`server/routes/auth.ts:147-183`
 - Jellyfin：`server/routes/auth.ts:440-483`
 
-### 2.4 密码重置（类邀请）链接的过期与失效机制
+### 2.4 邀请链接共享与撤回（不存在该机制）
+
+> 重要澄清：该项目**完全没有"邀请链接"或"共享链接"的概念**。经过全代码库检索，没有任何 invite link、share link、public link、邀请码 token 等相关实现。
+
+#### 2.4.1 为什么不需要邀请链接
+
+三种用户加入途径均不需要"链接"：
+1. **管理员创建本地用户** → 直接填表单入库，可选邮件发送初始密码
+2. **从媒体服务器批量导入** → 管理员后台操作，用户无需点击链接
+3. **自助登录首次创建** → 用户直接通过 Plex/Jellyfin OAuth 登录即创建，不需要邀请链接
+
+#### 2.4.2 与"邀请"最接近的功能对比
+
+| 功能 | 是否生成链接 | 能否撤回 | 代码位置 |
+|---|---|---|---|
+| 密码重置链接 | ✅ 是（`resetPasswordGuid`） | ✅ 是（用后置空或过期） | `server/entity/User.ts:229-265` |
+| Plex OAuth PIN 码 | ❌ 不是链接，是弹窗 PIN | ❌ 不能撤回，Plex.tv 侧控制过期 | `src/utils/plex.ts` |
+| 登录 Session | ❌ 是 Cookie-Session | ✅ 是（logout 销毁） | `server/routes/auth.ts:648-716` |
+| 邀请链接 | ❌ 不存在 | ❌ 不存在 | 无 |
+
+#### 2.4.3 所谓"撤回邀请"的等效操作
+
+如果管理员想"撤回"一个用户的访问权，只能通过**硬删除用户**实现：
+- 接口：`DELETE /api/v1/user/:id`（`server/routes/user/index.ts:593-655`）
+- 副作用：用户的所有请求、关注清单、Issue 等会被 CASCADE 删除
+- 没有"禁用/冻结"的软删除概念
+
+### 2.5 密码重置（类邀请）链接的过期与失效机制
 
 > 注：该项目**没有传统的一次性邀请码/邀请链接机制**。与"链接过期"相关的代码触发只有密码重置链接 + Plex PIN + Session 过期三条链路。
 
-#### 2.4.1 密码重置链接（最接近邀请语义）
+#### 2.5.1 密码重置链接（最接近邀请语义）
 
 **生成**：`server/entity/User.ts:229-265` `User.resetPassword()`
 ```typescript
@@ -833,9 +860,216 @@ home: pxml.$?.home == '1' ? true : false,
 - 缺少指定权限 → 403
 - 位运算：`hasPermission(permissions, this.permissions, options)`
 
+### 12.3 单点登出（SLO）与邀请会话清理
+
+> 澄清：该项目**没有 SSO 单点登出（Single Logout）机制**。没有 SAML/OIDC 全局登出回调，也没有"一处登出，所有设备失效"的功能。
+
+#### 12.3.1 登出接口行为
+
+接口：`POST /api/v1/auth/logout`，实现于 `server/routes/auth.ts:648-716`
+
+登出时按媒体服务器类型做不同清理：
+
+| 登录方式 | Session 销毁 | 媒体服务器侧清理 |
+|---|---|---|
+| Plex OAuth | ✅ `req.session.destroy()` | ❌ 不通知 Plex.tv 失效 Token |
+| Jellyfin / Emby | ✅ `req.session.destroy()` | ✅ 调用 `DELETE /Devices` 删除 `jellyfinDeviceId` 对应的设备 |
+| Local | ✅ `req.session.destroy()` | ❌ 无外部服务 |
+
+#### 12.3.2 Jellyfin 设备注销详细流程
+
+代码段（`server/routes/auth.ts:660-698`）：
+
+```
+1. 判断是否 Jellyfin/Emby 媒体服务器
+2. 读取用户的 jellyfinUserId 和 jellyfinDeviceId
+3. 构造 X-Emby-Authorization 头（用管理员 API Key）
+4. axios.delete(`${baseUrl}/Devices?Id=${jellyfinDeviceId}`)
+5. 无论成功失败都继续销毁 Session
+6. 失败时记录 error 日志
+```
+
+**注意**：
+- Jellyfin 的 `jellyfinAuthToken`（即用户登录后拿到的 AccessToken）**不会**被显式失效，只是删除了设备记录
+- 同一用户在多个浏览器/设备上登录会产生多个 Session，登出一个**不会**影响其他 Session
+- 没有"全局强制下线"管理员功能
+
+#### 12.3.3 对"邀请会话"的影响
+
+> 不存在"邀请会话"这个概念。邀请（用户创建）和会话（登录状态）是完全独立的两件事：
+
+1. **邀请不会产生 Session**：用户被创建后只是数据库中有一条记录，不自动登录
+2. **登出不会撤回邀请**：用户登出只是销毁当前 Session，用户记录仍在数据库，下次仍可登录
+3. **用户删除 ≠ 登出**：删除用户时 CASCADE 掉所有关联数据，但 Session 表中可能残留该用户的 session（TTL 到期后由 TypeormStore 清理）
+
+#### 12.3.4 Plex Token 的"隐式失效"
+
+Plex 登录拿到的 `plexToken` 存储在用户表中，用于后续 Watchlist 同步等后台任务。这个 token **不会**因为用户登出而失效：
+
+- 用户登出 Seerr → 本地 Session 销毁 → 但 `user.plexToken` 仍在数据库
+- 下次登录时，Plex OAuth 流程会用新的 authToken 重新获取用户信息，然后**覆盖更新** `plexToken`
+- 如果用户在 Plex.tv 侧撤销了 Seerr 的授权，后台的 Watchlist 同步任务会失败，但代码不会自动禁用该用户
+
 ---
 
-## 十三、完整协作流程图
+## 十三、Plex Watchlist 集成与邀请触发同步
+
+Plex Watchlist 同步是该项目中**唯一与"邀请后自动触发请求"相关的机制**。新用户被邀请后，如果开启了 Watchlist 同步，其 Plex Watchlist 中的内容会被自动请求，相当于"邀请触发了一批媒体请求"。
+
+### 13.1 整体架构：定时任务 + 逐用户同步
+
+**任务调度**：`server/job/schedule.ts:89-107`
+```
+Job ID: plex-watchlist-sync
+类型: process
+间隔: 可配置（默认短间隔秒级）
+触发: node-schedule cron
+执行: watchlistSync.syncWatchlist()
+```
+仅在 `mediaServerType === PLEX` 时注册该任务，Jellyfin/Emby 模式下不运行。
+
+### 13.2 同步入口：`WatchlistSync.syncWatchlist()`
+
+实现于 `server/lib/watchlistsync.ts:17-32`
+
+```
+1. 查找所有 plexToken 不为空的用户
+   （即所有通过 Plex 登录或关联了 Plex 账号的用户）
+2. 逐用户调用 syncUserWatchlist(user)
+```
+
+> 注意：这里遍历的是**全部有 Plex token 的用户**，包括管理员和普通用户。没有白名单或"只同步被邀请用户"的限制。
+
+### 13.3 单用户同步逻辑：`syncUserWatchlist()`
+
+实现于 `server/lib/watchlistsync.ts:34-197`
+
+#### 13.3.1 前置检查（按顺序跳过）
+
+| 检查项 | 代码位置 | 跳过条件 |
+|---|---|---|
+| 无 Plex Token | 第 35-41 行 | `!user.plexToken` → warn 日志 |
+| 无 Auto-Request 权限 | 第 43-54 行 | 没有 `AUTO_REQUEST / AUTO_REQUEST_MOVIE / AUTO_REQUEST_TV` |
+| 未开启同步开关 | 第 56-62 行 | `watchlistSyncMovies` 和 `watchlistSyncTv` 都为 false |
+
+> **与邀请的关系**：新用户被创建时，`settings.watchlistSyncMovies/Tv` 默认为 false，需要用户自己在设置页打开。管理员导入用户时**不会**自动开启。
+
+#### 13.3.2 数据拉取与比对
+
+```typescript
+// 1. 拉取 Plex Watchlist 前 20 条
+const response = await plexTvApi.getWatchlist({ size: 20 });
+
+// 2. 在 Seerr 本地库中匹配已存在的媒体
+const mediaItems = await Media.getRelatedMedia(user, response.items.map(...));
+
+// 3. 查出该用户已有的 auto-request（避免重复）
+const existingAutoRequests = await requestRepository
+  .createQueryBuilder('request')
+  .where('request.requestedBy = :userId', { userId: user.id })
+  .andWhere('request.isAutoRequest = true')
+  .andWhere('media.tmdbId IN (:...tmdbIds)', { tmdbIds: watchlistTmdbIds })
+  .getMany();
+
+// 4. 过滤出"未请求 + 未入库 + 未拉黑"的条目
+const unavailableItems = response.items.filter(...);
+```
+
+#### 13.3.3 自动创建请求
+
+对每个 `unavailableItems` 中的条目：
+```typescript
+await MediaRequest.request(
+  {
+    mediaId: mediaItem.tmdbId,
+    mediaType: movie/show 对应 MOVIE/TV,
+    seasons: 'all',           // TV 默认请求全部季
+    tvdbId: mediaItem.tvdbId,
+    is4k: false,
+  },
+  user,
+  { isAutoRequest: true }     // 标记为自动请求
+);
+```
+
+**标记 `isAutoRequest: true` 的意义**：
+- 去重：同步时只检查 `isAutoRequest=true` 的请求，避免和用户手动请求混淆
+- 前端展示：用户可以在 Watchlist 页区分哪些是自动的
+- 错误分级：同步时遇到配额超限、重复请求等错误只打 debug 日志，不中断流程
+
+### 13.4 配额交互：邀请触发时的预占用
+
+Watchlist 同步调用的是标准的 `MediaRequest.request()` 方法，**配额计算完全一致**：
+
+1. 同步时每个自动请求都会调用 `getQuota()` 检查
+2. 如果配额超限 → 抛出 `QuotaRestrictedError` → 被 catch 打 debug 日志 → **跳过该条继续下一条**
+3. 成功创建的请求 → `status=PENDING 或 APPROVED` → 立即占用配额（预占用机制）
+4. 如果管理员后续拒绝 → 状态变 DECLINED → 配额释放
+
+**批量场景特点**：
+- 假设用户剩余配额 3 条，Watchlist 有 10 条 → 前 3 条成功，后 7 条因配额超限跳过
+- 下次同步时，如果配额还没恢复（滚动窗口没到或没被拒绝）→ 继续跳过
+- 配额恢复后 → 下次同步时继续自动请求
+
+### 13.5 本地 Watchlist 与 Plex Watchlist 的区别
+
+该项目有**两个独立的 Watchlist 概念**，容易混淆：
+
+| 维度 | Plex Watchlist | 本地 Seerr Watchlist |
+|---|---|---|
+| 数据存储 | Plex.tv 云端 | 本地数据库 `watchlist` 表 |
+| 实体 | 无本地表 | `server/entity/Watchlist.ts` |
+| 路由 | 无直接路由（通过同步间接操作） | `server/routes/watchlist.ts`（POST/DELETE） |
+| 自动请求 | ✅ 是（同步后自动请求） | ❌ 否（只是收藏，不自动请求） |
+| 与邀请关系 | 邀请后开启同步会自动触发一批请求 | 邀请本身不影响，用户手动维护 |
+| 删除用户时 | 不影响 Plex 侧数据 | CASCADE 级联删除 |
+
+> 注意：`MediaRequest.isAutoRequest = true` 的请求**来源于** Plex Watchlist 同步，但请求本身和本地 Watchlist 表没有直接关联。
+
+### 13.6 邀请 → Watchlist 同步的完整触发链路
+
+```
+用户被邀请（三种途径之一）
+   │
+   ▼
+用户首次 Plex 登录 / 关联 Plex 账号
+   │
+   ├─► user.plexToken 被写入数据库
+   │
+   ▼
+用户在设置页打开 "Auto-request from Plex Watchlist"
+   │
+   ├─► user.settings.watchlistSyncMovies = true
+   └─► user.settings.watchlistSyncTv = true
+   │
+   ▼
+下一次定时任务触发（plex-watchlist-sync）
+   │
+   ├─► 遍历所有有 plexToken 的用户
+   ├─► 检查权限和开关
+   ├─► 拉取 Plex Watchlist 前 20 条
+   ├─► 比对已存在/已请求/已拉黑
+   └─► 对未处理的条目调用 MediaRequest.request({ isAutoRequest: true })
+         │
+         ├─► 配额检查（预占用）
+         ├─► 成功 → PENDING 或 APPROVED，占用配额
+         └─► 失败（配额超/重复/拉黑）→ 跳过，记日志
+```
+
+### 13.7 相关开关与权限
+
+| 配置项 | 位置 | 默认值 | 说明 |
+|---|---|---|
+| `jobs['plex-watchlist-sync'].schedule` | 设置页 Jobs | 可配置 | cron 表达式 |
+| `user.settings.watchlistSyncMovies` | 用户设置 | false | 电影自动同步开关 |
+| `user.settings.watchlistSyncTv` | 用户设置 | false | 剧集自动同步开关 |
+| `Permission.AUTO_REQUEST` | 权限位 | 含在 defaultPermissions 中 | 总开关 |
+| `Permission.AUTO_REQUEST_MOVIE` | 权限位 | 含在 defaultPermissions 中 | 电影细分 |
+| `Permission.AUTO_REQUEST_TV` | 权限位 | 含在 defaultPermissions 中 | 剧集细分 |
+
+---
+
+## 十四、完整协作流程图
 
 ```
 管理员视角                           新用户视角
@@ -890,34 +1124,41 @@ home: pxml.$?.home == '1' ? true : false,
 
 ---
 
-## 十四、关键代码文件索引
+## 十五、关键代码文件索引
 
 | 功能 | 文件路径 |
 |---|---|
 | 用户类型常量 | `server/constants/user.ts` |
 | 权限位枚举与 hasPermission 算法 | `server/lib/permissions.ts` |
 | 日志系统（winston 双通道配置） | `server/logger.ts` |
-| 用户实体（含 getQuota、resetPassword、密码哈希） | `server/entity/User.ts` |
+| 定时任务调度（所有 cron job） | `server/job/schedule.ts` |
+| Plex Watchlist 同步逻辑（核心） | `server/lib/watchlistsync.ts` |
+| Watchlist 同步单测 | `server/lib/watchlistsync.test.ts` |
+| 用户实体（含 getQuota、resetPassword、密码哈希、plexToken） | `server/entity/User.ts` |
 | 会话实体（Session expiredAt 字段） | `server/entity/Session.ts` |
-| 请求实体（含 QuotaRestrictedError、onDelete 级联配置、配额拦截逻辑、状态枚举） | `server/entity/MediaRequest.ts` |
+| 请求实体（含 QuotaRestrictedError、isAutoRequest、onDelete 级联） | `server/entity/MediaRequest.ts` |
+| 本地 Watchlist 实体（与 Plex Watchlist 是两个概念） | `server/entity/Watchlist.ts` |
 | 关注清单实体（onDelete: CASCADE） | `server/entity/Watchlist.ts` |
-| 用户设置实体（onDelete: CASCADE） | `server/entity/UserSettings.ts` |
+| 用户设置实体（watchlistSyncMovies/Tv 开关） | `server/entity/UserSettings.ts` |
 | Issue/评论实体（onDelete 级联配置） | `server/entity/Issue.ts` |
 | MediaRequest 事件订阅（afterRemove/updateParentStatus/状态级联） | `server/subscriber/MediaRequestSubscriber.ts` |
 | Media 事件订阅（子请求状态同步） | `server/subscriber/MediaSubscriber.ts` |
 | IssueComment 事件订阅（通知） | `server/subscriber/IssueCommentSubscriber.ts` |
 | Plex 设备接口（home/ownerID 字段定义） | `server/interfaces/api/plexInterfaces.ts` |
-| 认证路由（登录/登出/重置密码过期判定/Jellyfin 设备注销） | `server/routes/auth.ts` |
+| Watchlist 创建接口 Zod Schema | `server/interfaces/api/watchlistCreate.ts` |
+| 认证路由（登录/登出/重置密码/Jellyfin 设备注销） | `server/routes/auth.ts` |
 | 请求路由（QuotaRestrictedError → 403 映射、审批/拒绝） | `server/routes/request.ts` |
-| 用户管理路由（CRUD/导入/删除时手动清理请求/配额字段写入） | `server/routes/user/index.ts` |
-| 用户设置路由（密码/关联冲突校验/权限） | `server/routes/user/usersettings.ts` |
-| 设置路由（libraries 全局启用/禁用、rate-limit） | `server/routes/settings/index.ts` |
+| 本地 Watchlist 路由（POST/DELETE） | `server/routes/watchlist.ts` |
+| 用户管理路由（CRUD/导入/删除/配额字段） | `server/routes/user/index.ts` |
+| 用户设置路由（密码/关联冲突校验/Watchlist 开关） | `server/routes/user/usersettings.ts` |
+| 设置路由（libraries 全局启用/禁用、rate-limit、Jobs 配置） | `server/routes/settings/index.ts` |
 | 鉴权中间件（Session 读取、权限校验） | `server/middleware/auth.ts` |
-| Plex.tv API 封装（含 checkUserAccess 服务器权限校验、home/ownerID 解析） | `server/api/plextv.ts` |
-| Jellyfin API 封装（Policy 接口定义、登录） | `server/api/jellyfin.ts` |
+| Plex.tv API 封装（含 checkUserAccess、getWatchlist、home/ownerID） | `server/api/plextv.ts` |
+| Jellyfin API 封装（Policy 接口定义、登录、Devices 删除） | `server/api/jellyfin.ts` |
 | 服务器启动（Session TTL / maxAge 配置、clientIp 解析） | `server/index.ts` |
 | Plex 扫描器（libraries enabled 过滤逻辑） | `server/lib/scanners/plex/index.ts` |
 | Plex OAuth 前端逻辑（PIN 轮询） | `src/utils/plex.ts` |
 | Plex 登录 Hook | `src/hooks/usePlexLogin.ts` |
 | 前端登录页 | `src/components/Login/index.tsx` |
 | 前端用户列表（创建/导入/配额表单） | `src/components/UserList/index.tsx` |
+| 前端 Watchlist 页面 | `src/pages/users/[userId]/watchlist.tsx` |
