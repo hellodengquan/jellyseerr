@@ -1076,7 +1076,7 @@ Issue 数据全部存在数据库表 `issue` 和 `issue_comment` 中，没有单
 
 ---
 
-## 十三、核心代码文件索引
+## 十八、核心代码文件索引
 
 | 文件 | 职责 |
 |------|------|
@@ -1115,10 +1115,13 @@ Issue 数据全部存在数据库表 `issue` 和 `issue_comment` 中，没有单
 | `server/lib/overseerrMerge.ts` | Overseerr 数据库合并迁移（首次启动时运行，非用户导出工具） |
 | `server/interfaces/api/settingsInterfaces.ts` | SettingsAboutResponse 定义（不含 totalIssues） |
 | `server/routes/settings/index.ts` | 全站唯一的 rate-limit 应用处（Plex 用户导入） |
+| `server/routes/search.ts` | TMDB 搜索路由（不搜索 Issue 数据） |
+| `server/middleware/auth.ts` | 认证中间件（checkUser + isAuthenticated） |
+| `server/lib/notifications/agents/webhook.ts` | Webhook Agent，含 Issue 字段 KeyMap 模板变量映射 |
 
 ---
 
-## 十四、容易混淆的点总结
+## 十九、容易混淆的点总结
 
 1. **Issue 没有 message 字段**：描述全在 comments[0]，创建 Issue 时的 message 直接变成第一条 Comment
 2. **第一条 Comment 不触发 ISSUE_COMMENT**：IssueCommentSubscriber 中有判断跳过，避免和 ISSUE_CREATED 重复
@@ -1147,3 +1150,265 @@ Issue 数据全部存在数据库表 `issue` 和 `issue_comment` 中，没有单
 25. **Issue 没有导出/备份接口**：没有 CSV/JSON 导出，没有应用内备份按钮，备份靠文件级（SQLite 文件或 pg_dump）
 26. **About 接口不含 Issue 统计**：`/settings/about` 只有 totalMediaItems 和 totalRequests，Issue 统计走独立的 `/issue/count`
 27. **Overseerr Merge 不是导出工具**：只在首次启动时自动运行一次，用于兼容 Overseerr 数据库，不是用户可调用的导入/导出功能
+
+---
+
+## 十五、Issue 跨语言搜索
+
+### 1. 结论：Issue 不参与搜索，也没有跨语言搜索能力
+
+经过全代码库搜索，Issue 模块**不存在搜索功能**，更不存在跨语言搜索。
+
+### 2. 全局搜索路由与 Issue 的关系
+
+**搜索路由**：`server/routes/search.ts`
+
+```
+GET /search?query=xxx&language=zh
+GET /search/keyword?query=xxx
+GET /search/company?query=xxx
+```
+
+这些搜索全部调用 **TMDB API**（The Movie Database），搜索对象是影视、关键词、公司，**不搜索本地 Issue 数据**。
+
+```
+用户输入搜索词
+    │
+    ▼
+searchProvider = findSearchProvider(queryString)  // 匹配 IMDB ID / TMDB ID 等特殊格式
+    │
+    ├─ 匹配到特殊 provider → 调用 provider.search()
+    └─ 未匹配 → tmdb.searchMulti({ query, language })  // TMDB 多语言搜索
+    │
+    ▼
+返回影视结果 + 关联的本地 Media 数据
+```
+
+`language` 参数传入 TMDB API，用于返回对应语言的影视标题/简介。这和 Issue 没有任何关系。
+
+### 3. Issue 列表的"过滤"不是"搜索"
+
+Issue 列表页（`GET /issue`）的查询参数只有过滤/排序，没有全文搜索：
+
+| 参数 | 作用 | 是否搜索 |
+|------|------|---------|
+| filter | open / resolved / all | 过滤，不是搜索 |
+| sort | added / modified | 排序 |
+| userId | 按创建者 | 过滤 |
+| take / skip | 分页 | 分页 |
+
+后端查询是纯 SQL `WHERE` 条件，没有 `LIKE`、没有 `FULLTEXT`、没有 `ILIKE`。
+
+### 4. 前端 Issue 页面的搜索
+
+`src/pages/issues/index.tsx` 中没有搜索框，只有过滤器（状态、类型、排序）。用户无法按评论内容或标题搜索 Issue。
+
+### 5. 为什么没有 Issue 搜索？
+
+Issue 的数据量设计上很小（每个媒体一般只有 0-2 个 Issue），SQL `WHERE status = OPEN` 就够了。没有引入 Elasticsearch / Meilisearch 等搜索引擎的必要。如果需要跨语言搜索，需要在 Issue 数据上建全文索引，目前代码中完全缺失这个方向。
+
+---
+
+## 十六、Issue 与监控告警系统集成
+
+### 1. 结论：没有独立监控告警系统，Webhook 是唯一的集成出口
+
+Jellyseerr **没有内置 Prometheus / Grafana / Zabbix 等监控集成**。但通知系统中的 **Webhook Agent** 可以作为对外集成的桥梁，Issue 事件通过它推送到外部系统。
+
+### 2. Webhook Agent 的 Issue 数据映射
+
+**位置**：`server/lib/notifications/agents/webhook.ts:17-64`
+
+Webhook Agent 定义了 `KeyMap`，将 Issue 相关字段映射为模板变量：
+
+| 模板变量 | 映射值 | 说明 |
+|---------|--------|------|
+| `{{issue_id}}` | `payload.issue.id` | Issue ID |
+| `{{issue_type}}` | `IssueType[issue.issueType]` | 问题类型名（VIDEO/AUDIO/SUBTITLES/OTHER） |
+| `{{issue_status}}` | `IssueStatus[issue.status]` | 状态名（OPEN/RESOLVED） |
+| `{{reportedBy_username}}` | `issue.createdBy.displayName` | 报告人用户名 |
+| `{{reportedBy_email}}` | `issue.createdBy.email` | 报告人邮箱 |
+| `{{reportedBy_avatar}}` | `issue.createdBy.avatar` | 报告人头像 |
+| `{{reportedBy_settings_discordIds}}` | `issue.createdBy.settings.discordIds` | 报告人 Discord ID |
+| `{{reportedBy_settings_telegramChatId}}` | `issue.createdBy.settings.telegramChatId` | 报告人 Telegram Chat ID |
+| `{{comment_message}}` | `comment.message` | 评论内容 |
+| `{{commentedBy_username}}` | `comment.user.displayName` | 评论人用户名 |
+| `{{commentedBy_email}}` | `comment.user.email` | 评论人邮箱 |
+| `{{commentedBy_avatar}}` | `comment.user.avatar` | 评论人头像 |
+| `{{notification_type}}` | `Notification[type]` | 通知类型名（ISSUE_CREATED/ISSUE_COMMENT 等） |
+| `{{event}}` | `payload.event` | 事件描述 |
+| `{{subject}}` | `payload.subject` | 主题（媒体名） |
+| `{{message}}` | `payload.message` | 消息内容 |
+
+### 3. Webhook 集成流程
+
+```
+Issue 事件触发
+    │
+    ▼
+Subscriber 构造 NotificationPayload
+    │
+    ▼
+NotificationManager 分发给 WebhookAgent
+    │
+    ▼
+WebhookAgent.send():
+    1. 检查 notifySystem && hasNotificationType
+    2. 从 settings 读取 webhookUrl + jsonPayload（Base64 编码的 JSON 模板）
+    3. 解码 jsonPayload → JSON.parse
+    4. parseKeys() 递归替换模板变量 {{xxx}} → 实际值
+    5. 支持 URL 变量替换（webhookUrl 中的 {{xxx}} 也会被替换）
+    6. axios.post(webhookUrl, parsedPayload, { headers })
+```
+
+### 4. 外部监控系统集成方案
+
+虽然 Jellyseerr 没有原生监控集成，但通过 Webhook 可以桥接：
+
+```
+Jellyseerr Issue Event
+    │
+    ▼ Webhook POST
+    │
+    ├─→ n8n / Zapier（自动化工作流）→ 邮件/Slack/JIRA
+    ├─→ 自建中间件 → Prometheus Pushgateway → Grafana
+    ├─→ Alertmanager Webhook → 告警升级
+    └─→ 任意 HTTP 端点
+```
+
+### 5. 其他 Agent 的 Issue 告警能力
+
+| Agent | Issue 事件是否支持 | 说明 |
+|-------|-------------------|------|
+| Webhook | ✅ 完整支持 | 可自定义 JSON 模板，灵活度最高 |
+| Discord | ✅ 内嵌 Embed | 含 Issue 类型、状态、报告人、链接 |
+| Email | ✅ 模板邮件 | 含 Issue 详情和链接 |
+| Slack | ✅ Block Kit | 含 Issue 字段 |
+| Telegram | ✅ 消息 | 含 Issue 文本 |
+| Pushover | ✅ 推送 | 简洁文本 |
+| WebPush | ✅ 浏览器通知 | 简洁文本 |
+| Gotify/Ntfy/Pushbullet | ✅ 推送 | 简洁文本 |
+
+所有 10 个通知 Agent 都能接收 Issue 事件，但只有 Webhook 支持自定义 JSON 结构，适合对接监控系统。其余 Agent 是面向人阅读的通知。
+
+### 6. `/status` 端点（非 Issue 专用）
+
+**位置**：`server/routes/index.ts:50-96`
+
+```
+GET /api/v1/status → { version, commitTag, updateAvailable, commitsBehind, restartRequired }
+```
+
+这个端点返回的是应用版本和更新状态，**不包含 Issue 统计**。没有健康检查端点、没有 `/metrics`、没有 Prometheus 格式输出。
+
+---
+
+## 十七、用户匿名提交 Issue 的处理路径
+
+### 1. 结论：Jellyseerr 不支持匿名提交 Issue
+
+经过全代码库搜索，Issue 创建**强制要求已认证用户**，不存在匿名提交路径。
+
+### 2. 认证中间件链
+
+**路由注册**：`server/routes/index.ts:172`
+
+```typescript
+router.use('/issue', isAuthenticated(), issueRoutes);
+```
+
+`isAuthenticated()` 中间件（`server/middleware/auth.ts:43-58`）的逻辑：
+
+```typescript
+if (!req.user || !req.user.hasPermission(permissions ?? 0)) {
+  res.status(403).json({
+    status: 403,
+    error: 'You do not have permission to access this endpoint',
+  });
+}
+```
+
+**没有 user → 直接 403**，没有 fallback，没有匿名角色。
+
+### 3. 用户身份的来源
+
+`checkUser` 中间件（`server/middleware/auth.ts:9-41`）在 `isAuthenticated` 之前执行，确定用户身份：
+
+```
+请求进入
+    │
+    ▼ checkUser()
+    │
+    ├─ X-API-Key header 匹配 → 使用 API Key 认证
+    │   ├─ 无 X-API-User header → 默认 userId = 1（管理员）
+    │   └─ 有 X-API-User header → 使用指定用户
+    │
+    ├─ session.userId 存在 → 使用 Session 认证（浏览器登录）
+    │
+    └─ 都没有 → req.user = undefined → 后续 isAuthenticated() 返回 403
+```
+
+### 4. Issue 创建时的用户关联
+
+**创建路由**：`server/routes/issue.ts:102-165`
+
+```typescript
+// 必须有用户
+if (!req.user) {
+  return next({ status: 500, message: 'User missing from request.' });
+}
+
+// createdBy 的确定逻辑
+let createdBy = req.user; // 默认：当前登录用户
+if (req.body.userId && req.body.userId !== req.user.id) {
+  // 管理员代为创建：需要 MANAGE_ISSUES 权限
+  if (!req.user.hasPermission(Permission.MANAGE_ISSUES)) {
+    return next({ status: 403, message: '...' });
+  }
+  createdBy = await userRepository.findOneOrFail({ where: { id: req.body.userId } });
+}
+```
+
+**所有 Issue 都必须有 createdBy（User 实体）**，没有 user 就无法创建 Issue。
+
+### 5. API Key 认证路径的"伪匿名"
+
+唯一接近"匿名"的场景是 API Key 认证：
+
+```
+X-API-Key: <server-api-key>
+X-API-User: <target-user-id>  (可选)
+```
+
+- 有 `X-API-Key` 但没有 `X-API-User` → 以 userId=1（管理员）身份创建 Issue
+- 有 `X-API-Key` + `X-API-User` → 以指定用户身份创建 Issue
+
+这不是匿名，而是**服务端认证代持**。Issue 仍然绑定到一个真实用户。
+
+### 6. 前端也没有匿名入口
+
+所有 Issue 相关前端组件（CreateIssueModal、IssueList 等）都在受保护路由下。未登录用户看不到 Issue 入口，也无法访问 `/api/v1/issue` 接口。
+
+### 7. 对比：哪些端点不需要认证？
+
+```
+无需认证的端点                    需要认证的端点
+─────────────────               ─────────────────
+GET /status                      GET/POST /issue（所有）
+GET /status/appdata              GET/POST /issueComment（所有）
+GET /settings/public             GET /search
+POST /auth/plex                  GET /request（所有）
+POST /auth/jellyfin              GET /media（所有）
+POST /auth/local                 ... 其他所有接口
+GET / (API info)
+```
+
+Issue 相关的所有接口都在认证墙后面。
+
+28. **Issue 没有搜索功能**：全局搜索只查 TMDB（影视/关键词/公司），不搜索本地 Issue 数据；Issue 列表只有过滤（状态/排序/用户），没有全文搜索
+29. **Issue 没有跨语言搜索**：连搜索本身都不存在，更谈不上跨语言；`language` 参数只传给 TMDB API，和 Issue 无关
+30. **监控集成的唯一出口是 Webhook**：没有 Prometheus/Grafana/Zabbix 原生集成，但 Webhook Agent 支持自定义 JSON 模板 + URL 变量替换，可桥接到任意外部系统
+31. **Webhook 的 Issue 字段映射很完整**：`KeyMap` 有 16 个 Issue/Comment 相关模板变量，包括报告人信息、评论人信息、Issue 类型/状态等
+32. **`/status` 端点不包含 Issue 数据**：只有版本号和更新状态，没有健康检查、没有 `/metrics`、没有 Prometheus 格式输出
+33. **不支持匿名提交 Issue**：`isAuthenticated()` 中间件强制拦截无用户请求返回 403；API Key 认证是"服务端认证代持"，Issue 仍绑定真实用户
+34. **认证链路：checkUser → isAuthenticated**：checkUser 先从 API Key 或 Session 提取 user，isAuthenticated 再验证权限；缺少任一环节都无法创建 Issue
