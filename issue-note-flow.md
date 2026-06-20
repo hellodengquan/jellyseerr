@@ -887,7 +887,196 @@ switch (filter) {
 
 ---
 
-## 十、核心代码文件索引
+## 十、Issue 自动分类与标签系统
+
+### 1. 结论：Issue 只有固定分类，没有标签系统，也没有自动分类
+
+经过全代码库搜索，Issue 模块的"分类/标签"体系非常简单：
+
+| 功能 | 是否存在 | 实现方式 |
+|------|---------|----------|
+| Issue 分类（Type） | ✅ 有 | `issueType` 枚举，4 种固定类型 |
+| Issue 标签（Tags） | ❌ 无 | Issue 实体无 tags 字段 |
+| 自动分类 | ❌ 无 | 没有任何基于内容/关键词的自动归类逻辑 |
+| 自定义分类 | ❌ 无 | 用户不能创建自己的 Issue 类别 |
+
+### 2. 现有的分类机制：IssueType 枚举
+
+**定义位置**：`server/constants/issue.ts`
+
+```typescript
+enum IssueType {
+  VIDEO = 1,     // 视频问题（画面、播放等）
+  AUDIO = 2,     // 音频问题
+  SUBTITLES = 3, // 字幕问题
+  OTHER = 4,     // 其他问题
+}
+```
+
+**特点**：
+- 固定 4 种，不可扩展
+- 创建 Issue 时由用户手动选择
+- 后端仅存储枚举值，不做任何自动判断
+- 列表页可按 `issueType` 过滤，但 API 层面的 count 接口有按类型统计
+
+### 3. 与 MediaRequest 标签系统的对比
+
+作为参照，`MediaRequest`（媒体请求）有完整的标签系统，但 Issue 没有：
+
+| 特性 | MediaRequest | Issue |
+|------|-------------|-------|
+| tags 字段 | ✅ `string[]` 数组 | ❌ 无 |
+| 自定义标签 | ✅ 用户可添加任意标签 | ❌ 无 |
+| 按标签过滤 | ✅ 支持 | ❌ 不支持 |
+| 自动打标 | ✅ 从 Radarr/Sonarr 同步 tag | ❌ 无 |
+
+**为什么 Issue 没有标签？** 从代码来看，Issue 设计上是一个**轻量级的问题反馈系统**，定位是简单的"报 bug/提问题"，而不是工单系统（ticket system）。没有优先级、没有标签、没有指派、没有自动分类。
+
+### 4. 前端分类选择 UI
+
+**CreateIssueModal**（`src/components/IssueModal/CreateIssueModal/index.tsx`）
+
+创建 Issue 时通过 `Selector` 组件选择 issueType，4 个选项对应 4 个枚举值，纯手动选择，无智能推荐。
+
+---
+
+## 十一、Issue 反垃圾与防刷机制
+
+### 1. 结论：Issue 模块没有专门的反垃圾过滤
+
+经过全代码库搜索，Issue 相关接口**没有任何反垃圾/防刷保护**：
+
+| 反垃圾手段 | 是否存在 | 说明 |
+|-----------|---------|------|
+| 速率限制（Rate Limit） | ❌ 无 | Issue 路由没有 rate-limit 中间件 |
+| 验证码（Captcha） | ❌ 无 | 全站无 Captcha |
+| 内容过滤（关键词/敏感词） | ❌ 无 | 后端不校验评论内容 |
+| Akismet 等反垃圾服务 | ❌ 无 | 无集成 |
+| 用户信任度/等级 | ❌ 无 | Plex/Jellyfin 用户一律平等 |
+| Flood 检测（短时间大量发帖） | ❌ 无 | 无时间窗口内的计数限制 |
+| 媒体级别频率限制 | ❌ 无 | 同一媒体可以被无限次报 Issue |
+
+### 2. 全站仅有的速率限制
+
+全项目唯一一处 `express-rate-limit` 在 Plex 用户导入接口：
+
+**位置**：`server/routes/settings/index.ts:540`
+
+```typescript
+settingsRoutes.get(
+  '/plex/users',
+  isAuthenticated(Permission.ADMIN),
+  rateLimit({ windowMs: 60 * 1000, max: 50 }), // 每分钟 50 次
+  // ...
+);
+```
+
+这个限制只针对**管理员调用 Plex 用户列表**的接口，和 Issue 完全无关。
+
+### 3. 间接的"门槛"保护
+
+Issue 虽然没有显式反垃圾，但有一些隐式门槛：
+
+| 门槛 | 说明 |
+|------|------|
+| 必须登录 | `router.use('/issue', isAuthenticated(), issueRoutes)`，所有 Issue 操作都需要登录 |
+| CREATE_ISSUES 权限 | 不是所有用户都能创建 Issue，需要管理员授予权限 |
+| 媒体必须存在 | 创建 Issue 时验证 mediaId，不能凭空发垃圾 |
+| Plex/Jellyfin 账号体系 | 用户都来自真实的媒体服务器账号，不是随便注册的 |
+
+### 4. 与反垃圾最接近的代码：Blocklist
+
+`Blocklist`（黑名单）系统是最接近"反垃圾"的机制，但它针对的是**媒体内容**（按 TMDB ID 或关键词屏蔽整部影视），不是针对 Issue 评论内容或用户行为。
+
+**路径**：用户报 Issue → 管理员判断严重 → 手动将媒体加入 Blocklist
+
+这是**事后人工处理**，不是事前自动过滤。
+
+---
+
+## 十二、Issue 数据备份与导出 API
+
+### 1. 结论：没有 Issue 专属的导出/备份接口
+
+经过全代码库搜索，Issue 模块**没有任何导出、备份、批量下载功能**：
+
+| 导出方式 | 是否存在 | 说明 |
+|----------|---------|------|
+| Issue CSV 导出 | ❌ 无 | 无 CSV 导出接口 |
+| Issue JSON 导出 | ❌ 无 | 无 JSON 批量导出 |
+| Issue 数据备份 | ❌ 无 | 没有备份 API |
+| Issue 数据导入 | ❌ 无 | 没有导入 API |
+| 数据库整体备份 | ❌ 无 | 应用内无备份按钮 |
+
+### 2. 全局数据迁移：Overseerr Merge
+
+唯一和"数据迁移"沾边的是 `overseerrMerge.ts`，但它**不是用户可主动调用的导出功能**：
+
+**位置**：`server/lib/overseerrMerge.ts`
+
+**作用**：首次启动时，检测到用户是从 Overseerr 迁移过来的（数据库已存在但 Jellyseerr 配置为空），自动合并数据库结构并修复数据。
+
+**触发条件**：
+```typescript
+const checkOverseerrMerge = async (): Promise<boolean> => {
+  const settings = await new Settings().load(undefined, true);
+  if (settings.main.mediaServerType) {
+    return false; // 已配置过就不运行
+  }
+  // ... 迁移逻辑
+};
+```
+
+**和 Issue 的关系**：迁移会保留 Issue 表结构（通过 TypeORM migration 兼容处理），但没有 Issue 专属的导入逻辑。Issue 数据跟着数据库文件走，SQLite 就是整个库一起迁移。
+
+### 3. About 接口的统计数据（不是导出）
+
+`GET /settings/about` 接口返回一些统计数字，但**不含 Issue 数量**：
+
+**位置**：`server/routes/settings/index.ts:822-836`
+
+```typescript
+settingsRoutes.get('/about', async (req, res) => {
+  const totalMediaItems = await mediaRepository.count();
+  const totalRequests = await mediaRequestRepository.count();
+
+  return res.status(200).json({
+    version: getAppVersion(),
+    totalMediaItems,  // 媒体总数
+    totalRequests,    // 请求总数
+    tz: process.env.TZ,
+    appDataPath: appDataPath(),
+  });
+});
+```
+
+注意：只有 `totalMediaItems` 和 `totalRequests`，**没有 `totalIssues`**。Issue 统计走的是独立的 `/issue/count` 接口（已在第九节分析）。
+
+### 4. 实际备份方式：文件级备份
+
+由于 Jellyseerr 使用 SQLite（默认）或 PostgreSQL，数据备份的实际方式是**文件级或数据库级备份**，不是应用内导出：
+
+| 部署方式 | 备份方法 |
+|---------|---------|
+| Docker SQLite | 备份 `config/db.sqlite` 文件 |
+| 原生 SQLite | 备份整个 `.sqlite` 文件 |
+| PostgreSQL | `pg_dump` 导出整库 |
+
+应用代码中**没有任何触发备份的逻辑**，完全靠运维层面处理。
+
+### 5. 相关的数据持久化机制
+
+| 机制 | 文件 | 说明 |
+|------|------|------|
+| 设置存储 | `settings.json` | 存在 `appDataPath` 目录，JSON 格式 |
+| 数据库 | `db.sqlite` | SQLite 数据库文件 |
+| 缓存 | `cache/` 目录 | 图片缓存等 |
+
+Issue 数据全部存在数据库表 `issue` 和 `issue_comment` 中，没有单独的导出文件。
+
+---
+
+## 十三、核心代码文件索引
 
 | 文件 | 职责 |
 |------|------|
@@ -923,10 +1112,13 @@ switch (filter) {
 | `src/components/IssueModal/CreateIssueModal/index.tsx` | 创建 Issue 弹窗 |
 | `src/components/Layout/index.tsx` | 全局 SWR 请求 /issue/count |
 | `src/components/Layout/Sidebar/index.tsx` | 侧边栏 Issue 计数 Badge |
+| `server/lib/overseerrMerge.ts` | Overseerr 数据库合并迁移（首次启动时运行，非用户导出工具） |
+| `server/interfaces/api/settingsInterfaces.ts` | SettingsAboutResponse 定义（不含 totalIssues） |
+| `server/routes/settings/index.ts` | 全站唯一的 rate-limit 应用处（Plex 用户导入） |
 
 ---
 
-## 十一、容易混淆的点总结
+## 十四、容易混淆的点总结
 
 1. **Issue 没有 message 字段**：描述全在 comments[0]，创建 Issue 时的 message 直接变成第一条 Comment
 2. **第一条 Comment 不触发 ISSUE_COMMENT**：IssueCommentSubscriber 中有判断跳过，避免和 ISSUE_CREATED 重复
@@ -948,3 +1140,10 @@ switch (filter) {
 18. **count 接口无权限检查**：`GET /issue/count` 未调用 isAuthenticated，且执行 7 次独立 COUNT 查询（可优化为 GROUP BY）
 19. **Issue 没有归档/清理机制**：RESOLVED 的 Issue 永远留在数据库，无 TTL、无归档表、无定时清理任务
 20. **BlocklistedTagsProcessor 不影响 Issue**：关键词黑名单自动扫描只处理 Blocklist + Media 状态，不碰 Issue
+21. **Issue 没有标签系统**：只有 issueType 枚举（4 种固定类型），没有 tags 字段，也不能自定义分类
+22. **MediaRequest 有标签但 Issue 没有**：两套系统设计定位不同，Issue 是轻量反馈，MediaRequest 是工单式管理
+23. **Issue 没有专门的反垃圾保护**：没有 rate limit、没有 captcha、没有内容过滤，全靠登录门槛和权限控制
+24. **全站唯一的 rate limit 在 Plex 用户导入**：和 Issue 完全无关，是 settings 里 `/plex/users` 接口每分钟 50 次
+25. **Issue 没有导出/备份接口**：没有 CSV/JSON 导出，没有应用内备份按钮，备份靠文件级（SQLite 文件或 pg_dump）
+26. **About 接口不含 Issue 统计**：`/settings/about` 只有 totalMediaItems 和 totalRequests，Issue 统计走独立的 `/issue/count`
+27. **Overseerr Merge 不是导出工具**：只在首次启动时自动运行一次，用于兼容 Overseerr 数据库，不是用户可调用的导入/导出功能
