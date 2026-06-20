@@ -315,11 +315,244 @@ Jellyfin 本身就是一个账号系统，因此校验较简单：
 
 ---
 
-## 六、用户配额（Quota）系统
+## 六、用户删除后的关联清理（没有"禁用"功能）
+
+> 澄清：该项目**没有"禁用用户"功能**（没有 active/disabled 状态字段），只有**硬删除**。用户被删时的关联数据清理由「数据库级 ON DELETE 约束 + 应用层手动批量删除」共同完成。
+
+### 6.1 删除权限与前置校验
+
+接口：`DELETE /api/v1/user/:id`，实现于 `server/routes/user/index.ts:593-655`
+
+三层校验按顺序：
+1. `user.id === 1` → 405 `"This account cannot be deleted."`（主管理员永远保留）
+2. `user.hasPermission(Permission.ADMIN) && req.user?.id !== 1` → 405 `"You cannot delete users with administrative privileges."`（非 Owner 不能删管理员）
+3. 必须有 `Permission.MANAGE_USERS` 权限（由路由层 `isAuthenticated` 保证）
+
+### 6.2 关联实体的级联策略总览
+
+TypeORM 实体上的 `onDelete` 配置决定了大部分清理行为，定义在各实体的 `@ManyToOne` / `@OneToOne` 装饰器：
+
+| 关联实体 | 关联字段 | onDelete 策略 | 清理时机 |
+|---|---|---|---|
+| MediaRequest | requestedBy | **CASCADE** | 数据库级，删用户时自动删请求 |
+| MediaRequest | modifiedBy | **SET NULL** | 数据库级，删用户时 modifiedBy 字段置空（保留历史审计） |
+| Watchlist | requestedBy | **CASCADE** | 数据库级 |
+| Watchlist | user | **CASCADE** | 数据库级 |
+| UserSettings | user | **CASCADE** | 数据库级 |
+| UserPushSubscription | user | **CASCADE** | 数据库级 |
+| Issue | createdBy | **CASCADE** | 数据库级 |
+| IssueComment | commentBy | **CASCADE** | 数据库级 |
+| SeasonRequest | request | **CASCADE** | 随 MediaRequest 间接级联 |
+| Issue | media | **CASCADE** | 随 Media 级联 |
+
+> 完整 onDelete 定义见 `server/entity/MediaRequest.ts:535-550`、`server/entity/Watchlist.ts:49-56`、`server/entity/UserSettings.ts:39` 等。
+
+### 6.3 应用层手动清理（覆盖 CASCADE 的特殊处理）
+
+关键代码在 `server/routes/user/index.ts:623-639`，这段代码**故意绕过**数据库级 CASCADE：
+
+```typescript
+/**
+ * Requests are usually deleted through a cascade constraint. Those however, do
+ * not trigger the removal event so listeners to not run and the parent Media
+ * will not be updated back to unknown for titles that were still pending. So
+ * we manually remove all requests from the user here so the parent media's
+ * properly reflect the change.
+ */
+await requestRepository.remove(user.requests, {
+  chunk: user.requests.length / 1000, // 避免 SQLite Expression tree is too large
+});
+await userRepository.delete(user.id);
+```
+
+**为什么不直接靠 CASCADE？**
+- CASCADE 只在数据库层执行，不触发 TypeORM 的 `@BeforeRemove` / `@AfterRemove` 事件监听器
+- MediaRequest 上挂了 `@AfterRemove` 事件（`MediaRequestSubscriber` 或实体内部）会更新父 Media 的 `status` 回到 `UNKNOWN`（当该媒体最后一个待处理请求被删除时）
+- 如果走 CASCADE，Media 状态会停留在 `PENDING`，变成"孤儿"状态，永远不会被下载
+
+### 6.4 Jellyfin 侧的设备清理（登出）
+
+删除用户并不会自动清理 Jellyfin 上的登录设备。Jellyfin 侧的设备注销只在**用户主动登出**时发生：
+
+`server/routes/auth.ts:660-698`：
+```typescript
+if (isJellyfinOrEmby) {
+  // 先在 Jellyfin 侧 DELETE /Devices 删除对应 jellyfinDeviceId
+  await axios.delete(`${baseUrl}/Devices`, { params: { Id: user.jellyfinDeviceId } });
+}
+req.session?.destroy(() => { ... });
+```
+删除用户时只删 Seerr 数据库记录，Jellyfin 上的 `jellyfinDeviceId` 会作为"僵尸设备"保留，直到 Jellyfin 自身超时清理。
+
+---
+
+## 七、邀请链接追踪与滥用检测（几乎为空）
+
+> 澄清：该项目**没有邀请链接（invite link）机制**，也没有 referrer/UTM/affiliate 追踪代码。与"滥用检测"相关的代码只有三处极简实现。
+
+### 7.1 不存在的特性
+
+| 特性 | 代码现状 |
+|---|---|
+| 邀请链接生成（邀请码 token） | 无 |
+| 邀请人追踪（referrerUserId） | 无 |
+| UTM 参数记录（utm_source/utm_medium） | 无 |
+| 邀请链接点击统计 | 无 |
+| Referer 请求头记录 | 无（代码中无任何 `req.get('Referer')` 或 `req.headers.referer` 调用） |
+
+### 7.2 已有的滥用防护
+
+#### 7.2.1 Rate Limit（设置接口）
+
+`server/routes/settings/index.ts:35` 引入 + `routes/settings/index.ts:540` 使用：
+```typescript
+import rateLimit from 'express-rate-limit';
+rateLimit({ windowMs: 60 * 1000, max: 50 }) // 1分钟最多50次
+```
+仅用于设置接口，登录、重置密码等敏感接口**没有** rate limit。
+
+#### 7.2.2 重置密码邮箱防枚举
+
+`server/routes/auth.ts:736-755`：
+```typescript
+const user = await userRepository.findOne({ where: { email: body.email.toLowerCase() } });
+if (user) {
+  await user.resetPassword();
+  await userRepository.save(user);
+  logger.info('Successfully sent password reset link', { ... });
+} else {
+  logger.error('Something went wrong sending password reset link', { ... });
+}
+return res.status(200).json({ status: 'ok' }); // 不管邮箱是否存在都返回 200
+```
+> 攻击者无法通过返回值判断哪些邮箱已注册。
+
+#### 7.2.3 登录失败日志（无封禁）
+
+三种登录接口（Plex/Jellyfin/Local）在失败时都会用 `logger.warn` 记录：
+- `server/routes/auth.ts:148-159`（Plex 未导入用户警告）
+- `server/routes/auth.ts:186-195`（Plex 无权限警告）
+- `server/routes/auth.ts:615-626`（本地密码错误警告）
+
+记录字段：`ip`, `email`, `plexId`, `plexUsername`, `userId`。
+
+**但没有**：
+- 失败计数
+- 账号锁定（N 次失败后锁定 X 分钟）
+- IP 临时封禁
+- CAPTCHA
+
+### 7.3 间接追踪信息（仅用于 Push 订阅清理）
+
+唯一记录 client 信息的地方是 Web Push 订阅：
+`server/routes/user/index.ts:237-310` 中的 `registerPushSubscription` 接口会存 `userAgent` 字段，用于检测 iOS 静默刷新 endpoint 时清理"僵尸订阅"——不用于滥用检测。
+
+`req.ip` 在登录、重置密码中广泛用于日志，但只做审计，不做拦截。IP 解析逻辑在 `server/index.ts:168-184` 用 `@supercharge/request-ip` 库处理 X-Forwarded-For。
+
+---
+
+## 八、媒体库权限传递与 Plex/Jellyfin 权限映射
+
+> 核心结论：**Seerr 自身不做媒体库级别的访问控制**，权限完全由 Plex/Jellyfin 媒体服务器侧定义。Seerr 在邀请/登录流程中只做"用户是否有权访问媒体服务器"的二元判断，不传递、不映射具体库级权限。
+
+### 8.1 Plex 侧权限的 Seerr 侧判定
+
+**仅检查服务器访问权，不检查具体库。**
+
+核心代码：`server/api/plextv.ts:230-257` `checkUserAccess(userId)`
+```typescript
+const user = users.find(u => parseInt(u.$.id) === userId);
+return !!user.Server?.find(
+  server => server.$.machineIdentifier === settings.plex.machineId
+);
+```
+
+Plex.tv API 返回的 `User.Server[]` 是该用户被共享的服务器列表，每个 `Server.$` 包含：
+- `id` / `serverId`
+- `machineIdentifier`（UUID，与 Seerr 配置的 `settings.plex.machineId` 匹配即表示有权）
+- `name` / `numLibraries` / `owned`
+
+**注意**：`numLibraries` 只是展示字段，**Seerr 不检查具体哪些库被共享**——只要用户能访问该 Plex 服务器，就认为其有权通过 Seerr 请求**所有 Seerr 侧已启用的库**。
+
+### 8.2 Seerr 侧的库过滤（全局配置，非用户级）
+
+Seerr 有库的启用/禁用开关，但这是**全局配置**，不是用户级权限：
+
+`server/routes/settings/index.ts:232-254`（Plex）与 `routes/settings/index.ts:333-393`（Jellyfin）：
+```typescript
+settings.plex.libraries = settings.plex.libraries.map(library => ({
+  ...library,
+  enabled: enabledLibraries.includes(library.id), // 管理员在设置页勾选
+}));
+```
+
+库过滤仅作用于**扫描器**（`server/lib/scanners/plex/index.ts:81-82`）：
+```typescript
+this.libraries = settings.plex.libraries.filter(
+  library => library.enabled
+);
+```
+即：禁用的库不会被扫描入库，所有用户都看不到这些库的内容。这是全局开关，不是按用户分配权限。
+
+### 8.3 Jellyfin 侧权限的 Seerr 侧判定
+
+**仅检查是否是管理员，忽略其他 Policy 字段。**
+
+Jellyfin 登录返回的 `account.User.Policy` 定义在 `server/api/jellyfin.ts:19-22`：
+```typescript
+Policy: {
+  IsAdministrator: boolean;
+  // Jellyfin 实际返回的还有：EnableContentDownloading、EnableMediaPlayback、
+  // EnableSync、EnableAllLibraries、EnabledFolders、ExcludeFolders 等
+  // 但 Seerr 的 interface 里只声明了 IsAdministrator，其他字段直接忽略
+}
+```
+
+仅在**首次初始化**时判断：`server/routes/auth.ts:320-322`
+```typescript
+if (account.User.Policy.IsAdministrator === false) {
+  throw new ApiError(403, ApiErrorCode.NotAdmin);
+}
+```
+日常登录和请求流程中，**完全不检查 Jellyfin Policy 的任何字段**。
+
+### 8.4 邀请时的权限传递（实际上没有传递）
+
+三种邀请途径在创建用户时，都**不会从媒体服务器侧拉取权限映射到 Seerr**：
+
+1. **管理员创建本地用户**（`POST /api/v1/user`）：权限固定为 `settings.main.defaultPermissions`，与媒体服务器无关
+2. **批量从 Plex 导入**（`POST /api/v1/user/import-from-plex`）：同样写入 `settings.main.defaultPermissions`，不考虑 Plex 侧该用户是否有"邀请其他人"或"管理库"的权限
+3. **自助登录自动创建**（`auth.ts:163-183` / `auth.ts:454-483`）：权限也是 `settings.main.defaultPermissions`
+
+> 唯一例外：**首个用户**（数据库为空时登录）会被授予 `Permission.ADMIN`，这是基于"首次配置"的约定，不是从媒体服务器映射而来。
+
+### 8.5 权限模型总结图
+
+```
+Plex 侧权限                      Seerr 侧权限
+─────────────                   ─────────────
+共享某台服务器 ────────────────► checkUserAccess() = true
+  │                                    │
+  ├─ 共享哪些库（Seerr 不读）           ├─ 全局 enabled libraries（管理员设）
+  ├─ 是否能邀请他人（Seerr 不读）        ├─ defaultPermissions（全局默认）
+  └─ Plex Pass 状态（Seerr 不读）        └─ 管理员手动调整 permissions 位掩码
+
+Jellyfin 侧权限                   Seerr 侧权限
+────────────────                   ─────────────
+IsAdministrator ────────────────► 仅首次初始化用（是否能成为 Owner）
+EnableAllLibraries ────────────► 完全忽略
+EnabledFolders ────────────────► 完全忽略
+EnableContentDownloading ───────► 完全忽略
+EnableMediaPlayback ────────────► 完全忽略
+```
+
+---
+
+## 九、用户配额（Quota）系统
 
 配额系统限制用户在一定周期内的请求数量（电影按"部"计，剧集按"季"计），与邀请流程的关联在于：新建用户时即按全局默认或管理员指定写入配额参数。
 
-### 6.1 数据模型：User 实体中的配额字段
+### 9.1 数据模型：User 实体中的配额字段
 
 定义于 `server/entity/User.ts:125-135`：
 
@@ -334,7 +567,7 @@ Jellyfin 本身就是一个账号系统，因此校验较简单：
 
 > 配额字段可在管理员创建用户（`POST /api/v1/user`）或编辑用户（`PUT /api/v1/user/:id`）时单独指定，覆盖全局默认。
 
-### 6.2 配额计算：`User.getQuota()`
+### 9.2 配额计算：`User.getQuota()`
 
 实现于 `server/entity/User.ts:273-372`，返回 `QuotaResponse` 结构：
 
@@ -372,7 +605,7 @@ Jellyfin 本身就是一个账号系统，因此校验较简单：
    ```
    limit 非零 且 used ≥ limit → 真正受限。limit=0（管理员或未设配额）永远返回 `restricted=false`。
 
-### 6.3 请求拦截点：`MediaRequest.request()`
+### 9.3 请求拦截点：`MediaRequest.request()`
 
 配额拒绝发生在**创建请求前立即拦截**，贯穿两处代码：
 
@@ -393,7 +626,7 @@ if (quotas.tv.limit && finalSeasons.length > (quotas.tv.remaining ?? 0))
 ```
 例如：剩余 2 季，但用户一次性请求包含 S1+S2+S3 共 3 季 → 拒绝。
 
-### 6.4 HTTP 层的错误传播
+### 9.4 HTTP 层的错误传播
 
 `server/routes/request.ts:321-324` 按错误类型映射状态码：
 ```typescript
@@ -402,7 +635,7 @@ case QuotaRestrictedError:
 ```
 前端可据此展示"配额超限"提示。
 
-### 6.5 与邀请流程的配合
+### 9.5 与邀请流程的配合
 
 邀请/创建用户时的配额写入：
 - 管理员点"Create Local User"创建：前端 `src/components/UserList/index.tsx` 弹窗中的配额字段传入后端
@@ -412,9 +645,9 @@ case QuotaRestrictedError:
 
 ---
 
-## 七、会话与鉴权中间件
+## 十、会话与鉴权中间件
 
-### 7.1 用户注入中间件
+### 10.1 用户注入中间件
 
 `server/middleware/auth.ts:9-41` `checkUser`
 
@@ -426,7 +659,7 @@ case QuotaRestrictedError:
 3. 设置 req.locale（用户设置或全局默认）
 ```
 
-### 7.2 权限校验中间件
+### 10.2 权限校验中间件
 
 `server/middleware/auth.ts:43-58` `isAuthenticated(permissions?, options?)`
 
@@ -436,7 +669,7 @@ case QuotaRestrictedError:
 
 ---
 
-## 八、完整协作流程图
+## 十一、完整协作流程图
 
 ```
 管理员视角                           新用户视角
@@ -491,22 +724,28 @@ case QuotaRestrictedError:
 
 ---
 
-## 九、关键代码文件索引
+## 十二、关键代码文件索引
 
 | 功能 | 文件路径 |
 |---|---|
 | 用户类型常量 | `server/constants/user.ts` |
+| 权限位枚举与 hasPermission 算法 | `server/lib/permissions.ts` |
 | 用户实体（含 getQuota、resetPassword、密码哈希） | `server/entity/User.ts` |
 | 会话实体（Session expiredAt 字段） | `server/entity/Session.ts` |
-| 请求实体（含 QuotaRestrictedError、配额拦截逻辑） | `server/entity/MediaRequest.ts` |
-| 认证路由（登录/登出/重置密码过期判定） | `server/routes/auth.ts` |
+| 请求实体（含 QuotaRestrictedError、onDelete 级联配置、配额拦截逻辑） | `server/entity/MediaRequest.ts` |
+| 关注清单实体（onDelete: CASCADE） | `server/entity/Watchlist.ts` |
+| 用户设置实体（onDelete: CASCADE） | `server/entity/UserSettings.ts` |
+| Issue/评论实体（onDelete 级联配置） | `server/entity/Issue.ts` |
+| 认证路由（登录/登出/重置密码过期判定/Jellyfin 设备注销） | `server/routes/auth.ts` |
 | 请求路由（QuotaRestrictedError → 403 映射） | `server/routes/request.ts` |
-| 用户管理路由（CRUD/导入/配额字段写入） | `server/routes/user/index.ts` |
+| 用户管理路由（CRUD/导入/删除时手动清理请求/配额字段写入） | `server/routes/user/index.ts` |
 | 用户设置路由（密码/关联冲突校验/权限） | `server/routes/user/usersettings.ts` |
+| 设置路由（libraries 全局启用/禁用、rate-limit） | `server/routes/settings/index.ts` |
 | 鉴权中间件（Session 读取、权限校验） | `server/middleware/auth.ts` |
-| Plex.tv API 封装（含 checkUserAccess） | `server/api/plextv.ts` |
-| Jellyfin API 封装 | `server/api/jellyfin.ts` |
-| 服务器启动（Session TTL / maxAge 配置） | `server/index.ts` |
+| Plex.tv API 封装（含 checkUserAccess 服务器权限校验） | `server/api/plextv.ts` |
+| Jellyfin API 封装（Policy 接口定义、登录） | `server/api/jellyfin.ts` |
+| 服务器启动（Session TTL / maxAge 配置、clientIp 解析） | `server/index.ts` |
+| Plex 扫描器（libraries enabled 过滤逻辑） | `server/lib/scanners/plex/index.ts` |
 | Plex OAuth 前端逻辑（PIN 轮询） | `src/utils/plex.ts` |
 | Plex 登录 Hook | `src/hooks/usePlexLogin.ts` |
 | 前端登录页 | `src/components/Login/index.tsx` |
